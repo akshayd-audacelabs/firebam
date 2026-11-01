@@ -667,14 +667,19 @@ test_bam_current_slot_work_status_bits( fd_wksp_t * wksp ) {
   ulong fseq[1] = { 0UL };
   state->bam_status_fseq = fseq;
 
-  state->bam_leader_state = (fd_bam_leader_state_t){
+  /* A leader slot that ends healthy counts as fresh work only if BAM work
+     for it arrived before its end. */
+  state->bam_status_counted = FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY;
+  fd_bam_stage_leader_state( state, &(fd_bam_leader_state_t){
     .slot               = 42UL,
     .slot_end_ns        = fd_log_wallclock() - 1L,
     .current_slot_has_bam_work = 0U,
-  };
+  } );
   state->epoch_slot0 = 1000UL; state->epoch_slot_cnt = 100UL; /* no leader slot known */
   state->bam_stream_live = 0U;
   fd_bam_tile_housekeeping( state );
+  FD_TEST( state->metrics.healthy_leader_slot_result_cnt[ FD_METRICS_ENUM_BAM_HEALTHY_LEADER_SLOT_RESULT_V_NONE_IDX       ]==1UL );
+  FD_TEST( state->metrics.healthy_leader_slot_result_cnt[ FD_METRICS_ENUM_BAM_HEALTHY_LEADER_SLOT_RESULT_V_FRESH_WORK_IDX ]==0UL );
   FD_TEST( !fd_bam_tile_leader_slot_known( state ) ); /* not admitted while unhealthy */
   state->bam_stream_live = 1U;
   fd_bam_tile_housekeeping( state );
@@ -689,13 +694,15 @@ test_bam_current_slot_work_status_bits( fd_wksp_t * wksp ) {
   FD_TEST( FD_MGAUGE_GET( BAM, LEADER_STATE_TICK ) == 0UL );
   FD_TEST( FD_MGAUGE_GET( BAM, LEADER_STATE_SLOT_END_TIME ) == (ulong)state->bam_leader_state.slot_end_ns );
 
-  state->bam_leader_state = (fd_bam_leader_state_t){
+  fd_bam_stage_leader_state( state, &(fd_bam_leader_state_t){
     .slot               = 43UL,
     .tick               = 7U,
-    .slot_end_ns        = fd_log_wallclock() + (long)1e9,
+    .slot_end_ns        = fd_log_wallclock() - 1L,
     .current_slot_has_bam_work = 1U,
-  };
+  } );
   fd_bam_tile_housekeeping( state );
+  FD_TEST( state->metrics.healthy_leader_slot_result_cnt[ FD_METRICS_ENUM_BAM_HEALTHY_LEADER_SLOT_RESULT_V_NONE_IDX       ]==1UL );
+  FD_TEST( state->metrics.healthy_leader_slot_result_cnt[ FD_METRICS_ENUM_BAM_HEALTHY_LEADER_SLOT_RESULT_V_FRESH_WORK_IDX ]==1UL );
   FD_TEST( fd_fseq_query( fseq ) == FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE );
   fd_bam_test_metrics_write( state );
   FD_TEST( FD_MGAUGE_GET( BAM, LEADER_STATE_SLOT ) == 43UL );
@@ -2379,38 +2386,40 @@ test_bam_receive_backpressure_parks_without_waker_fire( fd_wksp_t * wksp ) {
   test_bam_env_destroy( env );
 }
 
+/* A refused dial completes with POLLERR and SO_ERROR set: the step closes
+   the socket, counts a connect failure and arms the backoff.  The port is
+   bound but not listening, so loopback answers the SYN with a RST, and no
+   other socket can take the port. */
 static void
 test_bam_tcp_connect_completion_uses_so_error( fd_wksp_t * wksp ) {
+  long const saved_clock = g_clock;
+  g_clock = (long)10e9;
   test_bam_env_t env[1];
   fd_bam_tile_t * state = test_bam_env_create( env, wksp );
 
-  struct sockaddr_in addr;
-  int listen_sock = test_bam_loopback_listener( &addr );
+  int bound_sock = socket( AF_INET, SOCK_STREAM|SOCK_CLOEXEC, 0 );
+  FD_TEST( bound_sock>=0 );
+  struct sockaddr_in addr = { .sin_family = AF_INET, .sin_addr.s_addr = FD_IP4_ADDR( 127, 0, 0, 1 ) };
+  FD_TEST( 0==bind( bound_sock, fd_type_pun( &addr ), sizeof(addr) ) );
+  socklen_t addr_len = sizeof(addr);
+  FD_TEST( 0==getsockname( bound_sock, fd_type_pun( &addr ), &addr_len ) );
+  test_bam_set_server( state, fd_ushort_bswap( addr.sin_port ) );
+  state->backoff_until = 0L;
 
-  int client_sock = socket( AF_INET, SOCK_STREAM|SOCK_CLOEXEC, 0 );
-  FD_TEST( client_sock >= 0 );
-  FD_TEST( 0 == connect( client_sock, fd_type_pun_const( &addr ), sizeof(addr) ) );
+  int busy = 0;
+  fd_bam_client_step( state, &busy );
+  FD_TEST( busy && state->tcp_sock>=0 && !state->tcp_sock_connected ); /* EINPROGRESS */
 
-  int server_sock = accept4( listen_sock, NULL, NULL, SOCK_CLOEXEC );
-  FD_TEST( server_sock >= 0 );
-  FD_TEST( 0 == close( listen_sock ) );
+  busy = 0;
+  fd_bam_client_step( state, &busy );
+  FD_TEST( busy );
+  FD_TEST( state->tcp_sock==-1 && !state->tcp_sock_connected );
+  FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_CONNECT_IDX ]==1UL );
+  FD_TEST( state->backoff_until>g_clock );
 
-  int flags = fcntl( client_sock, F_GETFL, 0 );
-  FD_TEST( flags >= 0 );
-  FD_TEST( 0 == fcntl( client_sock, F_SETFL, flags|O_NONBLOCK ) );
-
-  state->tcp_sock           = client_sock;
-  state->tcp_sock_connected = 0U;
-
-  int charge_busy = 0;
-  fd_bam_client_step( state, &charge_busy );
-
-  FD_TEST( charge_busy == 1 );
-  FD_TEST( state->tcp_sock == client_sock );
-  FD_TEST( state->tcp_sock_connected == 1U );
-
-  FD_TEST( 0 == close( server_sock ) );
+  FD_TEST( 0==close( bound_sock ) );
   test_bam_env_destroy( env );
+  g_clock = saved_clock;
 }
 
 static void
@@ -4171,6 +4180,7 @@ test_bam_leader_state_supersede_counts_drop( fd_wksp_t * wksp ) {
 
   fd_bam_stage_leader_state( state, &newer_state );
 
+  FD_TEST( state->metrics.leader_pending_replaced_cnt==1UL );
   FD_TEST( state->bam_leader_pending == 1U );
   FD_TEST( state->bam_leader_state.slot == newer_state.slot );
   FD_TEST( state->bam_leader_state.tick == newer_state.tick );
@@ -4179,7 +4189,13 @@ test_bam_leader_state_supersede_counts_drop( fd_wksp_t * wksp ) {
   FD_TEST( state->leader_slot_end[ tracker_idx ].valid );
   FD_TEST( state->leader_slot_end[ tracker_idx ].slot==newer_state.slot );
 
+  /* Restaging the pending state, or staging over a sent one, drops nothing. */
   fd_bam_stage_leader_state( state, &newer_state );
+  FD_TEST( state->metrics.leader_pending_replaced_cnt==1UL );
+  state->bam_leader_pending = 0U;
+  newer_state.tick = 9U;
+  fd_bam_stage_leader_state( state, &newer_state );
+  FD_TEST( state->metrics.leader_pending_replaced_cnt==1UL );
 
   test_bam_env_destroy( env );
 }
