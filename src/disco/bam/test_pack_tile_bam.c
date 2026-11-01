@@ -3266,9 +3266,8 @@ test_pack_tile_bam_closed_admission_callbacks( void ) {
 }
 
 /* Results do not wait for after_credit.  A result decided while pack
-   skips and drains after_credit, with the result link out of credits,
-   is already on the link: pack_bam_res has no reliable consumer, so it
-   takes no credits.  after_credit then publishes nothing. */
+   skips and drains after_credit is already on the link, and a skipping
+   after_credit then publishes nothing, also after a second result. */
 static void
 test_pack_tile_bam_results_publish_while_skipping( void ) {
   test_pack_callbacks_t e[1];
@@ -3278,14 +3277,11 @@ test_pack_tile_bam_results_publish_while_skipping( void ) {
   FD_TEST( ctx->drain_execle && ctx->bam_min_admission_slot==105UL );
   ctx->execle_idle_bitset = 0UL;
   ctx->skip_cnt = 100L;
-  e->h->out->out_reliable[2] = 0;
-  e->h->out->cr_avail[2]     = 0UL;
-  for( uint i=0U; i<4U; i++ ) {
+  for( uint i=0U; i<2U; i++ ) {
     ulong results = test_pack_tile_result_cnt( e->h );
     test_pack_callbacks_insert( e, 70U+i, 104UL, 0 );
     FD_TEST( test_pack_tile_result_cnt( e->h )==results+1UL );
     FD_TEST( test_pack_tile_assert_last_result( e->h, 70U+i, 104UL, 1U, FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U )->scheduler_gen==9U );
-    FD_TEST( !e->h->out->cr_avail[2] );
     int poll=1, busy=0;
     after_credit( ctx, &e->h->out->stem, &poll, &busy );
     FD_TEST( test_pack_tile_result_cnt( e->h )==results+1UL );

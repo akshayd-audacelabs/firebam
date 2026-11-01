@@ -1056,6 +1056,7 @@ test_bam_conflict_lookahead( void ) {
     FD_TEST( FD_MCNT_GET( PACK, BAM_LOOKAHEAD_MISS )-empty0==(ulong)( kind==6 || kind==8 || kind>=11 ) ); /* only failed scans */
     if( kind==6 || (kind>=8 && kind!=10) ) {
       FD_TEST( !scheduled );
+      if( kind==8 ) FD_TEST( calls==1UL+FD_PACK_BAM_LOOKAHEAD_TXN_MAX-5UL ); /* the head and every dependent */
       if( kind==9 ) FD_TEST( !calls );
     } else {
       ulong expected = (kind==1 || kind==4) ? 703UL : kind==7 ? 708UL : kind==2 ? 701UL : kind==10 ? 700UL : 705UL;
