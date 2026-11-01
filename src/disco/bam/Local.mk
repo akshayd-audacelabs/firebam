@@ -42,7 +42,7 @@ $(call make-fuzz-test,fuzz_bam_pipeline_stateful,fuzz_bam_pipeline_stateful fuzz
 $(call make-unit-test,test_bam_latency_bench,test_bam_latency_bench test_bam_motor_fixture,fd_discof fd_disco fd_choreo fd_flamenco_test fd_flamenco fd_reedsol fd_waltz fd_tango fd_ballet fd_util)
 
 ifdef FD_HAS_DOUBLE
-$(call make-unit-test,test_pack_tile_bam,test_pack_tile_bam,fd_disco fd_tls fd_waltz fd_flamenco fd_tango fd_ballet fd_util)
+$(call make-unit-test,test_pack_tile_bam,test_pack_tile_bam,fd_disco fd_waltz fd_flamenco fd_tango fd_ballet fd_util)
 $(call run-unit-test,test_pack_tile_bam)
 $(call make-unit-test,test_bundle_tile_bam,test_bundle_tile_bam,fd_disco fd_waltz fd_tls fd_flamenco fd_tango fd_ballet fd_util)
 $(call run-unit-test,test_bundle_tile_bam)
