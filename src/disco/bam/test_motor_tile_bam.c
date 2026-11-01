@@ -1,6 +1,91 @@
-/* Exercise BAM feedback through the Alpenglow entry publication boundary. */
-#include "../../discof/motor/fd_motor_tile.c"
-#include "test_bam_motor_common.c"
+/* Exercise BAM feedback through the Alpenglow entry publication boundary.
+   test_motor_tile.c is included verbatim for its fixtures; its main is
+   renamed and not run here. */
+#define main test_motor_tile_upstream_main
+int test_motor_tile_upstream_main( int argc, char ** argv );
+#include "../../discof/motor/test_motor_tile.c"
+#undef main
+
+static fd_poh_out_t
+test_out_new( fd_wksp_t * wksp,
+              ulong       idx,
+              ulong       depth,
+              ulong       mtu ) {
+  void * dcache = test_dcache_new( wksp, depth, mtu );
+  ulong chunk0 = fd_dcache_compact_chunk0( wksp, dcache );
+  return (fd_poh_out_t) {
+    .idx    = idx,
+    .mem    = wksp,
+    .chunk0 = chunk0,
+    .wmark  = fd_dcache_compact_wmark( wksp, dcache, mtu ),
+    .chunk  = chunk0,
+  };
+}
+
+/* Every output is unreliable, so publishing never touches credits. */
+
+typedef struct {
+  fd_frag_meta_t *  mcaches[ 4 ];
+  ulong             seqs[ 4 ];
+  ulong             depths[ 4 ];
+  int               out_reliable[ 4 ];
+  fd_stem_context_t stem[1];
+} test_stem_t;
+
+static fd_stem_context_t *
+test_stem_new( test_stem_t * s,
+               fd_wksp_t *   wksp,
+               ulong         depth ) {
+  fd_memset( s, 0, sizeof(test_stem_t) );
+  for( ulong i=0UL; i<4UL; i++ ) {
+    s->mcaches[ i ] = test_mcache_new( wksp, depth );
+    s->depths[ i ] = depth;
+  }
+  *s->stem = (fd_stem_context_t){ .mcaches=s->mcaches, .seqs=s->seqs, .depths=s->depths, .out_reliable=s->out_reliable };
+  return s->stem;
+}
+
+/* A provisional all-success BAM result, as execle attaches it. */
+
+static fd_bam_bundle_result_t
+test_result( uint   seq_id,
+             ushort scheduler_gen,
+             ulong  slot,
+             uchar  txn_cnt ) {
+  fd_bam_bundle_result_t result = fd_bam_result_base( seq_id, scheduler_gen, slot, txn_cnt );
+  result.execution_success = 1U;
+  fd_bam_result_mark_sanitize_success_all( &result );
+  return result;
+}
+
+/* Writes an executed microblock of txn_cnt BAM transactions, with
+   result attached if non-NULL, and returns its size. */
+
+static ulong
+test_microblock( void *                         fragment,
+                 ulong                          slot,
+                 uint                           seq_id,
+                 ulong                          txn_cnt,
+                 fd_bam_bundle_result_t const * result ) {
+  fd_txn_p_t * txns = fragment;
+  for( ulong i=0UL; i<txn_cnt; i++ ) {
+    fd_txn_p_t * txn = txns+i;
+    fd_memset( txn, 0, sizeof(fd_txn_p_t) );
+    txn->payload_sz = FD_TXN_SIGNATURE_SZ;
+    txn->source_tpu = FD_TXN_M_TPU_SOURCE_BAM;
+    txn->flags      = FD_TXN_P_FLAGS_SANITIZE_SUCCESS | FD_TXN_P_FLAGS_EXECUTE_SUCCESS;
+    txn->first_seen_nanos             = 123456789L;
+    txn->scheduler_arrival_time_nanos = 987654321L;
+    TXN(txn)->signature_off = 0U;
+    fd_memset( txn->payload, (int)(seq_id+i), FD_TXN_SIGNATURE_SZ );
+  }
+
+  fd_microblock_trailer_t * trailer = (fd_microblock_trailer_t *)( txns+txn_cnt );
+  fd_memset( trailer, 0, sizeof(fd_microblock_trailer_t) );
+  trailer->hash[ 0 ] = (uchar)slot;
+  if( result ) fd_bam_microblock_attach_result( trailer, result );
+  return fd_bam_microblock_footprint( txn_cnt, !!result );
+}
 
 /* Motor initialized from a topology with its execle, pack and replay
    inputs and its shred, replay and BAM outputs. */
@@ -180,78 +265,32 @@ test_dropped_microblock_results( fd_wksp_t * wksp,
   FD_TEST( ctx->expect_pack_idx==4U && !seqs[ 0 ] && !seqs[ 1 ] && seqs[ 2 ]==2UL*(ulong)bam_wired );
 }
 
-/* Pack reads replay_out and Motor replay_slot, independently.
-   Exercise work that reaches Motor before its leader notice, then
-   retry after the notice. */
+/* Motor built from a topology with a motor_bam link forwards the
+   result an execle microblock carries once its leader slot starts.
+   The upstream test covers the rest of the slot handoff without it. */
 static void
-test_future_slot_handoff( fd_wksp_t * wksp ) {
+test_topology_bam_out( fd_wksp_t * wksp ) {
   fd_motor_tile_t * ctx = test_motor_new( wksp );
-  FD_TEST( ctx->slot==ULONG_MAX && !ctx->expect_pack_idx );
+  FD_TEST( ctx->bam_out->idx==2UL );
 
   test_stem_t ts[1];
-  fd_stem_context_t *      stem    = test_stem_new( ts, wksp, 16UL );
-  ulong const *            seqs    = ts->seqs;
-  fd_frag_meta_t * const * mcaches = ts->mcaches;
+  fd_stem_context_t * stem = test_stem_new( ts, wksp, 16UL );
+
+  ulong replay_chunk = ctx->in[2].chunk0;
+  fd_became_leader_t * leader = fd_chunk_to_laddr( wksp, replay_chunk );
+  fd_memset( leader, 0, sizeof(*leader) );
+  leader->slot = 1UL;
+  FD_TEST( !returnable_frag( ctx, 2UL, 0UL, REPLAY_SIG_BECAME_LEADER, replay_chunk, sizeof(*leader), 0UL, 0UL, 0UL, stem ) );
+  FD_TEST( ctx->slot==1UL );
 
   ulong execle_chunk = ctx->in[0].chunk0;
-  ulong pack_chunk   = ctx->in[1].chunk0;
-  ulong replay_chunk = ctx->in[2].chunk0;
-  fd_txn_p_t * txn           = fd_chunk_to_laddr( wksp, execle_chunk );
-  fd_done_packing_t * done   = fd_chunk_to_laddr( wksp, pack_chunk );
-  void * replay_frag        = fd_chunk_to_laddr( wksp, replay_chunk );
-
-  /* Slot zero must also wait for the first leader notice. */
-  FD_TEST( before_frag( ctx, 0UL, 0UL, fd_disco_execle_sig( 0UL, 0UL ) )==-1 );
-  FD_TEST( before_frag( ctx, 1UL, 0UL, fd_disco_execle_sig( 0UL, 0UL ) )==-1 );
-
-  for( ulong slot=1UL; slot<=2UL; slot++ ) {
-    uint pack_idx = ctx->expect_pack_idx;
-    ulong execle_sig = fd_disco_execle_sig( slot, pack_idx );
-    ulong pack_sig   = fd_disco_execle_sig( slot, pack_idx+1U );
-    FD_TEST( before_frag( ctx, 0UL, 0UL, execle_sig )==-1 );
-    FD_TEST( before_frag( ctx, 1UL, 0UL, pack_sig )==-1 );
-    FD_TEST( before_frag( ctx, 1UL, 0UL, FD_PACK_MSG_DONE_DRAINING )==1 );
-    FD_TEST( before_frag( ctx, 1UL, 0UL, FD_PACK_MSG_REDUCE_MB_BOUND )==1 );
-
-    fd_poh_reset_t * reset = replay_frag;
-    fd_memset( reset, 0, sizeof(*reset) );
-    reset->completed_slot = slot-1UL;
-    FD_TEST( !returnable_frag( ctx, 2UL, 0UL, REPLAY_SIG_RESET, replay_chunk, sizeof(*reset), 0UL, 0UL, 0UL, stem ) );
-    fd_became_leader_t * leader = replay_frag;
-    fd_memset( leader, 0, sizeof(*leader) );
-    leader->slot = slot;
-    FD_TEST( !returnable_frag( ctx, 2UL, 0UL, REPLAY_SIG_BECAME_LEADER, replay_chunk, sizeof(*leader), 0UL, 0UL, 0UL, stem ) );
-    FD_TEST( ctx->slot==slot && ctx->expect_pack_idx==pack_idx );
-
-    fd_memset( done, 0, sizeof(*done) );
-    done->end_slot_reason = FD_PACK_END_SLOT_REASON_TIME;
-    done->microblocks_in_slot = 1UL;
-    FD_TEST( !before_frag( ctx, 1UL, 0UL, pack_sig ) );
-    FD_TEST( returnable_frag( ctx, 1UL, 0UL, pack_sig, pack_chunk, sizeof(*done), 0UL, 0UL, 0UL, stem )==1 );
-    FD_TEST( ctx->expect_pack_idx==pack_idx && seqs[1]==slot-1UL );
-
-    fd_bam_bundle_result_t result = test_result( 90U+(uint)slot, 1U, slot, 1U );
-    ulong sz = test_microblock( txn, slot, result.seq_id, 1UL, &result );
-    FD_TEST( !before_frag( ctx, 0UL, 0UL, execle_sig ) );
-    FD_TEST( !returnable_frag( ctx, 0UL, 0UL, execle_sig, execle_chunk, sz, 0UL, 0UL, 0UL, stem ) );
-    FD_TEST( ctx->expect_pack_idx==pack_idx+1U && seqs[0]==4UL*(slot-1UL)+2UL );
-    FD_TEST( seqs[2]==slot );
-    fd_bam_bundle_result_t const * accepted = fd_chunk_to_laddr_const( wksp, mcaches[2][slot-1UL].chunk );
-    FD_TEST( fd_memeq( accepted, &result, sizeof(result) ) );
-    FD_TEST( !returnable_frag( ctx, 1UL, 0UL, pack_sig, pack_chunk, sizeof(*done), 0UL, 0UL, 0UL, stem ) );
-    FD_TEST( ctx->expect_pack_idx==pack_idx+2U && seqs[1]==slot );
-    fd_poh_leader_slot_ended_t const * ended = fd_chunk_to_laddr_const( wksp, mcaches[1][slot-1UL].chunk );
-    FD_TEST( ended->completed && ended->slot==slot && ended->microblock_count==1UL );
-
-    fd_replay_leader_footer_t * footer = replay_frag;
-    fd_memset( footer, 0, sizeof(*footer) );
-    footer->slot = slot;
-    FD_TEST( !returnable_frag( ctx, 2UL, 0UL, REPLAY_SIG_LEADER_FOOTER, replay_chunk, sizeof(*footer), 0UL, 0UL, 0UL, stem ) );
-    FD_TEST( seqs[0]==4UL*slot && seqs[1]==slot );
-    fd_entry_batch_meta_t const * meta = fd_chunk_to_laddr_const( wksp, mcaches[0][4UL*slot-1UL].chunk );
-    FD_TEST( meta->block_complete==1 );
-  }
-
+  ulong execle_sig   = fd_disco_execle_sig( 1UL, 0UL );
+  fd_bam_bundle_result_t result = test_result( 91U, 1U, 1UL, 1U );
+  ulong sz = test_microblock( fd_chunk_to_laddr( wksp, execle_chunk ), 1UL, result.seq_id, 1UL, &result );
+  FD_TEST( !before_frag( ctx, 0UL, 0UL, execle_sig ) );
+  FD_TEST( !returnable_frag( ctx, 0UL, 0UL, execle_sig, execle_chunk, sz, 0UL, 0UL, 0UL, stem ) );
+  FD_TEST( ctx->expect_pack_idx==1U && ts->seqs[2]==1UL );
+  FD_TEST( fd_memeq( fd_chunk_to_laddr_const( wksp, ts->mcaches[2][0].chunk ), &result, sizeof(result) ) );
 }
 
 int
@@ -266,7 +305,7 @@ main( int     argc,
   test_bam_and_tpu_microblocks( wksp );
   test_dropped_microblock_results( wksp, 1 );
   test_dropped_microblock_results( wksp, 0 );
-  test_future_slot_handoff( wksp );
+  test_topology_bam_out( wksp );
 
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();

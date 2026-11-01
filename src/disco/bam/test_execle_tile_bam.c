@@ -313,7 +313,9 @@ FD_UNIT_TEST( execle_empty_transaction_hash ) {
 }
 
 FD_UNIT_TEST( execle_bam_simple_ok ) {
-  /* Simple system program transfer */
+  /* execle_simple_ok as a non-revert BAM transaction.  Upstream's case
+     checks the execution outcome on the same tile code; this checks the
+     attached result and the published microblock around it. */
   test_env_t * env = test_env_create();
   fd_bank_t * bank = fd_svm_mini_bank( env->mini, env->bank_idx );
 
@@ -336,33 +338,25 @@ FD_UNIT_TEST( execle_bam_simple_ok ) {
   test_mark_bam_batch( txn, test_bam, 1UL, 101U, 0 );
   test_execle_run( env, txn, 1UL, 3U, 17UL, 0 );
 
-  fd_frag_meta_t const * motor_meta = test_out_poh_meta( 0UL );
-  FD_TEST( fd_frag_meta_seq_query( motor_meta )==0UL );
-  FD_TEST( motor_meta->sig==fd_disco_execle_sig( bank->f.slot, 3U ) );
-  fd_txn_p_t const * out_txn = fd_chunk_to_laddr( env->execle->out_poh->mem, motor_meta->chunk );
-  fd_bam_bundle_result_t const * result = fd_bam_microblock_strip_result( out_txn, &(ulong){ motor_meta->sz } );
+  test_assert_bam_nonbundle_out( env, 1UL, 3U );
+  test_assert_nonbundle_timing( env, 1UL );
+  fd_bam_bundle_result_t const * result = test_out_poh_bam_result( env, 0UL );
   FD_TEST( result );
   FD_TEST( result->seq_id==101U );
   FD_TEST( result->execution_success );
   FD_TEST( result->scheduling_error==FD_BAM_SCHED_ERR_NONE );
   FD_TEST( result->feepayer_balance_lamports[0]==payer_start-fee-transfer );
-  FD_TEST( env->execle->txn_out[0].err.is_committable );
-  FD_TEST( env->execle->txn_out[0].err.txn_err==FD_RUNTIME_EXECUTE_SUCCESS );
+
+  fd_txn_p_t const * out_txn = fd_chunk_to_laddr( env->execle->out_poh->mem, test_out_poh_meta( 0UL )->chunk );
   FD_TEST( out_txn->flags & FD_TXN_P_FLAGS_SANITIZE_SUCCESS );
   FD_TEST( out_txn->flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS );
   FD_TEST( (out_txn->flags & FD_TXN_P_FLAGS_RESULT_MASK)==0U );
-  FD_TEST( test_read_lamports( env, &fee_payer )==payer_start-fee-transfer );
-  FD_TEST( test_read_lamports( env, &recipient )==recipient_start+transfer );
-  FD_TEST( !env->execle->txn_out[0].err.is_fees_only );
 
   FD_TEST( out_txn->execle_cu.actual_consumed_cus + out_txn->execle_cu.rebated_cus ==
            txn->pack_cu.non_execution_cus + txn->pack_cu.requested_exec_plus_acct_data_cus );
   FD_TEST( out_txn->execle_cu.actual_consumed_cus >= txn->pack_cu.non_execution_cus );
 
   fd_microblock_trailer_t const * trailer = test_out_poh_trailer_nonbundle( env, 1UL );
-  FD_TEST( motor_meta->tsorig==(uint)env->begin_tspub ); /* as test_assert_nonbundle_timing */
-  FD_TEST( trailer->exec_start_ticks==env->execle->txn_out[0].details.load_start_ticks );
-  FD_TEST( fd_frag_meta_ts_decomp( motor_meta->tspub, trailer->exec_start_ticks )>trailer->exec_start_ticks );
   FD_TEST( trailer->pack_txn_idx==17UL );
   FD_TEST( trailer->tips==0UL );
   fd_txn_p_t txn_copy = *out_txn;
@@ -371,17 +365,13 @@ FD_UNIT_TEST( execle_bam_simple_ok ) {
   FD_TEST( !memcmp( trailer->hash, expected_hash, 32UL ) );
   test_assert_txn_ns_dt_ordered( &trailer->txn_ns_dt );
 
-  FD_TEST( fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED_BY_LANDING )+FD_METRICS_ENUM_TXN_LANDING_RESULT_V_SUCCESS_IDX ]==1UL );
-  FD_TEST( fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED )+FD_METRICS_ENUM_TXN_RESULT_V_SUCCESS_IDX ]==1UL );
-  FD_TEST( fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED_BY_VERSION )+FD_METRICS_ENUM_TXN_VERSION_V_LEGACY_IDX ]==1UL );
-  FD_TEST( env->execle->runtime->metrics.instr_cum==1UL );
-  FD_TEST( env->execle->runtime->metrics.cpi_cum==0UL );
-
   test_env_destroy( env );
 }
 
 FD_UNIT_TEST( execle_bam_simple_fee_payer_fail ) {
-  /* Transaction failed */
+  /* execle_simple_fee_payer_fail as a non-revert BAM transaction, whose
+     result reports it not committed.  As in execle_bam_simple_ok, the
+     execution outcome is upstream's to check. */
   test_env_t * env = test_env_create();
   fd_bank_t * bank = fd_svm_mini_bank( env->mini, env->bank_idx );
 
@@ -403,13 +393,11 @@ FD_UNIT_TEST( execle_bam_simple_fee_payer_fail ) {
   FD_TEST( !result->execution_success );
   FD_TEST( result->transaction_err_count==1U );
   FD_TEST( result->transaction_err[0]==bam_types_TransactionErrorReason_ACCOUNT_NOT_FOUND );
+
   fd_txn_p_t const * out_txn = fd_chunk_to_laddr( env->execle->out_poh->mem, test_out_poh_meta( 0UL )->chunk );
-  FD_TEST( !env->execle->txn_out[0].err.is_committable );
-  FD_TEST( env->execle->txn_out[0].err.txn_err==FD_RUNTIME_TXN_ERR_ACCOUNT_NOT_FOUND );
   FD_TEST( !(out_txn->flags & FD_TXN_P_FLAGS_SANITIZE_SUCCESS) );
   FD_TEST( !(out_txn->flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS) );
   FD_TEST( (out_txn->flags & FD_TXN_P_FLAGS_RESULT_MASK)==((uint)(-FD_RUNTIME_TXN_ERR_ACCOUNT_NOT_FOUND)<<24) );
-  FD_TEST( test_read_lamports( env, &data_acct )==data_acct_start );
 
   FD_TEST( out_txn->execle_cu.actual_consumed_cus==0U );
   FD_TEST( out_txn->execle_cu.rebated_cus==
@@ -424,10 +412,6 @@ FD_UNIT_TEST( execle_bam_simple_fee_payer_fail ) {
   FD_TEST( trailer->txn_ns_dt.exec_start  ==0.f );
   FD_TEST( trailer->txn_ns_dt.commit_start==0.f );
   FD_TEST( trailer->txn_ns_dt.commit_end  ==0.f );
-
-  FD_TEST( fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED_BY_LANDING )+FD_METRICS_ENUM_TXN_LANDING_RESULT_V_DROPPED_IDX ]==1UL );
-  FD_TEST( fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED )+FD_METRICS_ENUM_TXN_RESULT_V_ACCOUNT_NOT_FOUND_IDX ]==1UL );
-  FD_TEST( fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED_BY_VERSION )+FD_METRICS_ENUM_TXN_VERSION_V_V0_IDX ]==1UL );
 
   test_env_destroy( env );
 }
@@ -472,7 +456,9 @@ FD_UNIT_TEST( execle_bam_failed_txn_rollback_balance ) {
 }
 
 FD_UNIT_TEST( execle_bam_bundle_ok ) {
-  /* Successful bundle */
+  /* execle_bundle_ok as a BAM revert batch, whose result rides the last
+     member's microblock.  As in execle_bam_simple_ok, the execution
+     outcome is upstream's to check. */
   test_env_t * env = test_env_create();
   fd_bank_t * bank = fd_svm_mini_bank( env->mini, env->bank_idx );
 
@@ -500,23 +486,20 @@ FD_UNIT_TEST( execle_bam_bundle_ok ) {
   test_mark_bam_batch( txns, test_bam, 2UL, 103U, 1 );
   test_execle_run( env, txns, 2UL, 8U, 21UL, 1 );
 
-  test_assert_bundle_out( env, 1UL, 8U );
-  fd_frag_meta_t const * final_meta = test_out_poh_meta( 1UL );
-  fd_bam_bundle_result_t const * result = fd_bam_microblock_strip_result( fd_chunk_to_laddr( env->execle->out_poh->mem, final_meta->chunk ), &(ulong){ final_meta->sz } );
-  FD_TEST( fd_frag_meta_seq_query( final_meta )==1UL );
-  FD_TEST( final_meta->sig==fd_disco_execle_sig( bank->f.slot, 9U ) );
+  test_assert_bam_bundle_out( env, 2UL, 8U );
+  fd_bam_bundle_result_t const * result = test_out_poh_bam_result( env, 1UL );
   FD_TEST( result );
   FD_TEST( result->seq_id==103U );
   FD_TEST( result->execution_success );
-  FD_TEST( env->execle->txn_out[0].err.is_committable );
-  FD_TEST( env->execle->txn_out[1].err.is_committable );
+  FD_TEST( !result->transaction_err_count );
+  FD_TEST( result->feepayer_balance_lamports[1]==payer_start - 2UL*fee - transfer0 - transfer1 );
   for( ulong i=0UL; i<2UL; i++ ) {
+    FD_TEST( result->consumed_cus[i]==150U ); /* one System transfer */
+
     fd_txn_p_t const * out_txn = fd_chunk_to_laddr( env->execle->out_poh->mem, test_out_poh_meta( i )->chunk );
     FD_TEST( out_txn->flags & FD_TXN_P_FLAGS_SANITIZE_SUCCESS );
     FD_TEST( out_txn->flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS );
     FD_TEST( (out_txn->flags & FD_TXN_P_FLAGS_RESULT_MASK)==0U );
-    FD_TEST( !env->execle->txn_out[i].err.is_fees_only );
-    FD_TEST( env->execle->txn_out[i].err.txn_err==FD_RUNTIME_EXECUTE_SUCCESS );
 
     FD_TEST( out_txn->execle_cu.actual_consumed_cus + out_txn->execle_cu.rebated_cus ==
              txns[i].pack_cu.non_execution_cus + txns[i].pack_cu.requested_exec_plus_acct_data_cus );
@@ -531,14 +514,6 @@ FD_UNIT_TEST( execle_bam_bundle_ok ) {
     FD_TEST( !memcmp( trailer->hash, expected_hash, 32UL ) );
     test_assert_txn_ns_dt_ordered( &trailer->txn_ns_dt );
   }
-
-  FD_TEST( test_read_lamports( env, &fee_payer  )==payer_start - 2UL*fee - transfer0 - transfer1 );
-  FD_TEST( test_read_lamports( env, &recipient0 )==recipient0_start + transfer0 );
-  FD_TEST( test_read_lamports( env, &recipient1 )==recipient1_start + transfer1 );
-
-  FD_TEST( fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED_BY_LANDING )+FD_METRICS_ENUM_TXN_LANDING_RESULT_V_SUCCESS_IDX ]==2UL );
-  FD_TEST( fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED )+FD_METRICS_ENUM_TXN_RESULT_V_SUCCESS_IDX ]==2UL );
-  FD_TEST( fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED_BY_VERSION )+FD_METRICS_ENUM_TXN_VERSION_V_LEGACY_IDX ]==2UL );
 
   test_env_destroy( env );
 }
@@ -1031,21 +1006,15 @@ test_bam_pair_run( int variant,
 }
 
 /* Both completion orders must produce the same ledger, balances and
-   terminal results. */
+   terminal results.  Each run checks the ledger, balances and outcomes
+   against the same expected values; compare the rest of the results. */
 static void
 test_bam_pair_check( int                      variant,
                      test_bam_pair_result_t * parallel ) {
   test_bam_pair_result_t serial;
   test_bam_pair_run( variant, 1, parallel );
   test_bam_pair_run( variant, 0, &serial );
-  FD_TEST( !memcmp( parallel->balances, serial.balances, sizeof(serial.balances) ) );
-  FD_TEST( parallel->motor.txn_cnt==serial.motor.txn_cnt );
-  for( ulong i=0UL; i<serial.motor.txn_cnt; i++ ) {
-    FD_TEST( parallel->motor.txns[i].payload_sz==serial.motor.txns[i].payload_sz );
-    FD_TEST( !memcmp( parallel->motor.txns[i].payload, serial.motor.txns[i].payload, serial.motor.txns[i].payload_sz ) );
-  }
   for( ulong i=0UL; i<2UL; i++ ) {
-    FD_TEST( parallel->terminal[i].execution_success==serial.terminal[i].execution_success );
     FD_TEST( !memcmp( parallel->terminal[i].transaction_err, serial.terminal[i].transaction_err,
                       sizeof(serial.terminal[i].transaction_err) ) );
     FD_TEST( !memcmp( parallel->terminal[i].feepayer_balance_lamports, serial.terminal[i].feepayer_balance_lamports,
@@ -1138,7 +1107,6 @@ test_bam_lookahead_ready( void const *       _ctx,
 }
 
 typedef struct {
-  ulong balances[5];
   ulong actual_cost;
   fd_bam_bundle_result_t terminal[3];
 } test_bam_lookahead_result_t;
@@ -1243,7 +1211,7 @@ test_bam_lookahead_execute( int                          atomic,
   ulong expected[5];
   fd_memcpy( expected, test_bam_initial, sizeof(expected) );
   for( ulong i=0UL; i<3UL; i++ ) { expected[payer[i]]-=fee+transfer[i]; expected[recipient[i]]+=transfer[i]; }
-  for( ulong i=0UL; i<5UL; i++ ) FD_TEST( (result->balances[i]=test_read_lamports( env[0], &accounts[i] ))==expected[i] );
+  for( ulong i=0UL; i<5UL; i++ ) FD_TEST( test_read_lamports( env[0], &accounts[i] )==expected[i] );
   ulong unexecuted_cnt;
   result->actual_cost = test_bam_settle( pack, bank, env, output, &unexecuted_cnt );
   FD_TEST( !unexecuted_cnt );
@@ -1257,14 +1225,12 @@ FD_UNIT_TEST( execle_bam_independent_lookahead_pack_motor ) {
     test_bam_lookahead_result_t parallel, serial;
     test_bam_lookahead_execute( atomic, 1, &parallel );
     test_bam_lookahead_execute( atomic, 0, &serial );
-    FD_TEST( !memcmp( parallel.balances, serial.balances, sizeof(parallel.balances) ) );
+    /* Each run checks balances and outcomes; compare the rest. */
     FD_TEST( parallel.actual_cost==serial.actual_cost );
     for( ulong i=0UL; i<3UL; i++ ) {
       fd_bam_bundle_result_t const * p = &parallel.terminal[i];
       fd_bam_bundle_result_t const * s = &serial.terminal[i];
-      FD_TEST( p->seq_id==s->seq_id && p->scheduler_gen==s->scheduler_gen && p->slot==s->slot );
-      FD_TEST( p->execution_success==s->execution_success && p->bundle_txn_cnt==s->bundle_txn_cnt );
-      FD_TEST( p->transaction_err_count==s->transaction_err_count && p->sanitize_success[0]==s->sanitize_success[0] );
+      FD_TEST( p->bundle_txn_cnt==s->bundle_txn_cnt && p->sanitize_success[0]==s->sanitize_success[0] );
       FD_TEST( p->consumed_cus[0]==s->consumed_cus[0] );
       FD_TEST( p->feepayer_balance_lamports[0]==s->feepayer_balance_lamports[0] );
       FD_TEST( p->loaded_accounts_data_size[0]==s->loaded_accounts_data_size[0] );

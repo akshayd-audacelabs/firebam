@@ -10,9 +10,8 @@ int test_bundle_exec_upstream_main( int argc, char ** argv );
 #include "../../flamenco/runtime/fd_runtime_const.h"
 #include "../../flamenco/runtime/sysvar/fd_sysvar_recent_hashes.h"
 
-#define TEST_BAM_FILLER_MAX (8UL)
-
-/* test_bam_reset_world mirrors test_execute_bundles' reset_world. */
+/* test_bam_reset_world mirrors test_execute_bundles' reset_world, with
+   only the one filler account these tests use. */
 static void
 test_bam_reset_world( test_env_t *    env,
                       fd_svm_mini_t * mini ) {
@@ -20,16 +19,14 @@ test_bam_reset_world( test_env_t *    env,
   fd_pubkey_t pubkey1 = { .ul[0] = 1UL };
   fd_pubkey_t pubkey2 = { .ul[0] = 2UL };
   fd_pubkey_t pubkey3 = { .ul[0] = 3UL };
+  fd_pubkey_t filler  = { .ul[0] = 0xF000UL };
   uchar data2[5] = {6, 7, 8, 9, 10};
   uchar data3[5] = {11, 12, 13, 14, 15};
   setup_env( env, mini );
   create_test_account( env->mini->runtime->accdb, env->fork_id, &pubkey1, 1000000UL, 0UL, NULL,  &system );
   create_test_account( env->mini->runtime->accdb, env->fork_id, &pubkey2, 1000000UL, 5UL, data2, &system );
   create_test_account( env->mini->runtime->accdb, env->fork_id, &pubkey3, 1000000UL, 5UL, data3, &system );
-  for( ulong i=0UL; i<TEST_BAM_FILLER_MAX; i++ ) {
-    fd_pubkey_t filler = { .ul[0] = 0xF000UL + i };
-    create_test_account( env->mini->runtime->accdb, env->fork_id, &filler, 1000000UL, 0UL, NULL, &system );
-  }
+  create_test_account( env->mini->runtime->accdb, env->fork_id, &filler,  1000000UL, 0UL, NULL,  &system );
 }
 
 /* A parent-visible ALT address receives the writable permission from a
