@@ -401,6 +401,8 @@ FD_UNIT_TEST( execle_bam_simple_fee_payer_fail ) {
   FD_TEST( result );
   FD_TEST( result->seq_id==102U );
   FD_TEST( !result->execution_success );
+  FD_TEST( result->transaction_err_count==1U );
+  FD_TEST( result->transaction_err[0]==bam_types_TransactionErrorReason_ACCOUNT_NOT_FOUND );
   fd_txn_p_t const * out_txn = fd_chunk_to_laddr( env->execle->out_poh->mem, test_out_poh_meta( 0UL )->chunk );
   FD_TEST( !env->execle->txn_out[0].err.is_committable );
   FD_TEST( env->execle->txn_out[0].err.txn_err==FD_RUNTIME_TXN_ERR_ACCOUNT_NOT_FOUND );
@@ -989,6 +991,9 @@ test_bam_pair_run( int variant,
     FD_TEST( !result->terminal[0].transaction_err_count );
   if( instruction_failure )
     FD_TEST( result->terminal[0].transaction_err[next-1UL]==bam_types_TransactionErrorReason_INSTRUCTION_ERROR );
+  if( atomic_failure ) /* the failure cancels every earlier member */
+    for( ulong i=0UL; i<next-1UL; i++ )
+      FD_TEST( result->terminal[0].transaction_err[i]==bam_types_TransactionErrorReason_COMMIT_CANCELLED );
   if( fees_only )
     FD_TEST( result->terminal[0].transaction_err[0]==bam_types_TransactionErrorReason_PROGRAM_ACCOUNT_NOT_FOUND );
 
@@ -1329,6 +1334,8 @@ FD_UNIT_TEST( execle_bank_blockhash_validity ) {
     FD_TEST( env->execle->txn_out[0].err.txn_err==expected_err );
     fd_bam_bundle_result_t const * result = test_out_poh_bam_result( env, 0UL );
     FD_TEST( result && result->seq_id==400U+(uint)kind && result->execution_success==accepted );
+    FD_TEST( result->transaction_err_count==(accepted ? 0U : 1U) );
+    if( !accepted ) FD_TEST( result->transaction_err[0]==bam_types_TransactionErrorReason_BLOCKHASH_NOT_FOUND );
     FD_TEST( test_read_lamports( env, &recipient )==1000000UL+(accepted ? 1000UL : 0UL) );
     if( !accepted ) FD_TEST( test_read_lamports( env, &payer )==1000000000UL );
     test_env_destroy( env );
@@ -1400,6 +1407,8 @@ FD_UNIT_TEST( execle_reserved_fee_payer_rejected ) {
   test_assert_bam_nonbundle_out( env, 1UL, 0U );
   fd_bam_bundle_result_t const * result = test_out_poh_bam_result( env, 0UL );
   FD_TEST( result && result->seq_id==93U && !result->execution_success );
+  FD_TEST( result->transaction_err_count==1U );
+  FD_TEST( result->transaction_err[0]==bam_types_TransactionErrorReason_INVALID_ACCOUNT_FOR_FEE );
   FD_TEST( test_read_lamports( env, &fd_solana_system_program_id )==before );
   test_env_destroy( env );
 }
