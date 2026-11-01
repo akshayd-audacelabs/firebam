@@ -186,31 +186,6 @@ test_bam_fill_full_txn_batches( bam_types_Packet             (* packets)[ FD_BAM
   }
 }
 
-static void
-test_bam_fill_single_txn_batches( bam_types_Packet *             packets,
-                                  test_bam_packet_encode_ctx_t * packet_ctx,
-                                  bam_types_AtomicTxnBatch *     batches,
-                                  ulong                          batch_cnt,
-                                  uint                           seq_base,
-                                  ulong                          slot_base ) {
-  for( ulong i=0UL; i<batch_cnt; i++ ) {
-    packets[ i ] = (bam_types_Packet)bam_types_Packet_init_default;
-    packets[ i ].data.size      = 1U;
-    packets[ i ].data.bytes[ 0 ] = (uchar)( 'a' + (int)( i % 26UL ) );
-
-    packet_ctx[ i ] = (test_bam_packet_encode_ctx_t){
-      .packets    = &packets[ i ],
-      .packet_cnt = 1UL
-    };
-
-    batches[ i ] = (bam_types_AtomicTxnBatch)bam_types_AtomicTxnBatch_init_default;
-    batches[ i ].seq_id            = (uint32_t)( seq_base + (uint)i );
-    batches[ i ].max_schedule_slot = slot_base + i;
-    batches[ i ].packets.funcs.encode = test_bam_encode_packets_cb;
-    batches[ i ].packets.arg          = &packet_ctx[ i ];
-  }
-}
-
 static ulong
 test_hist_total_cnt( fd_histf_t const * hist ) {
   ulong total = 0UL;
@@ -650,15 +625,7 @@ test_bam_current_slot_work_status_bits( fd_wksp_t * wksp ) {
 
   test_bam_env_t env[1];
   fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-  test_bam_env_mock_conn_empty( env );
-  test_bam_env_mock_h2_hs( state );
-  test_bam_env_inject_config_response( state );
-
-  long now = fd_bam_now();
-  state->bam_last_builder_activity_ns    = now;
-  state->bam_builder_heartbeat_received  = 1U;
-  state->bam_stream_live                 = 1U;
-  state->bam_status_recent               = FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY;
+  test_bam_env_mock_conn( env );
 
   fd_keyswitch_t keyswitch = {0};
   keyswitch.state = FD_KEYSWITCH_STATE_COMPLETED;
@@ -911,40 +878,6 @@ test_bam_multiple_batches_forwarded( fd_wksp_t * wksp ) {
   FD_TEST( !memcmp( fd_txn_m_payload_const( tx0 ), bam_dump_txn_fixture, bam_dump_txn_fixture_sz ) );
   FD_TEST( fd_txn_m_payload_const( tx1 )[0] == 'n' );
   FD_TEST( fd_txn_m_payload_const( tx2 )[0] == 'o' );
-
-  test_bam_env_destroy( env );
-}
-
-static void
-test_bam_independent_batches_queue_and_drain_in_order( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-
-  bam_types_Packet packets[3];
-  test_bam_packet_encode_ctx_t packet_ctx[3];
-  bam_types_AtomicTxnBatch batches[3];
-  test_bam_fill_single_txn_batches( packets, packet_ctx, batches, 3UL, 50U, 500UL );
-
-  uchar protobuf[512];
-  size_t protobuf_sz = test_bam_encode_scheduler_multi_batch_response( batches, 3UL, protobuf, sizeof(protobuf) );
-  test_bam_rx_sched( state, protobuf, protobuf_sz );
-
-  FD_TEST( env->stem_seqs[0] == 0UL );
-  FD_TEST( bam_pending_txn_cnt( state->pending_txns ) == 3UL );
-  FD_TEST( state->metrics.transaction_published_cnt == 0UL );
-  FD_TEST( state->metrics.ingress_batch_published_cnt == 0UL );
-
-  FD_TEST( test_bam_env_drain_pending_txns( env ) == 3UL );
-  FD_TEST( bam_pending_txn_empty( state->pending_txns ) );
-  FD_TEST( state->metrics.transaction_published_cnt == 3UL );
-  FD_TEST( state->metrics.atomic_batch_published_cnt == 0UL );
-  FD_TEST( state->metrics.ingress_batch_published_cnt == 3UL );
-
-  for( ulong i=0UL; i<3UL; i++ ) {
-    fd_txn_m_t const * txnm = test_bam_check_published( env, i, 50U+(uint)i, 1U, 0U, 0U, 0UL, 0UL );
-    FD_TEST( env->out_mcache[ i ].sig == 0UL );
-    FD_TEST( fd_txn_m_payload_const( txnm )[0] == (uchar)( 'a' + (int)i ) );
-  }
 
   test_bam_env_destroy( env );
 }
@@ -1208,6 +1141,55 @@ test_bam_verify_backpressure_keeps_feedback_polling( fd_wksp_t * wksp ) {
   test_bam_env_destroy( env );
 }
 
+/* BAM consumes every input unreliably, so a lapping producer may reuse a
+   frag's dcache slot before the stem's overrun check.  after_frag must
+   commit what during_frag copied, never re-read the dcache. */
+static void
+test_bam_ingress_frag_copied_before_overrun_check( fd_wksp_t * wksp ) {
+  test_bam_env_t env[1];
+  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
+
+  union {
+    fd_bam_bundle_result_t result;
+    fd_bam_leader_state_t  leader;
+    fd_poh_reset_t         reset;
+    fd_replay_next_leader_t next_leader;
+    uchar                  bytes[ 1024 ];
+  } in[ 4 ];
+  fd_memset( in, 0, sizeof(in) );
+  state->motor_bam_in_idx       = 0UL;
+  state->motor_result_in        = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in[ 0 ].bytes };
+  state->pack_bam_result_in_idx = 1UL;
+  state->pack_result_in         = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in[ 1 ].bytes };
+  state->pack_bam_leader_in_idx = 2UL;
+  state->pack_leader_in         = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in[ 2 ].bytes };
+  state->replay_in_idx          = 3UL;
+  state->replay_in              = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in[ 3 ].bytes };
+
+  for( ulong i=0UL; i<2UL; i++ ) {
+    in[ i ].result = test_make_bundle_result( 71U+(uint)i, 900UL, 1U );
+    in[ i ].result.scheduler_gen = state->scheduler_gen;
+    fd_bam_test_receive_ingress_frag_lapped( state, i, 0UL, 0UL, sizeof(fd_bam_bundle_result_t), in[ i ].bytes );
+    FD_TEST( state->feedback_queue_depth==i+1UL );
+    FD_TEST( state->bam_results[ i ].seq_id==71U+(uint)i && state->bam_results[ i ].slot==900UL );
+  }
+  in[ 2 ].leader = (fd_bam_leader_state_t){ .slot = 77UL, .tick = 9U, .slot_cu_budget_remaining = 456U };
+  fd_bam_test_receive_ingress_frag_lapped( state, 2UL, 0UL, 0UL, sizeof(fd_bam_leader_state_t), in[ 2 ].bytes );
+  FD_TEST( state->bam_leader_state.slot==77UL && state->bam_leader_state.slot_cu_budget_remaining==456U );
+  in[ 3 ].reset.next_leader_slot = 88UL;
+  in[ 3 ].reset.completed_slot   = 80UL;
+  fd_bam_test_receive_ingress_frag_lapped( state, 3UL, REPLAY_SIG_RESET, 0UL, sizeof(fd_poh_reset_t), in[ 3 ].bytes );
+  FD_TEST( state->next_leader_slot==88UL );
+  in[ 3 ].next_leader = (fd_replay_next_leader_t){ .slot = 90UL, .next_leader_slot = 99UL };
+  fd_bam_test_receive_ingress_frag_lapped( state, 3UL, REPLAY_SIG_NEXT_LEADER, 0UL, sizeof(fd_replay_next_leader_t), in[ 3 ].bytes );
+  FD_TEST( state->next_leader_slot==99UL );
+  in[ 3 ].next_leader = (fd_replay_next_leader_t){ .slot = 100UL, .next_leader_slot = ULONG_MAX };
+  fd_bam_test_receive_ingress_frag_lapped( state, 3UL, REPLAY_SIG_NEXT_LEADER, 0UL, sizeof(fd_replay_next_leader_t), in[ 3 ].bytes );
+  FD_TEST( state->next_leader_slot==ULONG_MAX && state->leader_schedule_recheck_slot==164UL );
+
+  test_bam_env_destroy( env );
+}
+
 static void
 test_bam_queue_full_rejects_whole_batch_without_partial_enqueue( fd_wksp_t * wksp ) {
   test_bam_env_t env[1];
@@ -1242,14 +1224,18 @@ test_bam_queue_full_rejects_whole_batch_without_partial_enqueue( fd_wksp_t * wks
   test_bam_env_destroy( env );
 }
 
+/* Full atomic batches all publish with their metadata, also when each
+   transaction is FD_TXN_MTU bytes and the message fits the smallest gRPC
+   buffer.  No builder is needed, and seq_id 0 still gets a bundle_id. */
 static void
 test_bam_multiple_batches_accept_full_txn_count( fd_wksp_t * wksp,
                                                  ulong       batch_cnt,
                                                  uint        seq_base,
-                                                 ulong       slot_base ) {
+                                                 ulong       payload_sz ) {
   FD_TEST( batch_cnt <= FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE );
   test_bam_env_t env[1];
   fd_bam_tile_t * state = test_bam_env_create( env, wksp );
+  FD_TEST( fd_mem_iszero( state->builder_pubkey, 32UL ) );
 
   ulong const expected_txn_cnt = batch_cnt * FD_BAM_MAX_TXN_PER_ATOMIC_BATCH;
   zero_meta_ts( env->out_mcache, expected_txn_cnt );
@@ -1257,12 +1243,21 @@ test_bam_multiple_batches_accept_full_txn_count( fd_wksp_t * wksp,
   static bam_types_Packet packets[ FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE ][ FD_BAM_MAX_TXN_PER_ATOMIC_BATCH ];
   static test_bam_packet_encode_ctx_t packet_ctx[ FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE ];
   static bam_types_AtomicTxnBatch batches[ FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE ];
-  test_bam_fill_full_txn_batches( packets, packet_ctx, batches, batch_cnt, seq_base, slot_base );
+  test_bam_fill_full_txn_batches( packets, packet_ctx, batches, batch_cnt, seq_base, 100UL );
+  for( ulong i=0UL; i<batch_cnt; i++ ) {
+    for( ulong j=0UL; j<FD_BAM_MAX_TXN_PER_ATOMIC_BATCH; j++ ) {
+      packets[ i ][ j ].data.size = (pb_size_t)payload_sz;
+      fd_memset( packets[ i ][ j ].data.bytes, packets[ i ][ j ].data.bytes[0], payload_sz );
+      packets[ i ][ j ].meta.size = (pb_size_t)payload_sz;
+    }
+  }
 
-  uchar protobuf[ TEST_BAM_PROTOBUF_BUF_SZ ];
+  static uchar protobuf[ FD_BAM_GRPC_MIN_BUF_SZ ];
   size_t protobuf_sz = test_bam_encode_scheduler_multi_batch_response( batches, batch_cnt, protobuf, sizeof( protobuf ) );
+  FD_TEST( sizeof(fd_grpc_hdr_t)+protobuf_sz<=FD_BAM_GRPC_MIN_BUF_SZ );
   test_bam_rx_sched( state, protobuf, protobuf_sz );
   FD_TEST( bam_pending_txn_cnt( state->pending_txns ) == expected_txn_cnt );
+  FD_TEST( !state->metrics.atomic_batch_published_cnt && !state->metrics.transaction_published_cnt );
   FD_TEST( test_bam_env_drain_all_pending_txns( env ) == expected_txn_cnt );
   FD_TEST( bam_pending_txn_empty( state->pending_txns ) );
 
@@ -1276,42 +1271,10 @@ test_bam_multiple_batches_accept_full_txn_count( fd_wksp_t * wksp,
   for( ulong i=0UL; i<expected_txn_cnt; i++ ) {
     uint const seq_id  = seq_base + (uint)( i / FD_BAM_MAX_TXN_PER_ATOMIC_BATCH );
     uint const txn_idx = (uint)( i % FD_BAM_MAX_TXN_PER_ATOMIC_BATCH );
-    test_bam_check_published( env, i, seq_id, FD_BAM_MAX_TXN_PER_ATOMIC_BATCH, txn_idx, 1U, (ulong)seq_id+1UL,
-                              txn_idx ? 0UL : FD_BAM_MAX_TXN_PER_ATOMIC_BATCH );
+    fd_txn_m_t const * txnm = test_bam_check_published( env, i, seq_id, FD_BAM_MAX_TXN_PER_ATOMIC_BATCH, txn_idx, 1U,
+                                                        (ulong)seq_id+1UL, txn_idx ? 0UL : FD_BAM_MAX_TXN_PER_ATOMIC_BATCH );
+    FD_TEST( txnm->payload_sz==payload_sz );
   }
-
-  test_bam_env_destroy( env );
-}
-
-static void
-test_bam_max_wire_message_fits_min_grpc_buffer( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-
-  static bam_types_Packet packets[ FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE ][ FD_BAM_MAX_TXN_PER_ATOMIC_BATCH ];
-  static test_bam_packet_encode_ctx_t packet_ctx[ FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE ];
-  static bam_types_AtomicTxnBatch batches[ FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE ];
-  test_bam_fill_full_txn_batches( packets, packet_ctx, batches, FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE, 1700U, 600UL );
-
-  for( ulong i=0UL; i<FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE; i++ ) {
-    for( ulong j=0UL; j<FD_BAM_MAX_TXN_PER_ATOMIC_BATCH; j++ ) {
-      packets[ i ][ j ].data.size = (pb_size_t)FD_TXN_MTU;
-      fd_memset( packets[ i ][ j ].data.bytes, (int)(uchar)( i*FD_BAM_MAX_TXN_PER_ATOMIC_BATCH+j ), FD_TXN_MTU );
-      packets[ i ][ j ].meta.size = FD_TXN_MTU;
-    }
-  }
-
-  static uchar protobuf[ FD_BAM_GRPC_MIN_BUF_SZ ];
-  size_t protobuf_sz = test_bam_encode_scheduler_multi_batch_response(
-      batches,
-      FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE,
-      protobuf,
-      sizeof(protobuf) );
-  FD_TEST( sizeof(fd_grpc_hdr_t)+protobuf_sz<=FD_BAM_GRPC_MIN_BUF_SZ );
-
-  test_bam_rx_sched( state, protobuf, protobuf_sz );
-  FD_TEST( bam_pending_txn_cnt( state->pending_txns )==FD_BAM_MAX_TXN_PER_MESSAGE );
-  FD_TEST( test_bam_env_drain_all_pending_txns( env )==FD_BAM_MAX_TXN_PER_MESSAGE );
 
   test_bam_env_destroy( env );
 }
@@ -1532,50 +1495,6 @@ test_bam_scheduler_malformed_mss_padding_rolls_back( fd_wksp_t * wksp ) {
   test_bam_scheduler_malformed_trailer_rolls_back( wksp, trailer, t.bytes_written );
 }
 
-static void
-test_bam_scheduler_mss_padding_does_not_raise_batch_limit( fd_wksp_t * wksp ) {
-  uchar batch[ FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE+1UL ][ 256 ];
-  size_t batch_sz[ FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE+1UL ];
-  for( ulong i=0UL; i<FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE+1UL; i++ )
-    batch_sz[ i ] = test_bam_encode_one_packet_atomic_batch_raw( 605U+(uint)i, (uchar)'v', batch[ i ], sizeof(batch[ i ]) );
-  uchar const zero = 0U;
-  for( ulong batch_cnt=FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE;
-       batch_cnt<=FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE+1UL; batch_cnt++ ) {
-    uchar multi_payload[ 1024 ];
-    pb_ostream_t multi = pb_ostream_from_buffer( multi_payload, sizeof(multi_payload) );
-    for( ulong i=0UL; i<batch_cnt; i++ ) {
-      if( i==4UL )
-        test_bam_encode_string_field_raw( &multi, bam_types_MultipleAtomicTxnBatch_mss_padding_tag, &zero, 1UL );
-      test_bam_encode_string_field_raw( &multi, bam_types_MultipleAtomicTxnBatch_batches_tag, batch[ i ], batch_sz[ i ] );
-    }
-
-    uchar protobuf[ 1200 ];
-    size_t protobuf_sz = test_bam_encode_scheduler_multi_payload_raw( multi_payload, multi.bytes_written,
-                                                                      protobuf, sizeof(protobuf) );
-    test_bam_env_t env[1];
-    fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-    if( batch_cnt==FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE ) zero_meta_ts( env->out_mcache, batch_cnt );
-    test_bam_rx_sched( state, protobuf, protobuf_sz );
-
-    if( batch_cnt==FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE ) {
-      FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_SCHEDULER_ENVELOPE_DECODE_IDX ]==0UL );
-      FD_TEST( state->metrics.ingress_multi_message_received_cnt==1UL );
-      FD_TEST( state->metrics.ingress_batch_commit_attempt_cnt==batch_cnt );
-      FD_TEST( state->metrics.ingress_batch_published_cnt==0UL );
-      FD_TEST( test_bam_env_drain_all_pending_txns( env )==batch_cnt );
-      FD_TEST( state->metrics.ingress_batch_published_cnt==batch_cnt );
-    } else {
-      FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_SCHEDULER_ENVELOPE_DECODE_IDX ]==1UL );
-      FD_TEST( state->metrics.ingress_message_rejected_cnt[ FD_METRICS_ENUM_BAM_INGRESS_MESSAGE_REJECT_REASON_V_OVERFLOW_MESSAGE_IDX ]==1UL );
-      FD_TEST( state->metrics.ingress_multi_message_received_cnt==0UL );
-      FD_TEST( state->metrics.transaction_published_cnt==0UL );
-      FD_TEST( bam_pending_txn_empty( state->pending_txns ) );
-    }
-    FD_TEST( state->feedback_queue_depth==0U );
-    test_bam_env_destroy( env );
-  }
-}
-
 /* Duplicate oneof fields apply only the final recognized one, within a
    SchedulerResponseV0 and across repeated v0 fields.  Cases: 0 batches
    then a heartbeat; 1 two heartbeats then batches; 2 empty batches then a
@@ -1779,67 +1698,58 @@ test_bam_scheduler_rejects_non_length_delimited_packets( fd_wksp_t * wksp ) {
   test_bam_env_destroy( env );
 }
 
-#define TEST_BAM_MULTI_BATCH_WRAPPER_MAX (FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE + 2UL)
-
-/* A message carrying FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE batches is
-   accepted whole, and one carrying more is rejected whole. */
+/* A message carrying FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE independent
+   batches is accepted whole and drains in order, and one carrying more is
+   rejected whole.  mss_padding between batches does not raise the limit. */
 static void
 test_bam_multiple_batches_message_limit( fd_wksp_t * wksp ) {
-  for( ulong batch_cnt=FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE; batch_cnt<=TEST_BAM_MULTI_BATCH_WRAPPER_MAX; batch_cnt+=2UL ) {
-    ulong const overflow = batch_cnt>FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE;
-    ulong const accepted = overflow ? 0UL : batch_cnt;
-    test_bam_env_t env[1];
-    fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-    zero_meta_ts( env->out_mcache, accepted );
+  ulong const max = FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE;
+  uchar  batch   [ FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE+1UL ][ 256 ];
+  size_t batch_sz[ FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE+1UL ];
+  for( ulong i=0UL; i<=max; i++ )
+    batch_sz[ i ] = test_bam_encode_one_packet_atomic_batch_raw( 900U+(uint)i, (uchar)( 'a'+(int)i ), batch[ i ], sizeof(batch[ i ]) );
+  uchar const zero = 0U;
+  for( ulong padding=0UL; padding<2UL; padding++ ) {
+    for( ulong batch_cnt=max; batch_cnt<=max+1UL; batch_cnt++ ) {
+      ulong const overflow = batch_cnt>max;
+      ulong const accepted = overflow ? 0UL : batch_cnt;
+      uchar multi_payload[ 1024 ];
+      pb_ostream_t multi = pb_ostream_from_buffer( multi_payload, sizeof(multi_payload) );
+      for( ulong i=0UL; i<batch_cnt; i++ ) {
+        if( padding && i==4UL )
+          test_bam_encode_string_field_raw( &multi, bam_types_MultipleAtomicTxnBatch_mss_padding_tag, &zero, 1UL );
+        test_bam_encode_string_field_raw( &multi, bam_types_MultipleAtomicTxnBatch_batches_tag, batch[ i ], batch_sz[ i ] );
+      }
+      uchar protobuf[ 1200 ];
+      size_t protobuf_sz = test_bam_encode_scheduler_multi_payload_raw( multi_payload, multi.bytes_written,
+                                                                        protobuf, sizeof(protobuf) );
 
-    bam_types_Packet packets[ TEST_BAM_MULTI_BATCH_WRAPPER_MAX ];
-    test_bam_packet_encode_ctx_t packet_ctx[ TEST_BAM_MULTI_BATCH_WRAPPER_MAX ];
-    bam_types_AtomicTxnBatch batches[ TEST_BAM_MULTI_BATCH_WRAPPER_MAX ];
-    test_bam_fill_single_txn_batches( packets, packet_ctx, batches, batch_cnt, 900U, 300UL );
-    uchar protobuf[ TEST_BAM_PROTOBUF_BUF_SZ ];
-    test_bam_rx_sched( state, protobuf, test_bam_encode_scheduler_multi_batch_response( batches, batch_cnt, protobuf, sizeof( protobuf ) ) );
-    FD_TEST( test_bam_env_drain_all_pending_txns( env ) == accepted );
+      test_bam_env_t env[1];
+      fd_bam_tile_t * state = test_bam_env_create( env, wksp );
+      zero_meta_ts( env->out_mcache, accepted );
+      test_bam_rx_sched( state, protobuf, protobuf_sz );
+      FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_SCHEDULER_ENVELOPE_DECODE_IDX ]==overflow );
+      FD_TEST( state->metrics.ingress_message_rejected_cnt[ FD_METRICS_ENUM_BAM_INGRESS_MESSAGE_REJECT_REASON_V_OVERFLOW_MESSAGE_IDX ]==overflow );
+      FD_TEST( state->metrics.ingress_multi_message_received_cnt==!overflow );
+      FD_TEST( state->metrics.ingress_batch_commit_attempt_cnt==accepted );
+      FD_TEST( bam_pending_txn_cnt( state->pending_txns )==accepted );
+      FD_TEST( env->stem_seqs[0]==0UL && !state->metrics.transaction_published_cnt && !state->metrics.ingress_batch_published_cnt );
 
-    FD_TEST( state->metrics.transaction_published_cnt == accepted );
-    FD_TEST( state->metrics.ingress_batch_published_cnt == accepted );
-    FD_TEST( state->metrics.atomic_batch_published_cnt == 0UL );
-    FD_TEST( state->feedback_queue_depth == 0UL );
-    FD_TEST( state->metrics.ingress_message_rejected_cnt[ FD_METRICS_ENUM_BAM_INGRESS_MESSAGE_REJECT_REASON_V_OVERFLOW_MESSAGE_IDX ] == overflow );
-    FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_SCHEDULER_ENVELOPE_DECODE_IDX ] == overflow );
+      FD_TEST( test_bam_env_drain_pending_txns( env )==accepted ); /* one pass */
+      FD_TEST( bam_pending_txn_empty( state->pending_txns ) );
+      FD_TEST( state->metrics.transaction_published_cnt==accepted );
+      FD_TEST( state->metrics.ingress_batch_published_cnt==accepted );
+      FD_TEST( state->metrics.atomic_batch_published_cnt==0UL );
+      FD_TEST( state->feedback_queue_depth==0UL );
+      for( ulong i=0UL; i<accepted; i++ ) {
+        fd_txn_m_t const * txnm = test_bam_check_published( env, i, 900U+(uint)i, 1U, 0U, 0U, 0UL, 0UL );
+        FD_TEST( env->out_mcache[ i ].sig==0UL );
+        FD_TEST( fd_txn_m_payload_const( txnm )[0]==(uchar)( 'a'+(int)i ) );
+      }
 
-    fd_frag_meta_t * meta = env->out_mcache;
-    for( ulong i=0UL; i<accepted; i++ ) {
-      FD_TEST( meta[ i ].seq == i );
-      fd_txn_m_t * txnm = fd_chunk_to_laddr( state->verify_out.mem, meta[ i ].chunk );
-      FD_TEST( txnm->bam.seq_id == 900U + (uint)i );
-      FD_TEST( txnm->bam.txn_cnt == 1U );
+      test_bam_env_destroy( env );
     }
-
-    test_bam_env_destroy( env );
   }
-}
-
-static void
-test_bam_bundle_forwards_without_builder_info( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-
-  FD_TEST( fd_mem_iszero( state->builder_pubkey, 32UL ) );
-  /* seq_id 0 still yields a nonzero bundle_id. */
-  uchar protobuf[512];
-  size_t protobuf_sz = test_bam_build_scheduler_batch_msg( protobuf, sizeof(protobuf), 0U, 2, 1);
-  test_bam_rx_sched( state, protobuf, protobuf_sz );
-  FD_TEST( bam_pending_txn_cnt( state->pending_txns ) == 2UL );
-  FD_TEST( !state->metrics.atomic_batch_published_cnt && !state->metrics.transaction_published_cnt );
-  FD_TEST( test_bam_env_drain_pending_txns( env ) == 2UL );
-  FD_TEST( state->metrics.atomic_batch_published_cnt == 1UL );
-  FD_TEST( state->metrics.transaction_published_cnt == 2UL );
-  FD_TEST( state->feedback_queue_depth == 0UL );
-
-  test_bam_check_published( env, 0UL, 0U, 2U, 0U, 1U, 1UL, 2UL );
-  test_bam_check_published( env, 1UL, 0U, 2U, 1U, 1U, 1UL, 0UL );
-
-  test_bam_env_destroy( env );
 }
 
 /* Delivers a scheduler message whose one batch ingress rejects, then
@@ -1864,14 +1774,21 @@ test_bam_rejected_result( fd_bam_tile_t *              state,
   return &result->result.not_committed;
 }
 
-/* Mixed or defaulted revert_on_error flags are rejected as
+/* Ingress rejects a malformed batch whole and attributes the reason to
+   its real sequence.  Ingress is also what keeps votes out of the BAM
+   pipeline, whose consumers trust verify.  It
+   parses every packet, so a vote is rejected whatever its signature,
+   position, or scheduler metadata.  A stale slot is rejected before
+   either, and mixed or defaulted revert_on_error flags are rejected as
    INCONSISTENT_BUNDLE. */
 static void
-test_bam_bundle_revert_flag_cases( fd_wksp_t * wksp ) {
+test_bam_ingress_rejects_batch_variants( fd_wksp_t * wksp ) {
+  /* Each packet's payload, has_meta, has_flags and revert_on_error.
+     seq_id 0 is not on the wire, and its reject is still attributed. */
   struct {
     uint seq_id;
     struct { uchar payload, has_meta, has_flags, revert_on_error; } packet[ 2 ];
-  } const cases[] = {
+  } const revert_cases[] = {
     /* Explicit true/false mismatch across two packets. */
     {  0U, { { 'Z', 1, 1, 1 }, { '[', 1, 1, 0 } } },
     /* First packet omits flags (defaults false), second sets true. */
@@ -1881,50 +1798,20 @@ test_bam_bundle_revert_flag_cases( fd_wksp_t * wksp ) {
     /* has_meta without has_flags still defaults false and mismatches true. */
     { 46U, { { 'w', 1, 0, 0 }, { 'z', 1, 1, 1 } } },
   };
+  ulong const revert_case_cnt = sizeof(revert_cases)/sizeof(revert_cases[0]);
 
-  for( ulong case_idx=0UL; case_idx<sizeof(cases)/sizeof(cases[0]); case_idx++ ) {
-    test_bam_env_t env[1];
-    test_bam_env_create( env, wksp );
-    test_bam_env_mock_conn( env );
-
-    bam_types_Packet packets[ 2 ];
-    fd_memset( packets, 0, sizeof( packets ) );
-    for( ulong i=0UL; i<2UL; i++ ) {
-      packets[ i ].data.size                  = 1U;
-      packets[ i ].data.bytes[0]              = cases[ case_idx ].packet[ i ].payload;
-      packets[ i ].has_meta                   = cases[ case_idx ].packet[ i ].has_meta;
-      packets[ i ].meta.has_flags             = cases[ case_idx ].packet[ i ].has_flags;
-      packets[ i ].meta.flags.revert_on_error = cases[ case_idx ].packet[ i ].revert_on_error;
-    }
-    uchar protobuf[256];
-    size_t protobuf_sz = test_bam_encode_scheduler_response( packets, 2UL, cases[ case_idx ].seq_id, protobuf, sizeof( protobuf ) );
-    test_bam_decoded_message_t decoded;
-    bam_types_NotCommitted const * nc = test_bam_rejected_result( env->state, protobuf, protobuf_sz, cases[ case_idx ].seq_id,
-                                                                  (long)15e9+(long)case_idx*(long)1e9, &decoded );
-    FD_TEST( nc->which_reason==bam_types_NotCommitted_deserialization_error_tag );
-    FD_TEST( nc->reason.deserialization_error.reason==bam_types_DeserializationErrorReason_INCONSISTENT_BUNDLE );
-    FD_TEST( nc->reason.deserialization_error.index==0U );
-    test_bam_env_destroy( env );
-  }
-}
-
-/* Ingress rejects a malformed batch whole and attributes the reason to
-   its real sequence.  Ingress is also what keeps votes out of the BAM
-   pipeline, whose consumers trust verify.  It
-   parses every packet, so a vote is rejected whatever its signature,
-   position, or scheduler metadata. */
-static void
-test_bam_ingress_rejects_batch_variants( fd_wksp_t * wksp ) {
-  for( ulong variant=0UL; variant<8UL; variant++ ) {
+  for( ulong variant=0UL; variant<9UL+revert_case_cnt; variant++ ) {
     test_bam_env_t env[1];
     fd_bam_tile_t * state = test_bam_env_create( env, wksp );
     test_bam_env_mock_conn( env );
 
     bam_types_Packet packets[ FD_BAM_MAX_TXN_PER_ATOMIC_BATCH+1UL ];
     ulong            packet_cnt = 1UL;
+    uint             seq_id     = (uint)( 60UL+variant );
     uint             deser_idx  = 0U;
     uint             reason     = bam_types_DeserializationErrorReason_VOTE_TRANSACTION_FAILURE;
     ulong            reject_idx = FD_METRICS_ENUM_BAM_INGRESS_BATCH_REJECT_REASON_V_VOTE_TXN_IDX;
+    ulong            reject_cnt = 1UL;
     fd_memset( packets, 0, sizeof(packets) );
     switch( variant ) {
     case 0UL: /* forged: all signatures zeroed */
@@ -1988,39 +1875,42 @@ test_bam_ingress_rejects_batch_variants( fd_wksp_t * wksp ) {
       reason     = bam_types_DeserializationErrorReason_EMPTY;
       reject_idx = FD_METRICS_ENUM_BAM_INGRESS_BATCH_REJECT_REASON_V_EMPTY_BATCH_IDX;
       break;
+    case 8UL: /* a vote for a stale slot: the slot is checked first */
+      state->bam_leader_state.slot = 45UL;
+      test_bam_init_simple_vote_packet( &packets[0], 1U );
+      reject_cnt = 0UL;
+      break;
+    default: /* mixed or defaulted revert_on_error flags */
+      seq_id     = revert_cases[ variant-9UL ].seq_id;
+      packet_cnt = 2UL;
+      reason     = bam_types_DeserializationErrorReason_INCONSISTENT_BUNDLE;
+      reject_idx = FD_METRICS_ENUM_BAM_INGRESS_BATCH_REJECT_REASON_V_INVALID_BATCH_IDX;
+      for( ulong i=0UL; i<2UL; i++ ) {
+        packets[ i ].data.size                  = 1U;
+        packets[ i ].data.bytes[0]              = revert_cases[ variant-9UL ].packet[ i ].payload;
+        packets[ i ].has_meta                   = revert_cases[ variant-9UL ].packet[ i ].has_meta;
+        packets[ i ].meta.has_flags             = revert_cases[ variant-9UL ].packet[ i ].has_flags;
+        packets[ i ].meta.flags.revert_on_error = revert_cases[ variant-9UL ].packet[ i ].revert_on_error;
+      }
+      break;
     }
 
-    uint const seq_id = (uint)( 60UL+variant );
     uchar protobuf[ 2048 ];
     size_t protobuf_sz = test_bam_encode_scheduler_response( packets, packet_cnt, seq_id, protobuf, sizeof( protobuf ) );
     test_bam_decoded_message_t decoded;
     bam_types_NotCommitted const * nc = test_bam_rejected_result( state, protobuf, protobuf_sz, seq_id, (long)19e9, &decoded );
-    FD_TEST( state->metrics.ingress_batch_rejected_cnt[ reject_idx ]==1UL );
-    FD_TEST( nc->which_reason==bam_types_NotCommitted_deserialization_error_tag );
-    FD_TEST( nc->reason.deserialization_error.reason==reason );
-    FD_TEST( nc->reason.deserialization_error.index==deser_idx );
+    FD_TEST( state->metrics.ingress_batch_rejected_cnt[ reject_idx ]==reject_cnt );
+    if( variant==8UL ) {
+      FD_TEST( nc->which_reason==bam_types_NotCommitted_scheduling_error_tag );
+      FD_TEST( nc->reason.scheduling_error==bam_types_SchedulingError_OUTSIDE_LEADER_SLOT );
+    } else {
+      FD_TEST( nc->which_reason==bam_types_NotCommitted_deserialization_error_tag );
+      FD_TEST( nc->reason.deserialization_error.reason==reason );
+      FD_TEST( nc->reason.deserialization_error.index==deser_idx );
+    }
 
     test_bam_env_destroy( env );
   }
-}
-
-static void
-test_bam_stale_slot_rejects_before_vote_error( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-  test_bam_env_mock_conn( env );
-  state->bam_leader_state.slot = 45UL;
-
-  bam_types_Packet packet[ 1 ];
-  test_bam_init_simple_vote_packet( &packet[0], 1U );
-  uchar protobuf[ 2048 ];
-  size_t protobuf_sz = test_bam_encode_scheduler_response( packet, 1UL, 44U, protobuf, sizeof( protobuf ) );
-  test_bam_decoded_message_t decoded;
-  bam_types_NotCommitted const * nc = test_bam_rejected_result( state, protobuf, protobuf_sz, 44U, (long)18e9, &decoded );
-  FD_TEST( nc->which_reason==bam_types_NotCommitted_scheduling_error_tag );
-  FD_TEST( nc->reason.scheduling_error==bam_types_SchedulingError_OUTSIDE_LEADER_SLOT );
-
-  test_bam_env_destroy( env );
 }
 
 static void
@@ -2061,9 +1951,6 @@ test_bam_generated_v1_protobuf_fixtures( fd_wksp_t * wksp ) {
 
 static void
 test_bam_v1_packet_size_boundaries( fd_wksp_t * wksp ) {
-  FD_STATIC_ASSERT( sizeof(((bam_types_Packet *)0)->data.bytes)==FD_TXN_MTU,
-                    bam_packet_payload_holds_max_v1_transaction );
-
   test_bam_env_t env[1];
   fd_bam_tile_t * state = test_bam_env_create( env, wksp );
   test_bam_env_mock_conn( env );
@@ -2646,38 +2533,64 @@ test_bam_keepalive_pings_during_continuation( fd_wksp_t * wksp ) {
   g_clock = saved_clock;
 }
 
+/* A healthy connection with a live scheduler stream at time now. */
+static fd_bam_tile_t *
+test_bam_live_env_create( test_bam_env_t * env,
+                          fd_wksp_t *      wksp,
+                          long             now ) {
+  g_clock = now;
+  test_bam_env_create( env, wksp );
+  test_bam_env_mock_conn( env );
+  test_bam_prepare_scheduler_stream( env->state );
+  test_bam_keepalive_sync( env->state, now );
+  return env->state;
+}
+
 /* Returning early for an incomplete END_STREAM leaves the scheduler stream
-   live and reconnect reuses stale resolution state.  Release and reset it. */
+   live and reconnect reuses stale resolution state.  A stream that fails
+   (gRPC or HTTP status), ends, or times out is released with its pending
+   leader state, and the transport is reset.  Queued results stay for the
+   next stream; a failed request also discards the auth proof. */
 static void
 test_bam_grpc_end_handling( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-  test_bam_env_mock_conn( env );
-
-  /* A failed, then a successful, end of the scheduler stream */
-  for( ulong ok=0UL; ok<2UL; ok++ ) {
-    state->defer_reset = 0U;
-    fd_grpc_h2_stream_t * stream = fd_grpc_client_stream_acquire( state->grpc_client, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream );
-    FD_TEST( stream );
-    stream->hdrs.h2_status     = 200;
-    stream->hdrs.is_grpc_proto = 1;
-    state->bam_stream = stream;
+  ulong const failed  = FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_REQUEST_FAILED_IDX;
+  ulong const timeout = FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_REQUEST_TIMEOUT_IDX;
+  struct { uint h2_status, grpc_status; ulong failure_idx, drop_idx; } const cases[] = {
+    { 200U, FD_GRPC_STATUS_UNAVAILABLE, failed,    FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_REQUEST_FAILED_IDX },
+    { 200U, FD_GRPC_STATUS_OK,          ULONG_MAX, FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_STREAM_ENDED_IDX   },
+    { 503U, FD_GRPC_STATUS_OK,          failed,    FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_REQUEST_FAILED_IDX },
+    {   0U, 0U, /* timeout */           timeout,   FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_STREAM_TIMEOUT_IDX },
+  };
+  for( ulong i=0UL; i<sizeof(cases)/sizeof(cases[0]); i++ ) {
+    test_bam_env_t env[1];
+    fd_bam_tile_t * state = test_bam_live_env_create( env, wksp, (long)10e9 );
+    fd_bam_bundle_result_t result = test_make_bundle_result( 991U+(uint)i, 42UL, 1U );
+    test_enqueue_bundle_result( state, &result );
+    state->bam_stream_live = 0U;
     fd_bam_client_grpc_callbacks.rx_start( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream );
     FD_TEST( state->bam_stream_live == 1U );
     state->bam_leader_pending = 1U;
 
-    fd_grpc_resp_hdrs_t hdrs = { .h2_status = 200, .grpc_status = ok ? FD_GRPC_STATUS_OK : FD_GRPC_STATUS_UNAVAILABLE };
-    fd_bam_client_grpc_callbacks.rx_end( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream, &hdrs );
+    if( cases[ i ].h2_status ) {
+      fd_grpc_resp_hdrs_t hdrs = { .h2_status = cases[ i ].h2_status, .grpc_status = cases[ i ].grpc_status };
+      fd_bam_client_grpc_callbacks.rx_end( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream, &hdrs );
+    } else {
+      fd_bam_client_grpc_callbacks.rx_timeout( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream, FD_GRPC_DEADLINE_RX_END );
+    }
     FD_TEST( state->bam_stream_live == 0U );
     FD_TEST( state->bam_stream == NULL );
     FD_TEST( state->bam_leader_pending == 0U );
     FD_TEST( state->defer_reset == 1U );
-    FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_REQUEST_FAILED_IDX ] == 1UL );
-    FD_TEST( state->metrics.leader_pending_dropped_cnt[ FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_REQUEST_FAILED_IDX ] == 1UL );
-    FD_TEST( state->metrics.leader_pending_dropped_cnt[ FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_STREAM_ENDED_IDX ] == ok );
-  }
+    FD_TEST( state->bam_auth_ready==(cases[ i ].failure_idx!=failed) );
+    FD_TEST( state->feedback_queue_depth==1U );
+    FD_TEST( state->metrics.failure_cnt[ failed  ]==(cases[ i ].failure_idx==failed ) );
+    FD_TEST( state->metrics.failure_cnt[ timeout ]==(cases[ i ].failure_idx==timeout) );
+    for( ulong j=0UL; j<FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_CNT; j++ ) {
+      FD_TEST( state->metrics.leader_pending_dropped_cnt[ j ]==(j==cases[ i ].drop_idx) );
+    }
 
-  test_bam_env_destroy( env );
+    test_bam_env_destroy( env );
+  }
 }
 
 /* Runs one scheduler stream attempt that the BAM node accepts with
@@ -2778,6 +2691,101 @@ test_bam_scheduler_not_scheduled_reject_streak( fd_wksp_t * wksp ) {
   test_bam_env_destroy( env );
 }
 
+/* The replay frag the tests deliver on the tile's replay in. */
+static union {
+  fd_replay_message_t msg;
+  uchar               bytes[ sizeof(fd_replay_message_t) ];
+} test_bam_replay_frag;
+
+static void
+test_bam_replay_in_setup( fd_bam_tile_t * state ) {
+  fd_memset( &test_bam_replay_frag, 0, sizeof(test_bam_replay_frag) );
+  state->replay_in_idx = 2UL;
+  state->replay_in     = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)test_bam_replay_frag.bytes };
+}
+
+static void
+test_bam_replay_reset( fd_bam_tile_t * state,
+                       ulong           completed_slot,
+                       ulong           next_leader_slot ) {
+  test_bam_replay_frag.msg.reset = (fd_poh_reset_t){ .completed_slot = completed_slot, .next_leader_slot = next_leader_slot };
+  fd_bam_test_receive_ingress_frag( state, state->replay_in_idx, REPLAY_SIG_RESET, 0UL, sizeof(fd_poh_reset_t) );
+}
+
+static void
+test_bam_replay_next_leader( fd_bam_tile_t * state,
+                             ulong           slot,
+                             ulong           next_leader_slot ) {
+  test_bam_replay_frag.msg.next_leader = (fd_replay_next_leader_t){ .slot = slot, .next_leader_slot = next_leader_slot };
+  fd_bam_test_receive_ingress_frag( state, state->replay_in_idx, REPLAY_SIG_NEXT_LEADER, 0UL, sizeof(fd_replay_next_leader_t) );
+}
+
+static void
+test_bam_replay_slot_completed( fd_bam_tile_t * state,
+                                ulong           slot,
+                                ulong           slot_in_epoch,
+                                ulong           slots_per_epoch ) {
+  test_bam_replay_frag.msg.slot_completed =
+      (fd_replay_slot_completed_t){ .slot = slot, .slot_in_epoch = slot_in_epoch, .slots_per_epoch = slots_per_epoch };
+  fd_bam_test_receive_ingress_frag( state, state->replay_in_idx, REPLAY_SIG_SLOT_COMPLETED, 0UL, sizeof(fd_replay_slot_completed_t) );
+}
+
+/* A node in maintenance mode refuses every retry with the same
+   UNAVAILABLE.  The streak warns its duration every interval and keeps
+   queued results, also without a known leader slot; another reason or
+   a new epoch restarts it, as a healthy session does (see
+   test_bam_scheduler_not_scheduled_reject_streak). */
+static void
+test_bam_scheduler_unavailable_reject_streak( fd_wksp_t * wksp ) {
+  long const saved_clock = g_clock;
+  g_clock = (long)10e9;
+  test_bam_env_t env[1];
+  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
+  char const maintenance[] = "Node is in maintenance mode";
+  char const unhealthy[]   = "Node is not healthy";
+  uint const unavailable   = FD_GRPC_STATUS_UNAVAILABLE;
+
+  test_bam_replay_in_setup( state );
+  test_bam_replay_slot_completed( state, 500UL, 100UL, 400UL ); /* epoch [400,800) */
+  state->next_leader_slot = 700UL;
+  fd_bam_bundle_result_t res = test_make_bundle_result( 1U, 100UL, 1 );
+  res.scheduler_gen = state->scheduler_gen;
+  fd_bam_enqueue_result( state, &res );
+
+  long const t0 = g_clock;
+  FD_TEST( !test_bam_scheduler_reject_cycle( env, unavailable, maintenance ) );
+  g_clock += (long)500e6;
+  FD_TEST(  test_bam_scheduler_reject_cycle( env, unavailable, maintenance ) );
+  FD_TEST( state->bam_stream_reject_start_ns==t0 && state->bam_stream_reject_warn_ns==t0 );
+
+  /* The first repeat after the interval warns the streak's duration. */
+  g_clock = t0 + FD_BAM_DISCONNECTED_WARN_INTERVAL_NS;
+  FD_TEST(  test_bam_scheduler_reject_cycle( env, unavailable, maintenance ) );
+  FD_TEST( state->bam_stream_reject_start_ns==t0 && state->bam_stream_reject_warn_ns==g_clock );
+
+  state->next_leader_slot = ULONG_MAX;
+  FD_TEST(  test_bam_scheduler_reject_cycle( env, unavailable, maintenance ) );
+  FD_TEST( state->feedback_queue_depth==1U && !state->metrics.feedback_results_dropped_cnt );
+
+  g_clock += (long)500e6;
+  FD_TEST( !test_bam_scheduler_reject_cycle( env, unavailable, unhealthy ) );
+  FD_TEST( state->bam_stream_reject_start_ns==g_clock );
+  FD_TEST(  test_bam_scheduler_reject_cycle( env, unavailable, unhealthy ) );
+  test_bam_replay_slot_completed( state, 800UL, 0UL, 400UL );
+  FD_TEST( !test_bam_scheduler_reject_cycle( env, unavailable, unhealthy ) );
+
+  /* A PERMISSION_DENIED repeat never warns again within its epoch. */
+  char const not_scheduled[] = "Validator is not on the leader schedule";
+  FD_TEST( !test_bam_scheduler_reject_cycle( env, FD_GRPC_STATUS_PERMISSION_DENIED, not_scheduled ) );
+  long const warned_ns = state->bam_stream_reject_warn_ns;
+  g_clock += FD_BAM_DISCONNECTED_WARN_INTERVAL_NS;
+  FD_TEST(  test_bam_scheduler_reject_cycle( env, FD_GRPC_STATUS_PERMISSION_DENIED, not_scheduled ) );
+  FD_TEST( state->bam_stream_reject_warn_ns==warned_ns );
+
+  test_bam_env_destroy( env );
+  g_clock = saved_clock;
+}
+
 /* Opens a scheduler stream on a fresh connection and delivers its
    response headers. */
 static void
@@ -2860,10 +2868,55 @@ test_bam_scheduler_results_wait_for_acceptance( fd_wksp_t * wksp ) {
   test_bam_env_destroy( env );
 }
 
+/* Clearing BAM ownership before pack retires the old generation exposes stale
+   BAM work to normal scheduling.  Wait for pack's acknowledgement. */
+static void
+test_bam_ownership_generation_retirement_waits_for_pack( fd_wksp_t * wksp ) {
+  test_bam_env_t env[1];
+  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
+
+  ulong bam_status = FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE;
+  ulong generation = (ulong)state->ownership_gen<<1;
+  state->bam_status_fseq  = &bam_status;
+  state->bam_gen_fseq     = &generation;
+  state->ownership_gen_retired = 0U;
+
+  fd_bam_bundle_result_t result = test_make_bundle_result( 731U, 1731UL, 1U );
+  result.scheduler_gen = state->scheduler_gen;
+  test_enqueue_bundle_result( state, &result );
+  FD_TEST( state->feedback_queue_depth==1UL );
+
+  /* A transport reset requests a new ownership generation without
+     changing scheduler identity or dropping durable feedback.  Ownership
+     remains active until pack acknowledges that old pending work is gone. */
+  ushort old_scheduler_gen = state->scheduler_gen;
+  ushort old_ownership_gen = state->ownership_gen;
+  fd_bam_client_reset( state );
+  FD_TEST( state->scheduler_gen==old_scheduler_gen );
+  FD_TEST( state->ownership_gen!=old_ownership_gen );
+  FD_TEST( generation==(((ulong)state->ownership_gen<<1) | 1UL) );
+  FD_TEST( bam_status==FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE );
+  FD_TEST( state->ownership_gen_retired );
+  FD_TEST( state->feedback_queue_depth==1UL );
+
+  /* A fast reconnect cannot bypass the still-unacknowledged retirement
+     merely because bam_status has not dropped yet. */
+  fd_bam_publish_active_state( state, state->stem, 1 );
+  FD_TEST( bam_status==FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE );
+  FD_TEST( state->ownership_gen_retired );
+
+  generation &= ~1UL;
+  fd_bam_publish_active_state( state, state->stem, 0 );
+  FD_TEST( bam_status==0UL );
+  FD_TEST( state->feedback_queue_depth==1UL );
+
+  test_bam_env_destroy( env );
+}
+
 static void
 test_bam_grpc_timeout( fd_wksp_t * wksp ) {
-  /* Deadline expiry cancels inflight auth/scheduler attempts and marks the
-     client for reset. */
+  /* Deadline expiry cancels an inflight auth attempt and marks the client
+     for reset.  test_bam_grpc_end_handling covers the scheduler stream. */
   test_bam_env_t env[1];
   fd_bam_tile_t * state = test_bam_env_create( env, wksp );
   test_bam_env_mock_conn( env );
@@ -2878,84 +2931,35 @@ test_bam_grpc_timeout( fd_wksp_t * wksp ) {
   FD_TEST( state->defer_reset == 1U );
   FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_REQUEST_TIMEOUT_IDX ] == 1UL );
 
-  state->defer_reset = 0U;
-  state->bam_stream_live       = 1U;
-  state->bam_leader_pending    = 1U;
-  fd_grpc_h2_stream_t * timeout_stream = fd_grpc_client_stream_acquire( state->grpc_client, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream );
-  FD_TEST( timeout_stream );
-  state->bam_stream = timeout_stream;
-  fd_bam_client_grpc_callbacks.rx_timeout( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream, FD_GRPC_DEADLINE_RX_END );
-  FD_TEST( state->bam_stream_live == 0U );
-  FD_TEST( state->bam_leader_pending == 0U );
-  FD_TEST( state->defer_reset == 1U );
-  FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_REQUEST_TIMEOUT_IDX ] == 2UL );
-
   test_bam_env_destroy( env );
 }
 
-/* A healthy connection with a live scheduler stream at time now. */
-static fd_bam_tile_t *
-test_bam_live_env_create( test_bam_env_t * env,
-                          fd_wksp_t *      wksp,
-                          long             now ) {
-  g_clock = now;
-  test_bam_env_create( env, wksp );
-  test_bam_env_mock_conn( env );
-  test_bam_prepare_scheduler_stream( env->state );
-  test_bam_keepalive_sync( env->state, now );
-  return env->state;
-}
-
+/* A scheduler stream whose response header block never completes (a
+   HEADERS frame without END_HEADERS) times out and resets the client.
+   Completed headers clear the deadline for the long-lived stream. */
 static void
-test_bam_config_timeout_keeps_scheduler_live( fd_wksp_t * wksp ) {
-  int const deadline_kind[2] = { FD_GRPC_DEADLINE_HEADER, FD_GRPC_DEADLINE_RX_END };
-  for( ulong i=0UL; i<2UL; i++ ) {
+test_bam_scheduler_stream_header_deadline( fd_wksp_t * wksp ) {
+  for( ulong end_headers=0UL; end_headers<2UL; end_headers++ ) {
     test_bam_env_t env[1];
-    fd_bam_tile_t * state = test_bam_live_env_create( env, wksp, (long)10e9 );
-    test_bam_set_server( state, 50055U );
-    state->keepalive->interval   = 0L;
-    state->keepalive->ts_next_tx = LONG_MAX;
-    state->keepalive->ts_deadline = LONG_MAX;
-    state->keepalive->inflight = 0U;
-
-    ulong status[1] = { FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE };
-    state->bam_status_fseq = status;
-
-    /* Keep a successful prior config while its refresh is outstanding.
-       A hung config RPC is independent of the live scheduler. */
+    fd_bam_tile_t * state = test_bam_env_create( env, wksp );
+    test_bam_env_mock_conn_empty( env );
+    test_bam_env_mock_h2_hs( state );
     state->bam_config_inflight = 1U;
-    state->bam_last_config_poll_ns = g_clock-FD_BAM_CLIENT_REQUEST_TIMEOUT;
+    state->bam_auth_ready      = 1U;
+    g_clock = (long)5e9;
+    test_bam_keepalive_sync( state, g_clock );
+    state->bam_last_config_poll_ns = g_clock;
+    fd_bam_client_step_reconnect( state, g_clock );
     fd_grpc_h2_stream_t * stream = state->bam_stream;
-    uchar commission = state->builder_commission;
-    fd_ip4_port_t tpu = state->bam_tpu;
-    long backoff = state->backoff_until;
-    fd_bam_bundle_result_t result = test_make_bundle_result( 777U+(uint)i, 1UL, 1U );
-    test_enqueue_bundle_result( state, &result );
+    FD_TEST( stream && stream->has_header_deadline );
 
-    FD_TEST( fd_bam_client_status( state )==FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY );
-    fd_bam_client_grpc_callbacks.rx_timeout( state, FD_BAM_CLIENT_REQ_BAM_GetBuilderConfig, deadline_kind[i] );
-    FD_TEST( !state->bam_config_inflight && state->bam_last_config_poll_ns==g_clock );
-    FD_TEST( !state->defer_reset && state->backoff_until==backoff );
-    FD_TEST( state->bam_stream==stream && state->bam_stream_live );
-    FD_TEST( state->bam_config_received && state->builder_commission==commission && state->bam_tpu.l==tpu.l );
-    FD_TEST( state->feedback_queue_depth==1U );
-    FD_TEST( fd_fseq_query( state->bam_status_fseq )==FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE );
-    FD_TEST( fd_bam_client_status( state )==FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY );
-    FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_REQUEST_TIMEOUT_IDX ]==1UL );
-    FD_TEST( fd_bam_client_next_deadline( state, g_clock )==g_clock+(long)5e9 ); /* heartbeat */
-
-    /* Feedback continues while this config RPC waits for its own retry. */
-    FD_TEST( fd_bam_client_step_reconnect( state, g_clock )==1 );
-    FD_TEST( !state->feedback_queue_depth && !state->bam_config_inflight );
-    test_bam_decoded_message_t decoded;
-    test_bam_expect_msg( state, &decoded, bam_api_SchedulerMessageV0_multiple_atomic_txn_batch_result_tag );
-    FD_TEST( decoded.multi.result_cnt==1UL && decoded.multi.results[0].seq_id==result.seq_id );
-
-    g_clock += (long)60e9;
-    FD_TEST( fd_bam_client_step_reconnect( state, g_clock )==1 );
-    FD_TEST( state->bam_config_inflight && state->bam_last_config_poll_ns==g_clock );
-    FD_TEST( state->bam_stream==stream && state->bam_stream_live );
-    FD_TEST( fd_fseq_query( state->bam_status_fseq )==FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE );
+    fd_grpc_h2_cb_headers( state->grpc_client->conn, &stream->s, NULL, 0UL, end_headers ? FD_H2_FLAG_END_HEADERS : 0UL );
+    fd_grpc_client_service_streams( state->grpc_client, g_clock+FD_BAM_CLIENT_REQUEST_TIMEOUT-1L );
+    FD_TEST( state->bam_stream==stream && !state->defer_reset );
+    fd_grpc_client_service_streams( state->grpc_client, g_clock+FD_BAM_CLIENT_REQUEST_TIMEOUT );
+    FD_TEST( (state->bam_stream==stream)==(int)end_headers );
+    FD_TEST( !!state->defer_reset==!end_headers );
+    FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_REQUEST_TIMEOUT_IDX ]==(ulong)!end_headers );
 
     test_bam_env_destroy( env );
   }
@@ -3016,15 +3020,23 @@ test_bam_config_rpc_applies_only_after_ok( fd_wksp_t * wksp ) {
 }
 
 /* Failed config polls are independent of the bidirectional scheduler stream.
-   Heartbeats, leader snapshots, and durable results must progress before the
-   next config retry, with the last good config and ownership intact. */
+   A timeout, an HTTP error, or a gRPC error after DATA keeps the session,
+   the last good config and ownership.  Results and heartbeats progress
+   before the next config retry, which waits the full 60 s.  Cases: 0
+   header timeout; 1 end-of-stream timeout; 2 HTTP 503; 3 UNAVAILABLE;
+   4 UNKNOWN; 5 UNAUTHENTICATED. */
 static void
 test_bam_config_status_failure_keeps_scheduler_live( fd_wksp_t * wksp ) {
-  for( ulong i=0UL; i<4UL; i++ ) {
+  uint const grpc_status[ 6 ] = { 0U, 0U, FD_GRPC_STATUS_OK, FD_GRPC_STATUS_UNAVAILABLE, FD_GRPC_STATUS_UNKNOWN,
+                                  FD_GRPC_STATUS_UNAUTHENTICATED };
+  for( ulong i=0UL; i<6UL; i++ ) {
+    int const timeout = i<2UL;
     test_bam_env_t env[1];
     fd_bam_tile_t * state = test_bam_live_env_create( env, wksp, (long)10e9 );
-    state->keepalive->interval = 0L;
     test_bam_set_server( state, 50055U );
+    state->keepalive->interval    = 0L;
+    state->keepalive->ts_next_tx  = LONG_MAX;
+    state->keepalive->ts_deadline = LONG_MAX;
 
     ulong status[1] = { FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE };
     state->bam_status_fseq = status;
@@ -3033,43 +3045,41 @@ test_bam_config_status_failure_keeps_scheduler_live( fd_wksp_t * wksp ) {
     fd_ip4_port_t tpu_before = state->bam_tpu;
     uint fee_version_before = state->fee_cfg_version;
     long backoff_before = state->backoff_until;
-    state->bam_last_config_poll_ns = g_clock-(long)2e9;
+    state->bam_last_config_poll_ns = g_clock-( timeout ? FD_BAM_CLIENT_REQUEST_TIMEOUT : (long)2e9 );
     state->bam_config_inflight = 1U;
+    fd_bam_bundle_result_t result = test_make_bundle_result( 880U+(uint)i, 42UL, 1U );
+    test_enqueue_bundle_result( state, &result );
 
     uchar protobuf[256];
     ulong protobuf_sz = test_bam_encode_config_candidate( protobuf, sizeof(protobuf) );
-    if( i ) {
+    if( i>=3UL ) {
       fd_bam_client_grpc_callbacks.rx_msg( state, protobuf, protobuf_sz, FD_BAM_CLIENT_REQ_BAM_GetBuilderConfig );
       FD_TEST( state->bam_config_pending_received && state->bam_config_inflight );
     }
-    fd_grpc_resp_hdrs_t fail = {
-      .h2_status = i ? 200U : 503U,
-      .grpc_status = i==3UL ? FD_GRPC_STATUS_UNAUTHENTICATED :
-                     i==2UL ? FD_GRPC_STATUS_UNKNOWN :
-                     i==1UL ? FD_GRPC_STATUS_UNAVAILABLE : FD_GRPC_STATUS_OK,
-    };
-    fd_bam_client_grpc_callbacks.rx_end( state, FD_BAM_CLIENT_REQ_BAM_GetBuilderConfig, &fail );
+    FD_TEST( fd_bam_client_status( state )==FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY );
+    if( timeout ) {
+      fd_bam_client_grpc_callbacks.rx_timeout( state, FD_BAM_CLIENT_REQ_BAM_GetBuilderConfig,
+                                               i ? FD_GRPC_DEADLINE_RX_END : FD_GRPC_DEADLINE_HEADER );
+    } else {
+      fd_grpc_resp_hdrs_t fail = { .h2_status = i==2UL ? 503U : 200U, .grpc_status = grpc_status[ i ] };
+      fd_bam_client_grpc_callbacks.rx_end( state, FD_BAM_CLIENT_REQ_BAM_GetBuilderConfig, &fail );
+    }
     FD_TEST( !state->bam_config_inflight && !state->bam_config_pending_received && !state->bam_config_pending_invalid );
     FD_TEST( state->bam_last_config_poll_ns==g_clock && state->backoff_until==backoff_before );
     FD_TEST( !state->defer_reset && state->bam_stream==stream && state->bam_stream_live );
     FD_TEST( state->bam_auth_ready );
     FD_TEST( state->bam_config_received && state->builder_commission==commission_before );
     FD_TEST( state->bam_tpu.l==tpu_before.l && state->fee_cfg_version==fee_version_before );
+    FD_TEST( state->feedback_queue_depth==1U );
     FD_TEST( fd_fseq_query( state->bam_status_fseq )==FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE );
     FD_TEST( fd_bam_client_status( state )==FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY );
+    ulong const failure_idx = timeout ? FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_REQUEST_TIMEOUT_IDX
+                                      : FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_REQUEST_FAILED_IDX;
+    FD_TEST( state->metrics.failure_cnt[ failure_idx ]==1UL );
+    FD_TEST( fd_bam_client_next_deadline( state, g_clock )==g_clock+(long)5e9 ); /* heartbeat */
 
-    fd_bam_bundle_result_t result = test_make_bundle_result( 880U+(uint)i, 42UL, 1U );
-    test_enqueue_bundle_result( state, &result );
-    state->bam_last_validator_heartbeat_ns = g_clock-(long)5e9;
-    state->bam_leader_pending = 1U;
-    state->bam_leader_state = (fd_bam_leader_state_t){
-      .slot=42UL, .tick=7U, .slot_cu_budget_remaining=123U
-    };
+    /* Feedback continues while this config RPC waits for its own retry. */
     test_bam_decoded_message_t decoded;
-    FD_TEST( fd_bam_client_step_reconnect( state, g_clock )==1 );
-    test_bam_expect_msg( state, &decoded, bam_api_SchedulerMessageV0_heart_beat_tag );
-    FD_TEST( fd_bam_client_step_reconnect( state, g_clock )==1 );
-    test_bam_expect_msg( state, &decoded, bam_api_SchedulerMessageV0_leader_state_tag );
     FD_TEST( fd_bam_client_step_reconnect( state, g_clock )==1 );
     test_bam_expect_msg( state, &decoded, bam_api_SchedulerMessageV0_multiple_atomic_txn_batch_result_tag );
     FD_TEST( decoded.multi.result_cnt==1UL && decoded.multi.results[0].seq_id==result.seq_id );
@@ -3077,11 +3087,13 @@ test_bam_config_status_failure_keeps_scheduler_live( fd_wksp_t * wksp ) {
 
     /* A failed poll must not shorten the 60 s cadence. */
     FD_TEST( fd_bam_client_step_reconnect( state, g_clock+(long)30e9 )==1 && !state->bam_config_inflight );
-    test_bam_decode_last_message( state, &decoded ); /* drain the heartbeat */
+    test_bam_expect_msg( state, &decoded, bam_api_SchedulerMessageV0_heart_beat_tag );
 
     g_clock += (long)60e9;
     FD_TEST( fd_bam_client_step_reconnect( state, g_clock )==1 );
-    FD_TEST( state->bam_config_inflight && state->bam_stream==stream && state->bam_stream_live );
+    FD_TEST( state->bam_config_inflight && state->bam_last_config_poll_ns==g_clock );
+    FD_TEST( state->bam_stream==stream && state->bam_stream_live );
+    FD_TEST( fd_fseq_query( state->bam_status_fseq )==FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE );
 
     test_bam_env_destroy( env );
   }
@@ -3222,21 +3234,6 @@ test_bam_first_config_timeout_reconnects( fd_wksp_t * wksp ) {
   g_clock = saved_clock;
 }
 
-static void
-test_bam_scheduler_http_error_requests_transport_reset( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_live_env_create( env, wksp, (long)10e9 );
-  fd_bam_bundle_result_t result = test_make_bundle_result( 991U, 42UL, 1U );
-  test_enqueue_bundle_result( state, &result );
-  state->bam_leader_pending = 1U;
-  fd_grpc_resp_hdrs_t fail = { .h2_status=503U };
-  fd_bam_client_grpc_callbacks.rx_end( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream, &fail );
-  FD_TEST( state->defer_reset && !state->bam_stream_live && !state->bam_stream );
-  FD_TEST( !state->bam_auth_ready && !state->bam_leader_pending );
-  FD_TEST( state->feedback_queue_depth==1U );
-  test_bam_env_destroy( env );
-}
-
 static fd_bam_tile_t *
 test_bam_heartbeat_env_start( test_bam_env_t * env,
                               fd_wksp_t *      wksp ) {
@@ -3245,19 +3242,11 @@ test_bam_heartbeat_env_start( test_bam_env_t * env,
   g_clock = (long)1e9;
   fd_bam_tile_t * state = test_bam_env_create( env, wksp );
   test_bam_env_mock_conn( env );
-  state->enabled = 1;
-  state->keepalive->ts_deadline = LONG_MAX;
-  state->keepalive->ts_last_tx = g_clock;
-  state->keepalive->ts_last_rx = g_clock;
-  state->keepalive->inflight   = 0;
-  state->defer_reset = 0;
-  test_bam_keepalive_sync( state, g_clock );
   state->keepalive_interval    = LONG_MAX;
   state->keepalive->interval   = 0L;
   state->keepalive->timeout    = LONG_MAX;
   state->keepalive->ts_next_tx = LONG_MAX;
   state->keepalive->ts_deadline = LONG_MAX;
-  state->keepalive->inflight   = 0U;
   fd_bam_client_grpc_callbacks.rx_start( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream );
   FD_TEST( state->bam_last_builder_activity_ns == g_clock );
   FD_TEST( state->bam_last_validator_heartbeat_ns == g_clock );
@@ -3371,56 +3360,30 @@ test_bam_scheduler_stream_replays_only_retained_leader_state( fd_wksp_t * wksp )
   fd_bam_client_grpc_callbacks.rx_start( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream );
   FD_TEST( state->bam_leader_pending == 0U );
 
-  state->bam_leader_state = (fd_bam_leader_state_t){
-    .slot = 41UL,
-    .tick = 12U,
-    .slot_cu_budget_remaining = 321U,
-    .slot_end_ns = g_clock - FD_BAM_LEADER_STATE_EXPIRY_GRACE_NS - 1L,
-    .current_slot_has_bam_work = 1U
+  /* A state that ended more than the grace ago is dropped, even pending;
+     one just inside the grace or not yet ended is replayed. */
+  struct { ulong slot; ushort tick; uint cu; long slot_end_ns; } const cases[ 3 ] = {
+    { 41UL, 12U, 321U, g_clock - FD_BAM_LEADER_STATE_EXPIRY_GRACE_NS - 1L },
+    { 42UL,  8U, 456U, g_clock - FD_BAM_LEADER_STATE_EXPIRY_GRACE_NS + 1L },
+    { 43UL,  7U, 123U, g_clock + (long)1e9                                },
   };
-  state->bam_leader_pending = 1U;
+  for( ulong i=0UL; i<3UL; i++ ) {
+    state->bam_leader_state = (fd_bam_leader_state_t){
+      .slot = cases[ i ].slot,
+      .tick = cases[ i ].tick,
+      .slot_cu_budget_remaining = cases[ i ].cu,
+      .slot_end_ns = cases[ i ].slot_end_ns,
+      .current_slot_has_bam_work = 1U
+    };
+    state->bam_leader_pending = !i;
+    state->bam_stream_live    = 0U;
 
-  fd_bam_client_grpc_callbacks.rx_start( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream );
-  FD_TEST( state->bam_leader_pending == 0U );
-  FD_TEST( fd_bam_client_step_reconnect( state, g_clock ) == 0 );
-
-  state->bam_leader_state = (fd_bam_leader_state_t){
-    .slot = 42UL,
-    .tick = 8U,
-    .slot_cu_budget_remaining = 456U,
-    .slot_end_ns = g_clock - FD_BAM_LEADER_STATE_EXPIRY_GRACE_NS + 1L,
-    .current_slot_has_bam_work = 1U
-  };
-  state->bam_leader_pending = 0U;
-  state->bam_stream_live       = 0U;
-
-  fd_bam_client_grpc_callbacks.rx_start( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream );
-  FD_TEST( state->bam_leader_pending == 1U );
-
-  int busy = fd_bam_client_step_reconnect( state, g_clock );
-  FD_TEST( busy == 1 );
-  FD_TEST( state->bam_leader_pending == 0U );
-
-  test_bam_expect_leader_state( state, 42UL, 8U, 456U );
-
-  state->bam_leader_state = (fd_bam_leader_state_t){
-    .slot = 43UL,
-    .tick = 7U,
-    .slot_cu_budget_remaining = 123U,
-    .slot_end_ns = g_clock + (long)1e9,
-    .current_slot_has_bam_work = 1U
-  };
-  state->bam_leader_pending = 0U;
-  state->bam_stream_live       = 0U;
-
-  fd_bam_client_grpc_callbacks.rx_start( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream );
-  FD_TEST( state->bam_leader_pending == 1U );
-
-  busy = fd_bam_client_step_reconnect( state, g_clock );
-  FD_TEST( busy == 1 );
-  FD_TEST( state->bam_leader_pending == 0U );
-
-  test_bam_expect_leader_state( state, 43UL, 7U, 123U );
+    fd_bam_client_grpc_callbacks.rx_start( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream );
+    FD_TEST( state->bam_leader_pending == (uint)!!i );
+    FD_TEST( fd_bam_client_step_reconnect( state, g_clock ) == !!i );
+    FD_TEST( state->bam_leader_pending == 0U );
+    if( i ) test_bam_expect_leader_state( state, cases[ i ].slot, cases[ i ].tick, cases[ i ].cu );
+  }
 
   test_bam_env_destroy( env );
 }
@@ -3842,7 +3805,7 @@ test_bam_scheduler_auth_proof_publishes_message( fd_wksp_t * wksp ) {
 /* A session without a config polls at once, even with its scheduler stream
    up, then every second until it has a builder. */
 static void
-test_bam_missing_config_repolls_despite_valid_builder_info( fd_wksp_t * wksp ) {
+test_bam_missing_config_repolls_at_once_with_stream_up( fd_wksp_t * wksp ) {
   test_bam_env_t env[1];
   fd_bam_tile_t * state = test_bam_env_create( env, wksp );
   test_bam_env_mock_conn_empty( env );
@@ -3976,32 +3939,6 @@ test_bam_config_polls_every_minute_with_builder( fd_wksp_t * wksp ) {
   g_clock = saved_clock;
 }
 
-/* A due validator heartbeat, then pending leader state, go out on the
-   scheduler stream. */
-static void
-test_bam_scheduler_heartbeat_publishes_message( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_live_env_create( env, wksp, (long)7e9 );
-  long now = g_clock;
-  state->bam_last_validator_heartbeat_ns = 0L;
-  state->bam_last_config_poll_ns = now;
-  FD_TEST( fd_bam_client_step_reconnect( state, now )==1 );
-  FD_TEST( state->bam_last_validator_heartbeat_ns == now );
-
-  test_bam_decoded_message_t decoded;
-  test_bam_expect_msg( state, &decoded, bam_api_SchedulerMessageV0_heart_beat_tag );
-  FD_TEST( decoded.msg.versioned_msg.v0.msg.heart_beat.time_sent_microseconds == (uint64_t)(now/1000L) );
-  FD_TEST( state->metrics.outbound_enqueue_outcome_cnt[ FD_METRICS_ENUM_BAM_ENQUEUE_RESULT_V_HEARTBEAT_ENQUEUED_IDX ] == 1UL );
-
-  state->bam_leader_pending = 1U;
-  state->bam_leader_state = (fd_bam_leader_state_t){ .slot = 42UL, .tick = 7U, .slot_cu_budget_remaining = 123U };
-  FD_TEST( fd_bam_client_step_reconnect( state, now )==1 );
-  FD_TEST( state->bam_leader_pending == 0U );
-  test_bam_expect_leader_state( state, 42UL, 7U, 123U );
-
-  test_bam_env_destroy( env );
-}
-
 static void
 test_bam_deliver_scheduler_ping( fd_bam_tile_t * state,
                                  uint32_t        ping_id ) {
@@ -4110,16 +4047,18 @@ test_bam_outbound_send_blocked_is_not_failure( fd_wksp_t * wksp ) {
   FD_TEST( state->bam_leader_pending );
   FD_TEST( state->feedback_queue_depth==1U );
 
-  /* Each later step sends the next message once the previous one is out. */
+  /* Each later step sends the next message once the previous one is out:
+     the heartbeat, then the leader state, then the result. */
   test_bam_decoded_message_t decoded;
   test_bam_decode_last_message( state, &decoded ); /* drains the config request */
-  pb_size_t const order[3] = { bam_api_SchedulerMessageV0_heart_beat_tag,
-                               bam_api_SchedulerMessageV0_leader_state_tag,
-                               bam_api_SchedulerMessageV0_multiple_atomic_txn_batch_result_tag };
-  for( ulong i=0UL; i<3UL; i++ ) {
-    FD_TEST( fd_bam_client_step_reconnect( state, now )==1 );
-    test_bam_expect_msg( state, &decoded, order[ i ] );
-  }
+  FD_TEST( fd_bam_client_step_reconnect( state, now )==1 );
+  test_bam_expect_msg( state, &decoded, bam_api_SchedulerMessageV0_heart_beat_tag );
+  FD_TEST( decoded.msg.versioned_msg.v0.msg.heart_beat.time_sent_microseconds==(uint64_t)( now/1000L ) );
+  FD_TEST( state->bam_last_validator_heartbeat_ns==now );
+  FD_TEST( fd_bam_client_step_reconnect( state, now )==1 );
+  test_bam_expect_leader_state( state, 42UL, 7U, 123U );
+  FD_TEST( fd_bam_client_step_reconnect( state, now )==1 );
+  test_bam_expect_msg( state, &decoded, bam_api_SchedulerMessageV0_multiple_atomic_txn_batch_result_tag );
   FD_TEST( !state->bam_leader_pending );
   FD_TEST( !state->feedback_queue_depth );
   FD_TEST( cnt[ FD_METRICS_ENUM_BAM_ENQUEUE_RESULT_V_HEARTBEAT_ENQUEUED_IDX    ]==1UL );
@@ -4198,45 +4137,6 @@ test_bam_leader_state_supersede_counts_drop( fd_wksp_t * wksp ) {
   FD_TEST( state->metrics.leader_pending_replaced_cnt==1UL );
 
   test_bam_env_destroy( env );
-}
-
-/* The replay frag the tests deliver on the tile's replay in. */
-static union {
-  fd_replay_message_t msg;
-  uchar               bytes[ sizeof(fd_replay_message_t) ];
-} test_bam_replay_frag;
-
-static void
-test_bam_replay_in_setup( fd_bam_tile_t * state ) {
-  fd_memset( &test_bam_replay_frag, 0, sizeof(test_bam_replay_frag) );
-  state->replay_in_idx = 2UL;
-  state->replay_in     = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)test_bam_replay_frag.bytes };
-}
-
-static void
-test_bam_replay_reset( fd_bam_tile_t * state,
-                       ulong           completed_slot,
-                       ulong           next_leader_slot ) {
-  test_bam_replay_frag.msg.reset = (fd_poh_reset_t){ .completed_slot = completed_slot, .next_leader_slot = next_leader_slot };
-  fd_bam_test_receive_ingress_frag( state, state->replay_in_idx, REPLAY_SIG_RESET, 0UL, sizeof(fd_poh_reset_t) );
-}
-
-static void
-test_bam_replay_next_leader( fd_bam_tile_t * state,
-                             ulong           slot,
-                             ulong           next_leader_slot ) {
-  test_bam_replay_frag.msg.next_leader = (fd_replay_next_leader_t){ .slot = slot, .next_leader_slot = next_leader_slot };
-  fd_bam_test_receive_ingress_frag( state, state->replay_in_idx, REPLAY_SIG_NEXT_LEADER, 0UL, sizeof(fd_replay_next_leader_t) );
-}
-
-static void
-test_bam_replay_slot_completed( fd_bam_tile_t * state,
-                                ulong           slot,
-                                ulong           slot_in_epoch,
-                                ulong           slots_per_epoch ) {
-  test_bam_replay_frag.msg.slot_completed =
-      (fd_replay_slot_completed_t){ .slot = slot, .slot_in_epoch = slot_in_epoch, .slots_per_epoch = slots_per_epoch };
-  fd_bam_test_receive_ingress_frag( state, state->replay_in_idx, REPLAY_SIG_SLOT_COMPLETED, 0UL, sizeof(fd_replay_slot_completed_t) );
 }
 
 static void
@@ -4364,67 +4264,6 @@ test_bam_replay_schedule_recheck_slot_policy( fd_wksp_t * wksp ) {
   FD_TEST( !fd_bam_tile_waiting_for_leader_slot( state ) );
 
   test_bam_env_destroy( env );
-}
-
-/* A node in maintenance mode refuses every retry with the same
-   UNAVAILABLE.  The streak warns its duration every interval and keeps
-   queued results, also without a known leader slot; another reason, a
-   new epoch, or a healthy session restarts it. */
-static void
-test_bam_scheduler_unavailable_reject_streak( fd_wksp_t * wksp ) {
-  long const saved_clock = g_clock;
-  g_clock = (long)10e9;
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-  char const maintenance[] = "Node is in maintenance mode";
-  char const unhealthy[]   = "Node is not healthy";
-  uint const unavailable   = FD_GRPC_STATUS_UNAVAILABLE;
-
-  test_bam_replay_in_setup( state );
-  test_bam_replay_slot_completed( state, 500UL, 100UL, 400UL ); /* epoch [400,800) */
-  state->next_leader_slot = 700UL;
-  fd_bam_bundle_result_t res = test_make_bundle_result( 1U, 100UL, 1 );
-  res.scheduler_gen = state->scheduler_gen;
-  fd_bam_enqueue_result( state, &res );
-
-  long const t0 = g_clock;
-  FD_TEST( !test_bam_scheduler_reject_cycle( env, unavailable, maintenance ) );
-  g_clock += (long)500e6;
-  FD_TEST(  test_bam_scheduler_reject_cycle( env, unavailable, maintenance ) );
-  FD_TEST( state->bam_stream_reject_start_ns==t0 && state->bam_stream_reject_warn_ns==t0 );
-
-  /* The first repeat after the interval warns the streak's duration. */
-  g_clock = t0 + FD_BAM_DISCONNECTED_WARN_INTERVAL_NS;
-  FD_TEST(  test_bam_scheduler_reject_cycle( env, unavailable, maintenance ) );
-  FD_TEST( state->bam_stream_reject_start_ns==t0 && state->bam_stream_reject_warn_ns==g_clock );
-
-  state->next_leader_slot = ULONG_MAX;
-  FD_TEST(  test_bam_scheduler_reject_cycle( env, unavailable, maintenance ) );
-  FD_TEST( state->feedback_queue_depth==1U && !state->metrics.feedback_results_dropped_cnt );
-
-  g_clock += (long)500e6;
-  FD_TEST( !test_bam_scheduler_reject_cycle( env, unavailable, unhealthy ) );
-  FD_TEST( state->bam_stream_reject_start_ns==g_clock );
-  FD_TEST(  test_bam_scheduler_reject_cycle( env, unavailable, unhealthy ) );
-  test_bam_replay_slot_completed( state, 800UL, 0UL, 400UL );
-  FD_TEST( !test_bam_scheduler_reject_cycle( env, unavailable, unhealthy ) );
-
-  test_bam_env_mock_conn( env );
-  int charge_busy = 0;
-  fd_bam_client_step( state, &charge_busy );
-  FD_TEST( state->bam_status_counted==FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY );
-  FD_TEST( !state->bam_stream_reject_hash );
-
-  /* A PERMISSION_DENIED repeat never warns again within its epoch. */
-  char const not_scheduled[] = "Validator is not on the leader schedule";
-  FD_TEST( !test_bam_scheduler_reject_cycle( env, FD_GRPC_STATUS_PERMISSION_DENIED, not_scheduled ) );
-  long const warned_ns = state->bam_stream_reject_warn_ns;
-  g_clock += FD_BAM_DISCONNECTED_WARN_INTERVAL_NS;
-  FD_TEST(  test_bam_scheduler_reject_cycle( env, FD_GRPC_STATUS_PERMISSION_DENIED, not_scheduled ) );
-  FD_TEST( state->bam_stream_reject_warn_ns==warned_ns );
-
-  test_bam_env_destroy( env );
-  g_clock = saved_clock;
 }
 
 /* The BAM node admits only validators on its current epoch's leader
@@ -4677,8 +4516,10 @@ test_bam_identity_switch_halts_signing_and_invalidates_leader_schedule_state( fd
   test_bam_env_destroy( env );
 }
 
+/* While no leader slot is known the client does not dial, and rechecks
+   the leader schedule after a wallclock interval or once backoff ends. */
 static void
-test_bam_replay_schedule_hint_does_not_disconnect( fd_wksp_t * wksp ) {
+test_bam_unknown_leader_slot_gates_dial( fd_wksp_t * wksp ) {
   test_bam_env_t env[1];
   fd_bam_tile_t * state = test_bam_env_create( env, wksp );
   g_clock = (long)50e9;
@@ -4726,143 +4567,65 @@ test_bam_replay_schedule_hint_does_not_disconnect( fd_wksp_t * wksp ) {
   FD_TEST( state->leader_schedule_gate_start_ns == 0L );
   state->feedback_queue_depth = 0U;
 
+  /* A schedule hint does not disconnect a healthy connection. */
   test_bam_env_mock_conn( env );
 
   fd_keyswitch_t keyswitch = {0};
   keyswitch.state = FD_KEYSWITCH_STATE_COMPLETED;
   state->keyswitch = &keyswitch;
 
-  fd_metrics_register( (ulong *)fd_metrics_new( metrics_scratch, 0UL ) );
-
   fd_bam_tile_housekeeping( state );
-  fd_bam_test_metrics_write( state );
   charge_busy = 0;
   fd_bam_client_step( state, &charge_busy );
-  FD_TEST( state->bam_status_recent == FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY );
-  FD_TEST( FD_MGAUGE_GET( BAM, IS_HEALTHY ) == 1UL );
-  FD_TEST( FD_MGAUGE_GET( BAM, IS_STREAM_LIVE ) == 1UL );
+  FD_TEST( fd_bam_client_status( state ) == FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY );
   FD_TEST( state->tcp_sock >= 0 );
   FD_TEST( state->tcp_sock_connected == 1U );
 
   state->next_leader_slot     = 100000UL;
   fd_bam_tile_housekeeping( state );
-  fd_bam_test_metrics_write( state );
-  FD_TEST( state->bam_status_recent == FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY );
-  FD_TEST( FD_MGAUGE_GET( BAM, IS_HEALTHY ) == 1UL );
+  FD_TEST( fd_bam_client_status( state ) == FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY );
   FD_TEST( state->tcp_sock >= 0 );
   FD_TEST( state->tcp_sock_connected == 1U );
 
   test_bam_env_destroy( env );
 }
 
-static void
-test_bam_pack_leader_channel_contract( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-
-  union {
-    fd_bam_leader_state_t leader;
-    uchar                 bytes[ sizeof(fd_bam_leader_state_t) ];
-  } ingress = { .leader = {
-    .slot = 77UL,
-    .tick = 9U,
-    .slot_cu_budget_remaining = 456U
-  } };
-
-  state->pack_bam_leader_in_idx = 3UL;
-  state->pack_leader_in = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)ingress.bytes };
-
-  fd_bam_test_receive_ingress_frag( state, state->pack_bam_leader_in_idx, 0UL, 0UL, sizeof(fd_bam_leader_state_t) );
-
-  FD_TEST( state->bam_leader_pending == 1U );
-  FD_TEST( state->bam_leader_state.slot == ingress.leader.slot );
-  FD_TEST( state->bam_leader_state.tick == ingress.leader.tick );
-  FD_TEST( state->bam_leader_state.slot_cu_budget_remaining == ingress.leader.slot_cu_budget_remaining );
-  FD_TEST( state->feedback_queue_depth == 0U );
-
-  fd_bam_test_receive_ingress_frag( state, state->pack_bam_leader_in_idx, 0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
-
-  FD_TEST( state->bam_leader_pending == 1U );
-  FD_TEST( state->bam_leader_state.slot == ingress.leader.slot );
-  FD_TEST( state->feedback_queue_depth == 0U );
-
-  test_bam_env_destroy( env );
-}
-
-/* BAM consumes every input unreliably, so a lapping producer may reuse a
-   frag's dcache slot before the stem's overrun check.  after_frag must
-   commit what during_frag copied, never re-read the dcache. */
-static void
-test_bam_ingress_frag_copied_before_overrun_check( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-
-  union {
-    fd_bam_bundle_result_t result;
-    fd_bam_leader_state_t  leader;
-    fd_poh_reset_t         reset;
-    fd_replay_next_leader_t next_leader;
-    uchar                  bytes[ 1024 ];
-  } in[ 4 ];
-  fd_memset( in, 0, sizeof(in) );
-  state->motor_bam_in_idx       = 0UL;
-  state->motor_result_in        = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in[ 0 ].bytes };
-  state->pack_bam_result_in_idx = 1UL;
-  state->pack_result_in         = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in[ 1 ].bytes };
-  state->pack_bam_leader_in_idx = 2UL;
-  state->pack_leader_in         = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in[ 2 ].bytes };
-  state->replay_in_idx          = 3UL;
-  state->replay_in              = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in[ 3 ].bytes };
-
-  for( ulong i=0UL; i<2UL; i++ ) {
-    in[ i ].result = test_make_bundle_result( 71U+(uint)i, 900UL, 1U );
-    in[ i ].result.scheduler_gen = state->scheduler_gen;
-    fd_bam_test_receive_ingress_frag_lapped( state, i, 0UL, 0UL, sizeof(fd_bam_bundle_result_t), in[ i ].bytes );
-    FD_TEST( state->feedback_queue_depth==i+1UL );
-    FD_TEST( state->bam_results[ i ].seq_id==71U+(uint)i && state->bam_results[ i ].slot==900UL );
-  }
-  in[ 2 ].leader = (fd_bam_leader_state_t){ .slot = 77UL, .tick = 9U, .slot_cu_budget_remaining = 456U };
-  fd_bam_test_receive_ingress_frag_lapped( state, 2UL, 0UL, 0UL, sizeof(fd_bam_leader_state_t), in[ 2 ].bytes );
-  FD_TEST( state->bam_leader_state.slot==77UL && state->bam_leader_state.slot_cu_budget_remaining==456U );
-  in[ 3 ].reset.next_leader_slot = 88UL;
-  in[ 3 ].reset.completed_slot   = 80UL;
-  fd_bam_test_receive_ingress_frag_lapped( state, 3UL, REPLAY_SIG_RESET, 0UL, sizeof(fd_poh_reset_t), in[ 3 ].bytes );
-  FD_TEST( state->next_leader_slot==88UL );
-  in[ 3 ].next_leader = (fd_replay_next_leader_t){ .slot = 90UL, .next_leader_slot = 99UL };
-  fd_bam_test_receive_ingress_frag_lapped( state, 3UL, REPLAY_SIG_NEXT_LEADER, 0UL, sizeof(fd_replay_next_leader_t), in[ 3 ].bytes );
-  FD_TEST( state->next_leader_slot==99UL );
-  in[ 3 ].next_leader = (fd_replay_next_leader_t){ .slot = 100UL, .next_leader_slot = ULONG_MAX };
-  fd_bam_test_receive_ingress_frag_lapped( state, 3UL, REPLAY_SIG_NEXT_LEADER, 0UL, sizeof(fd_replay_next_leader_t), in[ 3 ].bytes );
-  FD_TEST( state->next_leader_slot==ULONG_MAX && state->leader_schedule_recheck_slot==164UL );
-
-  test_bam_env_destroy( env );
-}
-
+/* Leader state from pack waits for a scheduler stream, and a slot change
+   on a live one goes out at once.  A frag of the wrong size changes
+   nothing. */
 static void
 test_bam_pack_leader_slot_change_flushes_immediately( fd_wksp_t * wksp ) {
   test_bam_env_t env[1];
   fd_bam_tile_t * state = test_bam_env_create( env, wksp );
   test_bam_env_mock_conn( env );
 
-  test_bam_prepare_scheduler_stream( state );
-  state->bam_leader_state = (fd_bam_leader_state_t){
-    .slot = 76UL,
-    .tick = 8U,
-    .slot_cu_budget_remaining = 111U
-  };
-
   union {
     fd_bam_leader_state_t leader;
     uchar                 bytes[ sizeof(fd_bam_leader_state_t) ];
   } ingress = { .leader = {
-    .slot = 77UL,
-    .tick = 9U,
-    .slot_cu_budget_remaining = 456U
+    .slot = 76UL,
+    .tick = 8U,
+    .slot_cu_budget_remaining = 111U
   } };
 
   state->pack_bam_leader_in_idx = 3UL;
   state->pack_leader_in = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)ingress.bytes };
 
+  fd_bam_test_receive_ingress_frag( state, state->pack_bam_leader_in_idx, 0UL, 0UL, sizeof(fd_bam_leader_state_t) );
+  FD_TEST( state->bam_leader_pending == 1U );
+  FD_TEST( state->bam_leader_state.slot == 76UL );
+  FD_TEST( state->bam_leader_state.tick == 8U );
+  FD_TEST( state->bam_leader_state.slot_cu_budget_remaining == 111U );
+  FD_TEST( state->feedback_queue_depth == 0U );
+
+  ingress.leader.slot = 77UL;
+  fd_bam_test_receive_ingress_frag( state, state->pack_bam_leader_in_idx, 0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
+  FD_TEST( state->bam_leader_pending == 1U );
+  FD_TEST( state->bam_leader_state.slot == 76UL );
+  FD_TEST( state->feedback_queue_depth == 0U );
+
+  test_bam_prepare_scheduler_stream( state );
+  ingress.leader = (fd_bam_leader_state_t){ .slot = 77UL, .tick = 9U, .slot_cu_budget_remaining = 456U };
   fd_bam_test_receive_ingress_frag( state, state->pack_bam_leader_in_idx, 0UL, 0UL, sizeof(fd_bam_leader_state_t) );
 
   FD_TEST( state->bam_leader_pending == 0U );
@@ -4887,63 +4650,12 @@ test_bam_pack_leader_slot_change_flushes_immediately( fd_wksp_t * wksp ) {
   test_bam_env_destroy( env );
 }
 
-static void
-test_bam_pack_result_channel_contract( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-
-  union {
-    fd_bam_bundle_result_t result;
-    uchar                  bytes[ sizeof(fd_bam_bundle_result_t) ];
-  } ingress = { .result = {0} };
-  ingress.result = test_make_bundle_result( 905U, 1905UL, 2U );
-
-  state->pack_bam_result_in_idx = 4UL;
-  state->pack_result_in = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)ingress.bytes };
-
-  /* A result arriving on a stem input must preempt an old network timer. */
-  long future_deadline = fd_bam_now() + (long)5e9;
-  state->next_step_deadline = future_deadline;
-  fd_bam_test_receive_ingress_frag( state, state->pack_bam_result_in_idx, 0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
-  FD_TEST( state->next_step_deadline==0L );
-  int charge_busy = 0;
-  fd_bam_test_before_credit( state, env->stem, &charge_busy );
-  FD_TEST( state->next_step_deadline!=future_deadline );
-
-  FD_TEST( state->feedback_queue_depth == 1U );
-  FD_TEST( state->bam_results_head == 0U );
-  FD_TEST( state->bam_results_tail == 1U );
-  FD_TEST( state->bam_results[ 0 ].seq_id == ingress.result.seq_id );
-  FD_TEST( state->bam_results[ 0 ].slot == ingress.result.slot );
-  FD_TEST( state->bam_results[ 0 ].bundle_txn_cnt == ingress.result.bundle_txn_cnt );
-  FD_TEST( state->bam_leader_pending == 0U );
-
-  fd_bam_test_receive_ingress_frag( state, state->pack_bam_result_in_idx, 0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
-
-  FD_TEST( state->feedback_queue_depth == 1U );
-  FD_TEST( state->bam_results_tail == 1U );
-
-  ingress.result.slot++;
-  fd_bam_test_receive_ingress_frag( state, state->pack_bam_result_in_idx, 0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
-
-  FD_TEST( state->feedback_queue_depth == 2U );
-  FD_TEST( state->bam_results_tail == 2U );
-  FD_TEST( state->bam_results[ 1 ].slot == ingress.result.slot );
-
-  fd_bam_test_receive_ingress_frag( state, state->pack_bam_result_in_idx, 0UL, 0UL, sizeof(fd_bam_leader_state_t) );
-
-  FD_TEST( state->feedback_queue_depth == 2U );
-  FD_TEST( state->bam_results[ 0 ].seq_id == ingress.result.seq_id );
-  FD_TEST( state->bam_leader_pending == 0U );
-
-  test_bam_env_destroy( env );
-}
-
 /* Execution results arrive only on motor_bam and everything else pack
-   answers on pack_bam_res.  Both queue durably; a frag of the wrong size
-   or on another in queues nothing. */
+   answers on pack_bam_res.  Both queue durably in arrival order and must
+   preempt an old network timer.  A repeat of the newest result, a frag
+   of the wrong size or a frag on another in queues nothing. */
 static void
-test_bam_motor_result_channel_contract( fd_wksp_t * wksp ) {
+test_bam_result_channel_contract( fd_wksp_t * wksp ) {
   test_bam_env_t env[1];
   fd_bam_tile_t * state = test_bam_env_create( env, wksp );
 
@@ -4951,30 +4663,46 @@ test_bam_motor_result_channel_contract( fd_wksp_t * wksp ) {
     fd_bam_bundle_result_t result;
     uchar                  bytes[ sizeof(fd_bam_bundle_result_t) ];
   } ingress[2] = {0};
-  ingress[0].result = test_make_bundle_result( 501U, 1501UL, 1U );
-  ingress[1].result = test_make_bundle_result( 502U, 1502UL, 2U );
-
   state->motor_bam_in_idx       = 5UL;
   state->motor_result_in        = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)ingress[0].bytes };
   state->pack_bam_result_in_idx = 6UL;
   state->pack_result_in         = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)ingress[1].bytes };
+  ulong const in_idx[2] = { state->motor_bam_in_idx, state->pack_bam_result_in_idx };
 
-  fd_bam_test_receive_ingress_frag( state, state->motor_bam_in_idx,       0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
-  fd_bam_test_receive_ingress_frag( state, state->pack_bam_result_in_idx, 0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
+  for( ulong i=0UL; i<2UL; i++ ) {
+    ingress[ i ].result = test_make_bundle_result( 501U+(uint)i, 1501UL+i, (uchar)( 1UL+i ) );
+    ushort const depth = (ushort)( 2UL*i+1UL );
 
-  FD_TEST( state->feedback_queue_depth == 2U );
-  FD_TEST( state->bam_results_head == 0U );
-  FD_TEST( state->bam_results_tail == 2U );
-  FD_TEST( state->bam_results[0].seq_id == ingress[0].result.seq_id );
-  FD_TEST( state->bam_results[0].slot == ingress[0].result.slot );
-  FD_TEST( state->bam_results[1].seq_id == ingress[1].result.seq_id );
-  FD_TEST( state->bam_results[1].slot == ingress[1].result.slot );
+    long future_deadline = fd_bam_now() + (long)5e9;
+    state->next_step_deadline = future_deadline;
+    fd_bam_test_receive_ingress_frag( state, in_idx[ i ], 0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
+    FD_TEST( state->next_step_deadline==0L );
+    int charge_busy = 0;
+    fd_bam_test_before_credit( state, env->stem, &charge_busy );
+    FD_TEST( state->next_step_deadline!=future_deadline );
 
-  fd_bam_test_receive_ingress_frag( state, 7UL,                     0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
-  fd_bam_test_receive_ingress_frag( state, state->motor_bam_in_idx, 0UL, 0UL, sizeof(fd_bam_leader_state_t) );
+    FD_TEST( state->feedback_queue_depth==depth );
+    FD_TEST( state->bam_results_head==0U && state->bam_results_tail==depth );
+    FD_TEST( state->bam_results[ depth-1 ].seq_id==ingress[ i ].result.seq_id );
+    FD_TEST( state->bam_results[ depth-1 ].slot==ingress[ i ].result.slot );
+    FD_TEST( state->bam_results[ depth-1 ].bundle_txn_cnt==ingress[ i ].result.bundle_txn_cnt );
+    FD_TEST( state->bam_leader_pending==0U );
 
-  FD_TEST( state->feedback_queue_depth == 2U );
-  FD_TEST( state->bam_results_tail == 2U );
+    fd_bam_test_receive_ingress_frag( state, in_idx[ i ], 0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
+    FD_TEST( state->feedback_queue_depth==depth && state->bam_results_tail==depth );
+
+    ingress[ i ].result.slot++;
+    fd_bam_test_receive_ingress_frag( state, in_idx[ i ], 0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
+    FD_TEST( state->feedback_queue_depth==depth+1U && state->bam_results_tail==depth+1U );
+    FD_TEST( state->bam_results[ depth ].slot==ingress[ i ].result.slot );
+
+    fd_bam_test_receive_ingress_frag( state, in_idx[ i ], 0UL, 0UL, sizeof(fd_bam_leader_state_t) );
+    fd_bam_test_receive_ingress_frag( state, 7UL,         0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
+    FD_TEST( state->feedback_queue_depth==depth+1U && state->bam_results_tail==depth+1U );
+    FD_TEST( state->bam_results[ depth-1 ].seq_id==ingress[ i ].result.seq_id );
+    FD_TEST( state->bam_leader_pending==0U );
+  }
+  FD_TEST( state->bam_results[ 0 ].seq_id==501U && state->bam_results[ 2 ].seq_id==502U );
 
   test_bam_env_destroy( env );
 }
@@ -5206,7 +4934,10 @@ test_bam_ctrl_updates_url_and_sni( fd_wksp_t * wksp ) {
   test_bam_env_destroy( env );
 }
 
-/* A URL without a port takes the BAM default for its scheme. */
+/* A URL without a port takes the BAM default for its scheme.  An invalid
+   URL is an error that changes nothing.  A blank one (runtime
+   setBamUrl("")) clears the URL and forces BAM off instead of being
+   treated as a parse error. */
 static void
 test_bam_ctrl_defaults_bam_ports( fd_wksp_t * wksp ) {
   test_bam_env_t env[1];
@@ -5214,16 +4945,31 @@ test_bam_ctrl_defaults_bam_ports( fd_wksp_t * wksp ) {
   fd_bam_ctrl_t ctrl;
   setup_ctrl_defaults( ctx, &ctrl );
 
-  struct { char const * url; char const * applied; ushort port; uint is_ssl; } const cases[] = {
-    { "http://bam.example.com",       "http://bam.example.com:50055",  50055U, 0U },
-    { "https://bam.example.com",      "https://bam.example.com:50056", 50056U, 1U },
-    { "https://bam.example.com:9443", "https://bam.example.com:9443",  9443U,  1U },
+  uchar const ok  = FD_BAM_CTRL_STATE_SUCCESS;
+  uchar const err = FD_BAM_CTRL_STATE_ERROR;
+  struct {
+    char const * url;
+    uchar        state;
+    char const * applied;
+    char const * host;
+    ushort       port;
+    uint         is_ssl;
+    uchar        enabled;
+    char const * error;
+  } const cases[] = {
+    { "http://bam.example.com",       ok,  "http://bam.example.com:50055",  "bam.example.com", 50055U, 0U, 1U, ""                },
+    { "https://bam.example.com",      ok,  "https://bam.example.com:50056", "bam.example.com", 50056U, 1U, 1U, ""                },
+    { "https://bam.example.com:9443", ok,  "https://bam.example.com:9443",  "bam.example.com", 9443U,  1U, 1U, ""                },
+    { "not a url",                    err, "https://bam.example.com:9443",  "bam.example.com", 9443U,  1U, 1U, "Invalid BAM URL" },
+    { "   \t\n",                      ok,  "",                              "",                0U,     0U, 0U, ""                },
   };
   for( ulong i=0UL; i<sizeof(cases)/sizeof(cases[0]); i++ ) {
-    FD_TEST( test_bam_ctrl_request( ctx, FD_BAM_CTRL_CMD_URL, 1U, cases[ i ].url )==FD_BAM_CTRL_STATE_SUCCESS );
+    FD_TEST( test_bam_ctrl_request( ctx, FD_BAM_CTRL_CMD_URL, 1U, cases[ i ].url )==cases[ i ].state );
+    FD_TEST( cases[ i ].error[0] ? !!strstr( ctrl.error, cases[ i ].error ) : !ctrl.error[0] );
     FD_TEST( !strcmp( ctrl.url, cases[ i ].applied ) );
-    FD_TEST( !strcmp( ctrl.sni, "bam.example.com" ) );
-    test_bam_check_endpoint( ctx, "bam.example.com", "bam.example.com", cases[ i ].port, cases[ i ].is_ssl );
+    FD_TEST( !strcmp( ctrl.sni, cases[ i ].host ) );
+    test_bam_check_endpoint( ctx, cases[ i ].host, cases[ i ].host, cases[ i ].port, cases[ i ].is_ssl );
+    FD_TEST( ctx->enabled==cases[ i ].enabled && ctrl.enable==cases[ i ].enabled && ctrl.applied_enable==cases[ i ].enabled );
   }
 
   test_bam_env_destroy( env );
@@ -5267,23 +5013,6 @@ test_bam_ctrl_toggle_enable_updates_runtime_state( fd_wksp_t * wksp ) {
   FD_TEST( !strcmp( ctrl.url, "http://testnet.bam.jito.wtf:50055" ) );
   FD_TEST( !strcmp( ctx->server_fqdn, "testnet.bam.jito.wtf" ) );
   FD_TEST( ctx->server_tcp_port == 50055U );
-
-  test_bam_env_destroy( env );
-}
-
-static void
-test_bam_ctrl_enable_from_disabled_start( fd_wksp_t * wksp ) {
-  /* Ensure a tile launched with BAM disabled can be enabled via runtime control. */
-  test_bam_env_t env[1];
-  fd_bam_tile_t * ctx = test_bam_env_create( env, wksp );
-  fd_bam_ctrl_t ctrl;
-  setup_ctrl_defaults( ctx, &ctrl );
-  ctx->enabled = 0;
-
-  FD_TEST( test_bam_ctrl_request( ctx, FD_BAM_CTRL_CMD_ENABLE, 1U, NULL )==FD_BAM_CTRL_STATE_SUCCESS );
-  FD_TEST( ctrl.enable == 1U );
-  FD_TEST( ctx->enabled == 1 );
-  FD_TEST( !strcmp( ctrl.url, "http://testnet.bam.jito.wtf:50055" ) );
   FD_TEST( !strcmp( ctrl.error, "" ) );
 
   test_bam_env_destroy( env );
@@ -5320,83 +5049,6 @@ test_bam_ctrl_enable_from_dormant_then_set_url( fd_wksp_t * wksp ) {
   FD_TEST( ctx->enabled == 1U );
   test_bam_check_endpoint( ctx, "bam.example.com", "bam.example.com", 8899U, 0U );
   FD_TEST( !strcmp( ctrl.error, "" ) );
-
-  test_bam_env_destroy( env );
-}
-
-static void
-test_bam_ctrl_invalid_url_sets_error_and_preserves_config( fd_wksp_t * wksp ) {
-  /* Invalid runtime URLs should surface an error without mutating existing configuration. */
-  test_bam_env_t env[1];
-  fd_bam_tile_t * ctx = test_bam_env_create( env, wksp );
-  fd_bam_ctrl_t ctrl;
-  setup_ctrl_defaults( ctx, &ctrl );
-
-  FD_TEST( test_bam_ctrl_request( ctx, FD_BAM_CTRL_CMD_URL, 1U, "not a url" )==FD_BAM_CTRL_STATE_ERROR );
-  FD_TEST( strstr( ctrl.error, "Invalid BAM URL" ) != NULL );
-  FD_TEST( !strcmp( ctrl.url, "http://testnet.bam.jito.wtf:50055" ) );
-  FD_TEST( !strcmp( ctx->server_fqdn, "testnet.bam.jito.wtf" ) );
-  FD_TEST( ctx->enabled == 1 );
-  FD_TEST( ctrl.applied_enable == 1U );
-
-  test_bam_env_destroy( env );
-}
-
-static void
-test_bam_ctrl_blank_url_clears_and_disables( fd_wksp_t * wksp ) {
-  /* Runtime setBamUrl("") semantics: blank/whitespace clears the URL and
-     forces BAM off instead of being treated as a parse error. */
-  test_bam_env_t env[1];
-  fd_bam_tile_t * ctx = test_bam_env_create( env, wksp );
-  fd_bam_ctrl_t ctrl;
-  setup_ctrl_defaults( ctx, &ctrl );
-
-  FD_TEST( test_bam_ctrl_request( ctx, FD_BAM_CTRL_CMD_URL, 1U, "   \t\n" )==FD_BAM_CTRL_STATE_SUCCESS );
-  FD_TEST( ctrl.enable == 0U );
-  FD_TEST( ctrl.applied_enable == 0U );
-  FD_TEST( !strcmp( ctrl.url, "" ) );
-  FD_TEST( !strcmp( ctrl.sni, "" ) );
-  FD_TEST( ctx->enabled == 0 );
-  test_bam_check_endpoint( ctx, "", "", 0U, 0U );
-  FD_TEST( !strcmp( ctrl.error, "" ) );
-
-  test_bam_env_destroy( env );
-}
-
-static void
-test_bam_gossip_update_falls_back_to_configured_default_tpu( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-
-  fd_wksp_t * gossip_mem = test_bam_setup_gossip_out( env );
-  ulong chunk_before = state->gossip_out.chunk;
-  ulong seq_before   = env->stem_seqs[ state->gossip_out.idx ];
-  state->bam_gossip_handoff_pending = 1U;
-
-  FD_TEST( !fd_bam_gossip_update( state, state->stem, 0 ) );
-
-  FD_TEST( state->gossip_out.chunk == chunk_before );
-  FD_TEST( env->stem_seqs[ state->gossip_out.idx ] == seq_before );
-  FD_TEST( state->tpu_update_state == FD_BAM_CONTACT_UPDATE_STATE_PENDING_DEFAULT );
-  FD_TEST( state->client_id_update_state == FD_BAM_CONTACT_UPDATE_STATE_PENDING_DEFAULT );
-  FD_TEST( !state->bam_gossip_handoff_pending );
-
-  FD_TEST( fd_cstr_to_ip4_addr( "1.1.1.1", &state->configured_default_tpu.addr ) );
-  state->configured_default_tpu.port = fd_ushort_bswap( 4242U );
-  state->bam_tpu     = state->configured_default_tpu;
-  state->bam_tpu_fwd = state->configured_default_tpu;
-
-  ulong publish_chunk = state->gossip_out.chunk;
-  FD_TEST( fd_bam_gossip_update( state, state->stem, 0 ) );
-  fd_bam_contact_update_t update = test_bam_read_gossip_update( gossip_mem, publish_chunk );
-
-  FD_TEST( update.tpu.l     == state->configured_default_tpu.l );
-  FD_TEST( update.tpu_fwd.l == state->configured_default_tpu.l );
-  FD_TEST( update.version_client_id == FD_GOSSIP_CONTACT_INFO_CLIENT_FIREDANCER );
-  FD_TEST( state->default_tpu.l     == state->configured_default_tpu.l );
-  FD_TEST( state->default_tpu_fwd.l == state->configured_default_tpu.l );
-  FD_TEST( state->tpu_update_state == FD_BAM_CONTACT_UPDATE_STATE_APPLIED_DEFAULT );
-  FD_TEST( state->client_id_update_state == FD_BAM_CONTACT_UPDATE_STATE_APPLIED_DEFAULT );
 
   test_bam_env_destroy( env );
 }
@@ -5827,56 +5479,6 @@ test_bam_gossip_stale_contact_case( fd_wksp_t * wksp,
   test_bam_env_destroy( env );
 }
 
-static void
-test_bam_gossip_publishes_bam_config_contact( fd_wksp_t * wksp ) {
-  /* A healthy BAM tile should advertise the TPU endpoints supplied by BamConfig. */
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-  test_bam_env_mock_conn( env );
-
-  fd_wksp_t * gossip_mem = test_bam_setup_gossip_out( env );
-  state->bam_status_recent = FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY;
-
-  bam_api_ConfigResponse resp = bam_api_ConfigResponse_init_default;
-  test_bam_config_set_tpu( &resp, "10.20.30.40", 1122U, "11.12.13.14", 3344U );
-  ulong publish_chunk = state->gossip_out.chunk;
-  test_bam_apply_config_resp( state, &resp );
-  fd_bam_contact_update_t update = test_bam_read_gossip_update( gossip_mem, publish_chunk );
-  test_bam_check_contact( &update, test_bam_ip4_port( "10.20.30.40", 1122U ), test_bam_ip4_port( "11.12.13.14", 3344U ),
-                          FD_GOSSIP_CONTACT_INFO_CLIENT_FIRE_BAM );
-
-  test_bam_env_destroy( env );
-}
-
-static void
-test_bam_activation_waits_for_gossip_ack( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-  test_bam_setup_gossip_out( env );
-  test_bam_set_bam_tpu( state, "10.1.1.1", 5000U, "10.1.1.2", 6000U );
-
-  test_bam_handoff_fseqs_t fseqs[1];
-  test_bam_setup_handoff_fseqs( env, fseqs );
-
-  fd_bam_publish_active_state( state, state->stem, 1 );
-  FD_TEST( env->stem_seqs[0] == 1UL );
-  FD_TEST( state->bam_gossip_handoff_pending );
-  FD_TEST( state->bam_gossip_handoff_target == 1UL );
-  FD_TEST( fd_fseq_query( fseqs->status ) == 0UL );
-
-  fd_bam_publish_active_state( state, state->stem, 1 );
-  FD_TEST( env->stem_seqs[0] == 1UL );
-  FD_TEST( fd_fseq_query( fseqs->status ) == 0UL );
-
-  fd_fseq_update( fseqs->signed_ack, 1UL );
-  fd_bam_publish_active_state( state, state->stem, 1 );
-  FD_TEST( env->stem_seqs[0] == 1UL );
-  FD_TEST( !state->bam_gossip_handoff_pending );
-  FD_TEST( fd_fseq_query( fseqs->status ) == FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE );
-
-  test_bam_env_destroy( env );
-}
-
 /* Efficient layout: an idle pack and bundle are parked and read bam_gen
    and bam_status only when woken.  BAM rings pack until it acknowledges
    a generation, and both on each override change. */
@@ -6005,6 +5607,7 @@ test_bam_activation_ignores_stale_gossip_ack_after_reenable( fd_wksp_t * wksp ) 
   test_bam_setup_handoff_fseqs( env, fseqs );
 
   fd_bam_publish_active_state( state, state->stem, 1 );
+  FD_TEST( state->bam_gossip_handoff_pending );
   FD_TEST( state->bam_gossip_handoff_target == 1UL );
   FD_TEST( env->stem_seqs[0] == 1UL );
   FD_TEST( fd_fseq_query( fseqs->status ) == 0UL );
@@ -6019,12 +5622,15 @@ test_bam_activation_ignores_stale_gossip_ack_after_reenable( fd_wksp_t * wksp ) 
   FD_TEST( state->bam_gossip_handoff_target == 3UL );
   FD_TEST( env->stem_seqs[0] == 3UL );
 
+  /* Waiting for the ack does not republish the contact. */
   fd_fseq_update( fseqs->signed_ack, 1UL );
   fd_bam_publish_active_state( state, state->stem, 1 );
   FD_TEST( fd_fseq_query( fseqs->status ) == 0UL );
+  FD_TEST( env->stem_seqs[0] == 3UL );
   fd_fseq_update( fseqs->signed_ack, 3UL );
   fd_bam_publish_active_state( state, state->stem, 1 );
   FD_TEST( fd_fseq_query( fseqs->status ) == FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE );
+  FD_TEST( !state->bam_gossip_handoff_pending && env->stem_seqs[0] == 3UL );
 
   test_bam_env_destroy( env );
 }
@@ -6148,6 +5754,44 @@ test_bam_invalid_quic_base_port_does_not_activate( fd_wksp_t * wksp ) {
 }
 
 static void
+test_bam_gossip_update_falls_back_to_configured_default_tpu( fd_wksp_t * wksp ) {
+  test_bam_env_t env[1];
+  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
+
+  fd_wksp_t * gossip_mem = test_bam_setup_gossip_out( env );
+  ulong chunk_before = state->gossip_out.chunk;
+  ulong seq_before   = env->stem_seqs[ state->gossip_out.idx ];
+  state->bam_gossip_handoff_pending = 1U;
+
+  FD_TEST( !fd_bam_gossip_update( state, state->stem, 0 ) );
+
+  FD_TEST( state->gossip_out.chunk == chunk_before );
+  FD_TEST( env->stem_seqs[ state->gossip_out.idx ] == seq_before );
+  FD_TEST( state->tpu_update_state == FD_BAM_CONTACT_UPDATE_STATE_PENDING_DEFAULT );
+  FD_TEST( state->client_id_update_state == FD_BAM_CONTACT_UPDATE_STATE_PENDING_DEFAULT );
+  FD_TEST( !state->bam_gossip_handoff_pending );
+
+  FD_TEST( fd_cstr_to_ip4_addr( "1.1.1.1", &state->configured_default_tpu.addr ) );
+  state->configured_default_tpu.port = fd_ushort_bswap( 4242U );
+  state->bam_tpu     = state->configured_default_tpu;
+  state->bam_tpu_fwd = state->configured_default_tpu;
+
+  ulong publish_chunk = state->gossip_out.chunk;
+  FD_TEST( fd_bam_gossip_update( state, state->stem, 0 ) );
+  fd_bam_contact_update_t update = test_bam_read_gossip_update( gossip_mem, publish_chunk );
+
+  FD_TEST( update.tpu.l     == state->configured_default_tpu.l );
+  FD_TEST( update.tpu_fwd.l == state->configured_default_tpu.l );
+  FD_TEST( update.version_client_id == FD_GOSSIP_CONTACT_INFO_CLIENT_FIREDANCER );
+  FD_TEST( state->default_tpu.l     == state->configured_default_tpu.l );
+  FD_TEST( state->default_tpu_fwd.l == state->configured_default_tpu.l );
+  FD_TEST( state->tpu_update_state == FD_BAM_CONTACT_UPDATE_STATE_APPLIED_DEFAULT );
+  FD_TEST( state->client_id_update_state == FD_BAM_CONTACT_UPDATE_STATE_APPLIED_DEFAULT );
+
+  test_bam_env_destroy( env );
+}
+
+static void
 test_bam_gossip_uses_defaults_when_contact_missing( fd_wksp_t * wksp ) {
   /* An incomplete BamConfig without a cached BAM contact should force gossip
      back to defaults without blocking scheduler activation. */
@@ -6195,7 +5839,6 @@ test_bam_gossip_disconnect_uses_defaults_without_clearing_stored_contact( fd_wks
 
   test_bam_env_mock_conn( env );
   fd_wksp_t * gossip_mem = test_bam_setup_gossip_out( env );
-  state->bam_status_recent = FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY;
   test_bam_set_default_tpu( state );
 
   fd_ip4_port_t const bam_tpu     = test_bam_ip4_port( "9.8.7.6", 5000U );
@@ -6213,7 +5856,6 @@ test_bam_gossip_disconnect_uses_defaults_without_clearing_stored_contact( fd_wks
   update = test_bam_read_gossip_update( gossip_mem, publish_chunk );
   test_bam_check_contact( &update, state->default_tpu, state->default_tpu_fwd, FD_GOSSIP_CONTACT_INFO_CLIENT_FIREDANCER );
 
-  state->bam_status_recent = FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTING;
   state->bam_stream_live = 0U;
   state->tpu_update_state = FD_BAM_CONTACT_UPDATE_STATE_APPLIED_BAM;
 
@@ -6232,75 +5874,11 @@ test_bam_gossip_disconnect_uses_defaults_without_clearing_stored_contact( fd_wks
   update = test_bam_read_gossip_update( gossip_mem, publish_chunk );
   test_bam_check_contact( &update, state->default_tpu, state->default_tpu_fwd, FD_GOSSIP_CONTACT_INFO_CLIENT_FIREDANCER );
 
-  test_bam_env_destroy( env );
-}
-
-static void
-test_bam_runtime_toggle_updates_gossip( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-  test_bam_env_mock_conn( env );
-
-  fd_wksp_t * gossip_mem = test_bam_setup_gossip_out( env );
-  state->bam_status_recent = FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY;
-  state->configured_default_tpu = test_bam_ip4_port( "1.1.1.1", 4242U );
-  fd_ip4_port_t const bam_tpu     = test_bam_ip4_port( "9.9.9.9", 7000U );
-  fd_ip4_port_t const bam_tpu_fwd = test_bam_ip4_port( "8.8.8.8", 7001U );
-
-  /* Initial BamConfig should publish the override while runtime is enabled. */
-  bam_api_ConfigResponse resp = bam_api_ConfigResponse_init_default;
-  test_bam_config_set_tpu( &resp, "9.9.9.9", 7000U, "8.8.8.8", 7001U );
-  ulong publish_chunk = state->gossip_out.chunk;
-  test_bam_apply_config_resp( state, &resp );
-  fd_bam_contact_update_t update = test_bam_read_gossip_update( gossip_mem, publish_chunk );
-  test_bam_check_contact( &update, bam_tpu, bam_tpu_fwd, FD_GOSSIP_CONTACT_INFO_CLIENT_FIRE_BAM );
-
-  /* Disabling runtime should immediately revert gossip to the Firedancer defaults. */
+  /* Using BAM again republishes the stored BAM contact. */
   publish_chunk = state->gossip_out.chunk;
-  state->enabled = 0;
-  fd_bam_gossip_update( state, state->stem, false );
-  update = test_bam_read_gossip_update( gossip_mem, publish_chunk );
-  test_bam_check_contact( &update, state->configured_default_tpu, state->configured_default_tpu,
-                          FD_GOSSIP_CONTACT_INFO_CLIENT_FIREDANCER );
-
-  /* Re-enabling runtime while still connected should republish the BamConfig address. */
-  publish_chunk = state->gossip_out.chunk;
-  state->enabled = 1;
   fd_bam_gossip_update( state, state->stem, true );
   update = test_bam_read_gossip_update( gossip_mem, publish_chunk );
   test_bam_check_contact( &update, bam_tpu, bam_tpu_fwd, FD_GOSSIP_CONTACT_INFO_CLIENT_FIRE_BAM );
-
-  test_bam_env_destroy( env );
-}
-
-/* Passing IPv6 or malformed receivers into the IPv4-only shred path can abort
-   transmission.  Drop them during config parsing and retain valid IPv4 entries. */
-static void
-test_bam_shred_update_publishes_receiver_list( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-  test_bam_env_mock_conn( env );
-
-  state->shred_out = test_bam_out( env, sizeof(fd_bam_shred_update_t) );
-  fd_wksp_t * shred_mem = state->shred_out.mem;
-
-  bam_api_ConfigResponse resp = bam_api_ConfigResponse_init_default;
-  test_bam_config_set_tpu( &resp, "10.20.30.40", 1122U, "11.12.13.14", 3344U );
-  char const * shred_ip  [ 5 ] = { "1.1.1.1", "2.2.2.2", "1.1.1.1", "::1", "bad-ip" };
-  uint const   shred_port[ 5 ] = { 5001U,     5002U,     5001U,     5003U, 0U       };
-  resp.bam_config.shred_socks_count = 5U;
-  for( ulong i=0UL; i<5UL; i++ ) {
-    fd_cstr_ncpy( resp.bam_config.shred_socks[ i ].ip, shred_ip[ i ], sizeof( resp.bam_config.shred_socks[ i ].ip ) );
-    resp.bam_config.shred_socks[ i ].port = shred_port[ i ];
-  }
-  ulong publish_chunk = state->shred_out.chunk;
-  test_bam_apply_config_resp( state, &resp );
-
-  fd_bam_shred_update_t update = test_bam_read_shred_update( shred_mem, publish_chunk );
-  FD_TEST( update.shred_sock_cnt == 2UL );
-  FD_TEST( state->bam_shred_sock_cnt == 2UL );
-  FD_TEST( update.shred_sock[ 0 ].l==test_bam_ip4_port( "1.1.1.1", 5001U ).l );
-  FD_TEST( update.shred_sock[ 1 ].l==test_bam_ip4_port( "2.2.2.2", 5002U ).l );
 
   test_bam_env_destroy( env );
 }
@@ -6340,6 +5918,10 @@ test_bam_control_outputs_retry_without_credit( fd_wksp_t * wksp ) {
   test_bam_env_destroy( env );
 }
 
+/* Passing IPv6 or malformed receivers into the IPv4-only shred path can
+   abort transmission.  Config parsing drops them and duplicates, and
+   keeps valid IPv4 entries.  A disconnect publishes an empty list
+   without clearing them, and a config without receivers clears them. */
 static void
 test_bam_shred_update_disconnect_uses_empty_without_clearing_receivers( fd_wksp_t * wksp ) {
   test_bam_env_t env[1];
@@ -6351,17 +5933,22 @@ test_bam_shred_update_disconnect_uses_empty_without_clearing_receivers( fd_wksp_
 
   bam_api_ConfigResponse resp = bam_api_ConfigResponse_init_default;
   test_bam_config_set_tpu( &resp, "10.20.30.40", 1122U, "11.12.13.14", 3344U );
-  resp.bam_config.shred_socks_count = 2U;
-  fd_cstr_ncpy( resp.bam_config.shred_socks[ 0 ].ip, "3.3.3.3", sizeof( resp.bam_config.shred_socks[ 0 ].ip ) );
-  resp.bam_config.shred_socks[ 0 ].port = 7001U;
-  fd_cstr_ncpy( resp.bam_config.shred_socks[ 1 ].ip, "4.4.4.4", sizeof( resp.bam_config.shred_socks[ 1 ].ip ) );
-  resp.bam_config.shred_socks[ 1 ].port = 7002U;
+  char const * shred_ip  [ 5 ] = { "1.1.1.1", "2.2.2.2", "1.1.1.1", "::1", "bad-ip" };
+  uint const   shred_port[ 5 ] = { 5001U,     5002U,     5001U,     5003U, 0U       };
+  resp.bam_config.shred_socks_count = 5U;
+  for( ulong i=0UL; i<5UL; i++ ) {
+    fd_cstr_ncpy( resp.bam_config.shred_socks[ i ].ip, shred_ip[ i ], sizeof( resp.bam_config.shred_socks[ i ].ip ) );
+    resp.bam_config.shred_socks[ i ].port = shred_port[ i ];
+  }
   ulong publish_chunk = state->shred_out.chunk;
   test_bam_apply_config_resp( state, &resp );
 
   fd_bam_shred_update_t updates[ 4 ] = {0};
   updates[ 0 ] = test_bam_read_shred_update( shred_mem, publish_chunk );
   FD_TEST( updates[ 0 ].shred_sock_cnt == 2UL );
+  FD_TEST( state->bam_shred_sock_cnt == 2UL );
+  FD_TEST( updates[ 0 ].shred_sock[ 0 ].l==test_bam_ip4_port( "1.1.1.1", 5001U ).l );
+  FD_TEST( updates[ 0 ].shred_sock[ 1 ].l==test_bam_ip4_port( "2.2.2.2", 5002U ).l );
 
   publish_chunk = state->shred_out.chunk;
   fd_bam_shred_update( state, state->stem, false );
@@ -6397,8 +5984,6 @@ test_bam_config_reuses_cached_contact_for_incomplete_refresh( fd_wksp_t * wksp )
   test_bam_env_mock_conn( env );
 
   fd_wksp_t * gossip_mem = test_bam_setup_gossip_out( env );
-  state->bam_status_recent = FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY;
-
   test_bam_set_default_tpu( state );
 
   fd_ip4_port_t const expected_tpu     = test_bam_ip4_port( "5.5.5.5", 5000U );
@@ -6470,79 +6055,7 @@ test_bam_endpoint_change_forgets_cached_contact_before_incomplete_refresh( fd_wk
   test_bam_env_destroy( env );
 }
 
-/* Clearing BAM ownership before pack retires the old generation exposes stale
-   BAM work to normal scheduling.  Wait for pack's acknowledgement. */
-static void
-test_bam_ownership_generation_retirement_waits_for_pack( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-
-  ulong bam_status = FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE;
-  ulong generation = (ulong)state->ownership_gen<<1;
-  state->bam_status_fseq  = &bam_status;
-  state->bam_gen_fseq     = &generation;
-  state->ownership_gen_retired = 0U;
-
-  fd_bam_bundle_result_t result = test_make_bundle_result( 731U, 1731UL, 1U );
-  result.scheduler_gen = state->scheduler_gen;
-  test_enqueue_bundle_result( state, &result );
-  FD_TEST( state->feedback_queue_depth==1UL );
-
-  /* A transport reset requests a new ownership generation without
-     changing scheduler identity or dropping durable feedback.  Ownership
-     remains active until pack acknowledges that old pending work is gone. */
-  ushort old_scheduler_gen = state->scheduler_gen;
-  ushort old_ownership_gen = state->ownership_gen;
-  fd_bam_client_reset( state );
-  FD_TEST( state->scheduler_gen==old_scheduler_gen );
-  FD_TEST( state->ownership_gen!=old_ownership_gen );
-  FD_TEST( generation==(((ulong)state->ownership_gen<<1) | 1UL) );
-  FD_TEST( bam_status==FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE );
-  FD_TEST( state->ownership_gen_retired );
-  FD_TEST( state->feedback_queue_depth==1UL );
-
-  /* A fast reconnect cannot bypass the still-unacknowledged retirement
-     merely because bam_status has not dropped yet. */
-  fd_bam_publish_active_state( state, state->stem, 1 );
-  FD_TEST( bam_status==FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE );
-  FD_TEST( state->ownership_gen_retired );
-
-  generation &= ~1UL;
-  fd_bam_publish_active_state( state, state->stem, 0 );
-  FD_TEST( bam_status==0UL );
-  FD_TEST( state->feedback_queue_depth==1UL );
-
-  test_bam_env_destroy( env );
-}
-
 /* --- Config and fee propagation ----------------------------------------------------- */
-
-static void
-test_bam_config_updates_contact_info( fd_wksp_t * wksp ) {
-  test_bam_env_t env[1];
-  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-
-  FD_TEST( !state->bam_tpu.l && !state->bam_tpu_fwd.l );
-
-  /* Initial config populates TPU endpoints.  A later one with an invalid
-     forward socket, or with neither socket, preserves the last valid BAM
-     contact. */
-  fd_ip4_port_t const expected_tpu     = test_bam_ip4_port( "1.2.3.4", 9000U );
-  fd_ip4_port_t const expected_tpu_fwd = test_bam_ip4_port( "5.6.7.8", 10001U );
-  bam_api_ConfigResponse resp = bam_api_ConfigResponse_init_default;
-  test_bam_config_set_tpu( &resp, "1.2.3.4", 9000U, "5.6.7.8", 10001U );
-  fd_cstr_ncpy( resp.bam_config.prio_fee_recipient_pubkey, "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
-                sizeof( resp.bam_config.prio_fee_recipient_pubkey ) );
-  resp.bam_config.commission_bps = 2750U;
-  for( ulong i=0UL; i<3UL; i++ ) {
-    if( i==1UL ) resp.bam_config.has_tpu_fwd_sock = false;
-    if( i==2UL ) resp.bam_config.has_tpu_sock     = false;
-    test_bam_apply_config_resp( state, &resp );
-    FD_TEST( state->bam_tpu.l==expected_tpu.l && state->bam_tpu_fwd.l==expected_tpu_fwd.l );
-  }
-
-  test_bam_env_destroy( env );
-}
 
 /* Delivers a BlockEngineBuilderConfig update.  A NULL pubkey sends a
    string that does not decode to 32 bytes. */
@@ -6714,37 +6227,6 @@ test_bam_full_result_queue_deduplicates_before_reject( fd_wksp_t * wksp ) {
   FD_TEST( state->metrics.feedback_results_dropped_cnt==dropped_before+1UL );
 
   test_bam_env_destroy( env );
-}
-
-/* A scheduler stream whose response header block never completes (a
-   HEADERS frame without END_HEADERS) times out and resets the client.
-   Completed headers clear the deadline for the long-lived stream. */
-static void
-test_bam_scheduler_stream_header_deadline( fd_wksp_t * wksp ) {
-  for( ulong end_headers=0UL; end_headers<2UL; end_headers++ ) {
-    test_bam_env_t env[1];
-    fd_bam_tile_t * state = test_bam_env_create( env, wksp );
-    test_bam_env_mock_conn_empty( env );
-    test_bam_env_mock_h2_hs( state );
-    state->bam_config_inflight = 1U;
-    state->bam_auth_ready      = 1U;
-    g_clock = (long)5e9;
-    test_bam_keepalive_sync( state, g_clock );
-    state->bam_last_config_poll_ns = g_clock;
-    fd_bam_client_step_reconnect( state, g_clock );
-    fd_grpc_h2_stream_t * stream = state->bam_stream;
-    FD_TEST( stream && stream->has_header_deadline );
-
-    fd_grpc_h2_cb_headers( state->grpc_client->conn, &stream->s, NULL, 0UL, end_headers ? FD_H2_FLAG_END_HEADERS : 0UL );
-    fd_grpc_client_service_streams( state->grpc_client, g_clock+FD_BAM_CLIENT_REQUEST_TIMEOUT-1L );
-    FD_TEST( state->bam_stream==stream && !state->defer_reset );
-    fd_grpc_client_service_streams( state->grpc_client, g_clock+FD_BAM_CLIENT_REQUEST_TIMEOUT );
-    FD_TEST( (state->bam_stream==stream)==(int)end_headers );
-    FD_TEST( !!state->defer_reset==!end_headers );
-    FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_REQUEST_TIMEOUT_IDX ]==(ulong)!end_headers );
-
-    test_bam_env_destroy( env );
-  }
 }
 
 /* Appends an unknown field of each skippable wire type (varint, fixed32,
@@ -6971,25 +6453,19 @@ main( int     argc,
   test_bam_slot_ingress_timing_tracks_hash_collisions( wksp );
   test_bam_publish_batch_uses_captured_ingress_metadata( wksp );
   test_bam_multiple_batches_forwarded( wksp );
-  test_bam_independent_batches_queue_and_drain_in_order( wksp );
   test_bam_pending_over_stem_burst_drains_in_multiple_passes( wksp );
   test_bam_verify_backpressure_keeps_feedback_polling( wksp );
   test_bam_ingress_frag_copied_before_overrun_check( wksp );
   test_bam_queue_full_rejects_whole_batch_without_partial_enqueue( wksp );
-  test_bam_multiple_batches_accept_full_txn_count( wksp, FD_BAM_FULL_ATOMIC_BATCHES_PER_STEM_BURST, 700U, 100UL );
-  test_bam_multiple_batches_accept_full_txn_count( wksp, FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE, 1500U, 500UL );
-  test_bam_max_wire_message_fits_min_grpc_buffer( wksp );
+  test_bam_multiple_batches_accept_full_txn_count( wksp, FD_BAM_FULL_ATOMIC_BATCHES_PER_STEM_BURST, 0U,    1UL        );
+  test_bam_multiple_batches_accept_full_txn_count( wksp, FD_BAM_MAX_ATOMIC_BATCHES_PER_MESSAGE,     1700U, FD_TXN_MTU );
   test_bam_scheduler_rejects_invalid_custom_decode_fields( wksp );
   test_bam_scheduler_accepts_mss_padding( wksp );
   test_bam_scheduler_malformed_mss_padding_rolls_back( wksp );
-  test_bam_scheduler_mss_padding_does_not_raise_batch_limit( wksp );
   test_bam_scheduler_v0_oneof_uses_last_field( wksp );
   test_bam_multiple_batches_isolate_nested_decode_failures( wksp );
   test_bam_scheduler_rejects_non_length_delimited_packets( wksp );
   test_bam_multiple_batches_message_limit( wksp );
-  test_bam_bundle_forwards_without_builder_info( wksp );
-  test_bam_bundle_revert_flag_cases( wksp );
-  test_bam_stale_slot_rejects_before_vote_error( wksp );
   test_bam_ingress_rejects_batch_variants( wksp );
   test_bam_generated_v1_protobuf_fixtures( wksp );
   test_bam_v1_packet_size_boundaries( wksp );
@@ -7008,13 +6484,12 @@ main( int     argc,
   test_bam_connect_timeout_resets_stalled_handshake( wksp );
   test_bam_keepalive_pings_during_continuation( wksp );
   test_bam_grpc_timeout( wksp );
-  test_bam_config_timeout_keeps_scheduler_live( wksp );
+  test_bam_scheduler_stream_header_deadline( wksp );
   test_bam_config_rpc_applies_only_after_ok( wksp );
   test_bam_config_status_failure_keeps_scheduler_live( wksp );
   test_bam_config_rpc_discards_incomplete_or_invalid_response( wksp );
   test_bam_config_rpc_accepts_empty_and_unknown_fields( wksp );
   test_bam_first_config_timeout_reconnects( wksp );
-  test_bam_scheduler_http_error_requests_transport_reset( wksp );
   test_bam_auth_retry_deadline_tracks_backoff( wksp );
   test_bam_blocked_config_deadline_does_not_spin( wksp );
   test_bam_backoff_step_returns_without_sleep( wksp );
@@ -7030,10 +6505,9 @@ main( int     argc,
   /* Scheduler/auth messaging */
   test_bam_auth_challenge_response_verifies_cached_identity( wksp );
   test_bam_scheduler_auth_proof_publishes_message( wksp );
-  test_bam_missing_config_repolls_despite_valid_builder_info( wksp );
+  test_bam_missing_config_repolls_at_once_with_stream_up( wksp );
   test_bam_missing_config_uses_short_repoll_throttle( wksp );
   test_bam_config_polls_every_minute_with_builder( wksp );
-  test_bam_scheduler_heartbeat_publishes_message( wksp );
   test_bam_scheduler_ping_publishes_message( wksp );
   test_bam_outbound_send_blocked_is_not_failure( wksp );
   test_bam_scheduler_stream_replays_only_retained_leader_state( wksp );
@@ -7045,11 +6519,9 @@ main( int     argc,
   test_bam_replay_wait_gate_policy( wksp );
   test_bam_replay_wait_gate_cleared_on_reset_or_disable( wksp );
   test_bam_identity_switch_halts_signing_and_invalidates_leader_schedule_state( wksp );
-  test_bam_replay_schedule_hint_does_not_disconnect( wksp );
-  test_bam_pack_leader_channel_contract( wksp );
+  test_bam_unknown_leader_slot_gates_dial( wksp );
   test_bam_pack_leader_slot_change_flushes_immediately( wksp );
-  test_bam_pack_result_channel_contract( wksp );
-  test_bam_motor_result_channel_contract( wksp );
+  test_bam_result_channel_contract( wksp );
   test_bam_scheduler_result_publishes_message( wksp );
   test_bam_txn_err_mapping_matches_jito();
 
@@ -7057,41 +6529,31 @@ main( int     argc,
   test_bam_ctrl_updates_url_and_sni( wksp );
   test_bam_ctrl_defaults_bam_ports( wksp );
   test_bam_ctrl_toggle_enable_updates_runtime_state( wksp );
-  test_bam_ctrl_enable_from_disabled_start( wksp );
   test_bam_ctrl_enable_from_dormant_then_set_url( wksp );
-  test_bam_ctrl_invalid_url_sets_error_and_preserves_config( wksp );
-  test_bam_ctrl_blank_url_clears_and_disables( wksp );
-  test_bam_gossip_update_falls_back_to_configured_default_tpu( wksp );
 
   /* Gossip advertisement */
   test_bam_gossip_tile_applies_contact_update( wksp );
   for( int tie=0; tie<2; tie++ ) test_bam_gossip_stale_contact_case( wksp, tie );
-  test_bam_gossip_publishes_bam_config_contact( wksp );
-  test_bam_activation_waits_for_gossip_ack( wksp );
   test_bam_handoff_rings_parked_readers( wksp );
   test_bam_handoff_keeps_housekeeping_cadence( wksp );
   test_bam_activation_ignores_stale_gossip_ack_after_reenable( wksp );
   test_bam_disable_clears_status_with_pending_gossip_handoff( wksp );
   for( int trigger=0; trigger<TEST_BAM_CONTACT_TRIGGER_CNT; trigger++ ) test_bam_pending_activation_restores_default_contact( wksp, trigger );
   test_bam_invalid_quic_base_port_does_not_activate( wksp );
+  test_bam_gossip_update_falls_back_to_configured_default_tpu( wksp );
   test_bam_gossip_uses_defaults_when_contact_missing( wksp );
   test_bam_gossip_disconnect_uses_defaults_without_clearing_stored_contact( wksp );
-  test_bam_runtime_toggle_updates_gossip( wksp );
-  test_bam_shred_update_publishes_receiver_list( wksp );
   test_bam_control_outputs_retry_without_credit( wksp );
   test_bam_shred_update_disconnect_uses_empty_without_clearing_receivers( wksp );
   test_bam_config_reuses_cached_contact_for_incomplete_refresh( wksp );
   test_bam_endpoint_change_forgets_cached_contact_before_incomplete_refresh( wksp );
 
   /* Config and fees */
-  test_bam_config_updates_contact_info( wksp );
   test_bam_builder_fee_info( wksp );
 
   /* Bundle result durability */
   test_bam_bundle_result_queue_flushes_after_reconnect( wksp );
   test_bam_full_result_queue_deduplicates_before_reject( wksp );
-
-  test_bam_scheduler_stream_header_deadline( wksp );
 
   /* Scheduler schema evolution */
   test_bam_scheduler_ignores_unknown_fields( wksp );

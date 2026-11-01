@@ -121,16 +121,22 @@ test_bam_keepalive_sync( fd_bam_tile_t * state,
   state->keepalive->inflight    = 0U;
 }
 
+/* Discards whatever the gRPC client was sending, as if the peer read it. */
+FD_FN_UNUSED static void
+test_bam_clear_grpc_tx( fd_grpc_client_t * client ) {
+  client->request_stream = NULL;
+  *client->request_tx_op = (fd_h2_tx_op_t){0};
+  client->frame_tx->lo = client->frame_tx->hi;
+  client->frame_tx->lo_off = client->frame_tx->hi_off;
+}
+
 FD_FN_UNUSED static void
 test_bam_prepare_scheduler_stream( fd_bam_tile_t * state ) {
   fd_grpc_h2_stream_t * stream = fd_grpc_client_stream_acquire( state->grpc_client, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream );
   FD_TEST( stream );
   state->bam_stream            = stream;
   state->bam_stream_live       = 1U;
-  state->grpc_client->request_stream = NULL;
-  *state->grpc_client->request_tx_op = (fd_h2_tx_op_t){0};
-  state->grpc_client->frame_tx->lo = state->grpc_client->frame_tx->hi;
-  state->grpc_client->frame_tx->lo_off = state->grpc_client->frame_tx->hi_off;
+  test_bam_clear_grpc_tx( state->grpc_client );
   state->bam_auth_ready        = 1U;
   state->bam_auth_inflight     = 0U;
 }
@@ -155,15 +161,15 @@ test_make_bundle_result( uint  seq_id,
   return res;
 }
 
+/* Queues res as a result of the current scheduler generation. */
 FD_FN_UNUSED static void
 test_enqueue_bundle_result( fd_bam_tile_t *               state,
                             fd_bam_bundle_result_t const * res ) {
-  FD_TEST( state->feedback_queue_depth < FD_BAM_MAX_PENDING_RESULTS );
   fd_bam_bundle_result_t copy = *res;
   copy.scheduler_gen = state->scheduler_gen;
-  state->bam_results[ state->bam_results_tail ] = copy;
-  state->bam_results_tail = (ushort)(( state->bam_results_tail + 1U ) % FD_BAM_MAX_PENDING_RESULTS);
-  state->feedback_queue_depth = (ushort)( state->feedback_queue_depth + 1U );
+  ushort depth = state->feedback_queue_depth;
+  fd_bam_enqueue_result( state, &copy );
+  FD_TEST( state->feedback_queue_depth==depth+1U );
 }
 
 FD_FN_UNUSED static void
@@ -320,10 +326,7 @@ test_bam_decode_last_message( fd_bam_tile_t *             state,
     }
   }
 
-  client->request_stream = NULL;
-  *client->request_tx_op = (fd_h2_tx_op_t){0};
-  client->frame_tx->lo = client->frame_tx->hi;
-  client->frame_tx->lo_off = client->frame_tx->hi_off;
+  test_bam_clear_grpc_tx( client );
 }
 
 FD_FN_UNUSED static void
