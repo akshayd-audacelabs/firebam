@@ -151,10 +151,13 @@ typedef struct bam_fuzz_pack   bam_fuzz_pack_t;
 typedef struct bam_fuzz_execle bam_fuzz_execle_t;
 
 /* bam_fuzz_<stage>_new creates an adapter consuming in and copies its
-   output links (indexed as above, else 0) to out. */
+   output links (indexed as above, else 0) to out.  Verify adapter
+   rr_idx of rr_cnt takes its round robin share of in, and dedup
+   consumes in_cnt verify outputs in[ i ]. */
 
-bam_fuzz_verify_t * bam_fuzz_verify_new( fd_wksp_t * wksp, bam_fuzz_link_t const * in, bam_fuzz_link_t out[ BAM_FUZZ_OUT_MAX ] );
-bam_fuzz_dedup_t *  bam_fuzz_dedup_new ( fd_wksp_t * wksp, bam_fuzz_link_t const * in, bam_fuzz_link_t out[ BAM_FUZZ_OUT_MAX ] );
+bam_fuzz_verify_t * bam_fuzz_verify_new( fd_wksp_t * wksp, bam_fuzz_link_t const * in, bam_fuzz_link_t out[ BAM_FUZZ_OUT_MAX ],
+                                         ulong rr_idx, ulong rr_cnt );
+bam_fuzz_dedup_t *  bam_fuzz_dedup_new ( fd_wksp_t * wksp, bam_fuzz_link_t const * in, ulong in_cnt, bam_fuzz_link_t out[ BAM_FUZZ_OUT_MAX ] );
 bam_fuzz_resolv_t * bam_fuzz_resolv_new( fd_wksp_t * wksp, bam_fuzz_link_t const * in, bam_fuzz_link_t out[ BAM_FUZZ_OUT_MAX ] );
 bam_fuzz_pack_t *   bam_fuzz_pack_new  ( fd_wksp_t * wksp, bam_fuzz_link_t const * in, bam_fuzz_link_t out[ BAM_FUZZ_OUT_MAX ],
                                          ulong ** execle_busy_fseq );
@@ -167,8 +170,12 @@ void bam_fuzz_resolv_delete( bam_fuzz_resolv_t * h );
 void bam_fuzz_pack_delete  ( bam_fuzz_pack_t *   h );
 void bam_fuzz_execle_delete( bam_fuzz_execle_t * h );
 
+/* A verify adapter publishes nothing for a frag outside its share.
+   Dedup sets *held and consumes nothing when the frag on in_idx must
+   wait for earlier BAM frags. */
+
 bam_fuzz_res_t bam_fuzz_verify_frag( bam_fuzz_verify_t * h, fd_frag_meta_t const * meta, ulong seq );
-bam_fuzz_res_t bam_fuzz_dedup_frag ( bam_fuzz_dedup_t *  h, fd_frag_meta_t const * meta, ulong seq );
+bam_fuzz_res_t bam_fuzz_dedup_frag ( bam_fuzz_dedup_t *  h, ulong in_idx, fd_frag_meta_t const * meta, ulong seq, int * held );
 bam_fuzz_res_t bam_fuzz_resolv_frag( bam_fuzz_resolv_t * h, fd_frag_meta_t const * meta, ulong seq );
 bam_fuzz_res_t bam_fuzz_pack_frag  ( bam_fuzz_pack_t *   h, fd_frag_meta_t const * meta, ulong seq, long now_ns );
 bam_fuzz_res_t bam_fuzz_execle_frag( bam_fuzz_execle_t * h, fd_frag_meta_t const * meta, ulong seq );

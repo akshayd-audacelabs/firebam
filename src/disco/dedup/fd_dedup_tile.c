@@ -7,6 +7,7 @@
 #include "../metrics/fd_metrics.h"
 
 #include "../../discof/replay/fd_replay_tile.h"
+#include "fd_dedup_tile_bam.h"
 
 /* fd_dedup provides services to deduplicate multiple streams of input
    fragments and present them to a mix of reliable and unreliable
@@ -58,6 +59,7 @@ typedef struct {
   struct {
     ulong dedup_tile_result[ FD_METRICS_ENUM_DEDUP_RESULT_CNT ];
   } metrics;
+  DEDUP_TILE_BAM_CTX
 } fd_dedup_ctx_t;
 
 FD_FN_CONST static inline ulong
@@ -275,6 +277,7 @@ unprivileged_init( fd_topo_t const *      topo,
       FD_LOG_ERR(( "unexpected link name %s", link->name ));
     }
   }
+  fd_dedup_tile_bam_init( ctx, tile->in_cnt );
 
   ctx->out_mem    = topo->workspaces[ topo->objs[ topo->links[ tile->out_link_id[ 0 ] ].dcache_obj_id ].wksp_id ].wksp;
   ctx->out_chunk0 = fd_dcache_compact_chunk0( ctx->out_mem, topo->links[ tile->out_link_id[ 0 ] ].dcache );
@@ -321,6 +324,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_dedup_ctx_t)
 
 #define STEM_CALLBACK_METRICS_WRITE metrics_write
+#define STEM_CALLBACK_BEFORE_FRAG   fd_dedup_tile_bam_before_frag
 #define STEM_CALLBACK_DURING_FRAG   during_frag
 #define STEM_CALLBACK_AFTER_FRAG    after_frag
 

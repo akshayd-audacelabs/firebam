@@ -2,8 +2,8 @@
 #define HEADER_fd_src_disco_bam_fd_bam_txn_m_h
 
 /* FireBAM helpers on fd_txn_m_t, whose BAM metadata overlays the Block
-   Engine fields.  Included by the verify, dedup and resolv BAM
-   siblings, which read the overlay. */
+   Engine fields.  Included by the dedup and resolv BAM siblings, which
+   read the overlay. */
 
 #include "../fd_txn_m.h"
 #include <stddef.h> /* offsetof */

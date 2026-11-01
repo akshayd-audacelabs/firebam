@@ -399,10 +399,14 @@ test_topology( int          bundle_enabled,
     ulong verify_link = fd_topo_find_link( topo, "bam_verif", 0UL );
     ulong sign_link   = fd_topo_find_link( topo, "bam_sign",  0UL );
     FD_TEST( verify_link!=ULONG_MAX && sign_link!=ULONG_MAX );
-    FD_TEST( fd_topo_link_consumer_cnt( topo, &topo->links[ verify_link ] )==1UL );
-    fd_topo_tile_t const * verify = &topo->tiles[ fd_topo_find_tile( topo, "verify", 0UL ) ];
-    ulong verify_in = fd_topo_find_tile_in_link( topo, verify, "bam_verif", 0UL );
-    FD_TEST( verify_in!=ULONG_MAX && verify->in_link_reliable[ verify_in ] && verify->in_link_poll[ verify_in ] );
+    /* Every verify tile takes its share of bam_verif */
+    ulong verify_cnt = fd_topo_tile_name_cnt( topo, "verify" );
+    FD_TEST( verify_cnt>1UL && fd_topo_link_consumer_cnt( topo, &topo->links[ verify_link ] )==verify_cnt );
+    for( ulong i=0UL; i<verify_cnt; i++ ) {
+      fd_topo_tile_t const * verify = &topo->tiles[ fd_topo_find_tile( topo, "verify", i ) ];
+      ulong verify_in = fd_topo_find_tile_in_link( topo, verify, "bam_verif", 0UL );
+      FD_TEST( verify_in!=ULONG_MAX && verify->in_link_reliable[ verify_in ] && verify->in_link_poll[ verify_in ] );
+    }
   }
 
   /* executed_txn lets pack retire BAM work.  Upstream Firedancer has

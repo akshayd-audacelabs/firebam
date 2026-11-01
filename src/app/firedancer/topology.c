@@ -789,7 +789,7 @@ fd_topo_initialize( config_t * config ) {
     FOR(shred_tile_cnt)  fd_topob_tile_in ( topo, "shred",   i,            "metric_in", "poh_shred",     0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   }
 
-  if( FD_UNLIKELY( bam_enabled ) ) topo_bam_tile_links( topo, config, execle_tile_cnt, shred_tile_cnt );
+  if( FD_UNLIKELY( bam_enabled ) ) topo_bam_tile_links( topo, config, verify_tile_cnt, execle_tile_cnt, shred_tile_cnt );
 
   FOR(shred_tile_cnt)    fd_topob_tile_in ( topo, "shred",   i,            "metric_in", "replay_epoch",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   FOR(shred_tile_cnt)    fd_topob_tile_in ( topo, "shred",   i,            "metric_in", "gossip_ciaddr", 0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );

@@ -53,7 +53,9 @@ BAM feedback/control links
 ## BAM feedback and control roles
 
 The topology overlay linked above defines link depths, consumer modes, and
-configuration gates. `bam_verif` feeds verify tile 0 only.
+configuration gates. Verify tiles take `bam_verif` round robin and publish
+each BAM frag with its `bam_verif` seq plus one as sig; dedup holds a BAM frag
+until all earlier ones have passed, so pack sees `bam_verif` order.
 
 - `executed_txn`: Motor publishes signature completion
   events for BAM transactions only. Landed and completed-unlanded events both

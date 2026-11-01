@@ -18,9 +18,12 @@ adapters. Live code is authoritative.
 The adapters call real verify, dedup, resolver, pack, and native Firedancer
 execle/runtime code with signature-valid fixtures, seeded account/blockhash
 state, and miniature banks. Links and tile clocks are synthetic; pack's BAM
-ownership is fixed active and output credits are effectively unlimited. This
-target does not exercise concurrent stem operation, real link backpressure,
-ownership handoffs, or transport authentication/TLS.
+ownership is fixed active and output credits are effectively unlimited. Three
+verify adapters take `bam_verif` round robin, and dedup polls their outputs
+last tile first after a per-input lag of 1-6 frags, so it must hold BAM frags
+and restore `bam_verif` order. This target does not exercise concurrent stem
+operation, real link backpressure, ownership handoffs, or transport
+authentication/TLS.
 
 There is no motor adapter. The harness counts `execle_poh` outputs but
 does not turn their provisional committed outcomes into `motor_bam` feedback.

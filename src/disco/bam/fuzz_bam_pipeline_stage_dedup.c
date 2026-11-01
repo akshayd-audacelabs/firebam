@@ -4,7 +4,6 @@
 
 #include "fuzz_bam_pipeline_stage.h"
 
-#define BAM_FUZZ_DEDUP_IN_VERIFY_IDX (0UL)
 #define BAM_FUZZ_DEDUP_MCACHE_DEPTH  (256UL)
 #define BAM_FUZZ_DEDUP_TCACHE_DEPTH  (128UL)
 
@@ -17,6 +16,7 @@ struct bam_fuzz_dedup {
 bam_fuzz_dedup_t *
 bam_fuzz_dedup_new( fd_wksp_t *             wksp,
                     bam_fuzz_link_t const * in,
+                    ulong                   in_cnt,
                     bam_fuzz_link_t         out[ BAM_FUZZ_OUT_MAX ] ) {
   bam_fuzz_dedup_t * h = fd_wksp_alloc_laddr( wksp, alignof(bam_fuzz_dedup_t), sizeof(bam_fuzz_dedup_t), 1UL );
   FD_TEST( h );
@@ -29,8 +29,12 @@ bam_fuzz_dedup_new( fd_wksp_t *             wksp,
 
   bam_fuzz_link_t const * o = bam_fuzz_outs_add( &h->outs, 0UL, wksp, BAM_FUZZ_DEDUP_MCACHE_DEPTH, FD_TPU_PARSED_MTU );
 
-  ctx->in_kind[ BAM_FUZZ_DEDUP_IN_VERIFY_IDX ] = IN_KIND_VERIFY;
-  ctx->in     [ BAM_FUZZ_DEDUP_IN_VERIFY_IDX ] = (fd_dedup_in_ctx_t){ .mem = in->mem, .chunk0 = in->chunk0, .wmark = in->wmark, .mtu = FD_TPU_PARSED_MTU };
+  FD_TEST( in_cnt<=sizeof(ctx->in)/sizeof(ctx->in[ 0 ]) );
+  for( ulong i=0UL; i<in_cnt; i++ ) {
+    ctx->in_kind[ i ] = IN_KIND_VERIFY;
+    ctx->in     [ i ] = (fd_dedup_in_ctx_t){ .mem = in[ i ].mem, .chunk0 = in[ i ].chunk0, .wmark = in[ i ].wmark, .mtu = FD_TPU_PARSED_MTU };
+  }
+  fd_dedup_tile_bam_init( ctx, in_cnt );
   ctx->out_mem    = o->mem;
   ctx->out_chunk0 = o->chunk0;
   ctx->out_wmark  = o->wmark;
@@ -56,10 +60,16 @@ bam_fuzz_dedup_delete( bam_fuzz_dedup_t * h ) {
 
 bam_fuzz_res_t
 bam_fuzz_dedup_frag( bam_fuzz_dedup_t *     h,
+                     ulong                  in_idx,
                      fd_frag_meta_t const * meta,
-                     ulong                  seq ) {
+                     ulong                  seq,
+                     int *                  held ) {
   bam_fuzz_res_t res = bam_fuzz_outs_begin( &h->outs );
-  during_frag( h->ctx, BAM_FUZZ_DEDUP_IN_VERIFY_IDX, seq, meta->sig, meta->chunk, meta->sz, meta->ctl );
-  after_frag( h->ctx, BAM_FUZZ_DEDUP_IN_VERIFY_IDX, seq, meta->sig, meta->sz, meta->tsorig, meta->tspub, h->outs.stem );
+  int filter = fd_dedup_tile_bam_before_frag( h->ctx, in_idx, seq, meta->sig );
+  FD_TEST( filter<=0 );
+  *held = filter<0;
+  if( *held ) return res;
+  during_frag( h->ctx, in_idx, seq, meta->sig, meta->chunk, meta->sz, meta->ctl );
+  after_frag( h->ctx, in_idx, seq, meta->sig, meta->sz, meta->tsorig, meta->tspub, h->outs.stem );
   return bam_fuzz_outs_end( &h->outs, res );
 }

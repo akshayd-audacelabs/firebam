@@ -28,7 +28,9 @@ FD_IMPORT_BINARY( bam_fuzz_pack_txn7, "src/disco/pack/fixtures/txn7.bin" );
 
 /* Stateful BAM pipeline fuzzer.  Stages exercise the real BAM scheduler
    protobuf decode, pending transaction queue, bam_verif publication,
-   verify/dedup/resolv tile callbacks, pack tile callbacks through
+   verify/dedup/resolv tile callbacks (BAM_FUZZ_VERIFY_CNT verify tiles
+   taking bam_verif round robin and dedup restoring its order, after a
+   per-input lag of frags), pack tile callbacks through
    pack_execle and pack_bam_*, execle tile callbacks through native
    Firedancer runtime execution, durable feedback queue, and outbound
    scheduler protobuf result encoding.  It has no model oracle, and all
@@ -63,6 +65,8 @@ typedef enum {
 #define BAM_FUZZ_MAX_BATCHES FD_BAM_FULL_ATOMIC_BATCHES_PER_STEM_BURST
 #define BAM_FUZZ_PB_BUF_SZ  (64UL*1024UL)
 #define BAM_FUZZ_WKSP_FOOTPRINT (8UL<<30)
+
+#define BAM_FUZZ_VERIFY_CNT (3UL)
 
 #define BAM_FUZZ_BANK_IN_EXECLE_IDX (0UL)
 #define BAM_FUZZ_BANK_IN_BASE_IDX   (3UL)
@@ -121,17 +125,22 @@ typedef struct {
   fd_bam_tile_t *     state;   /* == env->state */
   bam_fuzz_link_t     bam_out; /* BAM tile -> verify */
 
-  bam_fuzz_verify_t * verify;
+  bam_fuzz_verify_t * verify[ BAM_FUZZ_VERIFY_CNT ];
   bam_fuzz_dedup_t *  dedup;
   bam_fuzz_resolv_t * resolv;
   bam_fuzz_pack_t *   pack;
   bam_fuzz_execle_t * execle;
-  bam_fuzz_link_t     verify_out[ BAM_FUZZ_OUT_MAX ];
+  bam_fuzz_link_t     verify_out[ BAM_FUZZ_VERIFY_CNT ][ BAM_FUZZ_OUT_MAX ];
   bam_fuzz_link_t     dedup_out [ BAM_FUZZ_OUT_MAX ];
   bam_fuzz_link_t     resolv_out[ BAM_FUZZ_OUT_MAX ];
   bam_fuzz_link_t     pack_out  [ BAM_FUZZ_OUT_MAX ];
   bam_fuzz_link_t     execle_out[ BAM_FUZZ_OUT_MAX ];
   ulong *             pack_execle_busy_fseq;
+
+  ulong verify_pub [ BAM_FUZZ_VERIFY_CNT ]; /* Frags verify tile i published */
+  ulong verify_took[ BAM_FUZZ_VERIFY_CNT ]; /* Of those, frags dedup took */
+  ulong dedup_took;                         /* BAM frags dedup took */
+  ulong dedup_lag;                          /* bam_verif frags per dedup pump */
 
   uint next_seq;
   ulong current_slot;
@@ -486,37 +495,73 @@ bam_fuzz_pump_resolv( bam_fuzz_state_t * f,
   }
 }
 
+/* bam_fuzz_pump_dedup offers dedup the frag at the head of each verify
+   output, last verify tile first, until it takes none: like a stem
+   whose round robin reaches later BAM frags before the one dedup waits
+   on.  Each frag dedup takes runs on through resolv and pack.  Returns
+   the number of frags dedup took. */
+
+static ulong
+bam_fuzz_pump_dedup( bam_fuzz_state_t * f ) {
+  ulong took = 0UL;
+  for( int progress=1; progress; ) {
+    progress = 0;
+    for( ulong i=BAM_FUZZ_VERIFY_CNT; i; i-- ) {
+      ulong v = i-1UL;
+      if( f->verify_took[ v ]==f->verify_pub[ v ] ) continue;
+      ulong verify_seq = f->verify_took[ v ];
+      fd_frag_meta_t const * verify_meta = bam_fuzz_link_frag( &f->verify_out[ v ][ 0 ], verify_seq, sizeof(fd_txn_m_t), FD_TPU_PARSED_MTU );
+      int held;
+      bam_fuzz_range_t dr = bam_fuzz_dedup_frag( f->dedup, v, verify_meta, verify_seq, &held ).out[ 0 ];
+      if( held ) continue;
+      FD_TEST( verify_meta->sig==++f->dedup_took ); /* bam_verif order */
+      f->verify_took[ v ]++;
+      took++;
+      progress = 1;
+
+      fd_frag_meta_t const * bam_meta;
+      fd_txn_m_t const * bam_txnm = bam_fuzz_link_txnm( &f->bam_out, verify_meta->sig-1UL, FD_TPU_PARSED_MTU, &bam_meta );
+      for( ulong dedup_seq=dr.lo; dedup_seq<dr.hi; dedup_seq++ ) {
+        fd_frag_meta_t const * dedup_meta;
+        fd_txn_m_t const * dedup_txnm = bam_fuzz_link_txnm( &f->dedup_out[ 0 ], dedup_seq, FD_TPU_PARSED_MTU, &dedup_meta );
+        bam_fuzz_assert_txnm_preserved( dedup_txnm, bam_txnm );
+        FD_TEST( dedup_meta->sig==1UL );
+
+        bam_fuzz_range_t rr = bam_fuzz_resolv_frag( f->resolv, dedup_meta, dedup_seq ).out[ 0 ];
+        for( ulong pack_seq=rr.lo; pack_seq<rr.hi; pack_seq++ ) {
+          fd_frag_meta_t const * pack_meta;
+          fd_txn_m_t const * pack_txnm = bam_fuzz_link_txnm( &f->resolv_out[ 0 ], pack_seq, FD_TPU_RESOLVED_MTU, &pack_meta );
+          bam_fuzz_assert_txnm_preserved( pack_txnm, bam_txnm );
+
+          bam_fuzz_res_t pack_res = bam_fuzz_pack_frag( f->pack, pack_meta, pack_seq, g_bam_fuzz_now );
+          bam_fuzz_ingest_pack_outputs( f, &pack_res );
+          bam_fuzz_pump_pack( f, 8UL );
+        }
+      }
+    }
+  }
+  return took;
+}
+
 static void
 bam_fuzz_run_pipeline( bam_fuzz_state_t *     f,
                        fd_frag_meta_t const * bam_meta,
                        fd_txn_m_t const *     bam_txnm,
                        ulong                  bam_seq ) {
-  bam_fuzz_range_t vr = bam_fuzz_verify_frag( f->verify, bam_meta, bam_seq ).out[ 0 ];
-  for( ulong verify_seq=vr.lo; verify_seq<vr.hi; verify_seq++ ) {
-    fd_frag_meta_t const * verify_meta;
-    fd_txn_m_t const * verify_txnm = bam_fuzz_link_txnm( &f->verify_out[ 0 ], verify_seq, FD_TPU_PARSED_MTU, &verify_meta );
-    bam_fuzz_assert_txnm_preserved( verify_txnm, bam_txnm );
-
-    bam_fuzz_range_t dr = bam_fuzz_dedup_frag( f->dedup, verify_meta, verify_seq ).out[ 0 ];
-    for( ulong dedup_seq=dr.lo; dedup_seq<dr.hi; dedup_seq++ ) {
-      fd_frag_meta_t const * dedup_meta;
-      fd_txn_m_t const * dedup_txnm = bam_fuzz_link_txnm( &f->dedup_out[ 0 ], dedup_seq, FD_TPU_PARSED_MTU, &dedup_meta );
-      bam_fuzz_assert_txnm_preserved( dedup_txnm, bam_txnm );
-      FD_TEST( dedup_meta->sig==1UL );
-
-      bam_fuzz_range_t rr = bam_fuzz_resolv_frag( f->resolv, dedup_meta, dedup_seq ).out[ 0 ];
-      for( ulong pack_seq=rr.lo; pack_seq<rr.hi; pack_seq++ ) {
-        fd_frag_meta_t const * pack_meta;
-        fd_txn_m_t const * pack_txnm = bam_fuzz_link_txnm( &f->resolv_out[ 0 ], pack_seq, FD_TPU_RESOLVED_MTU, &pack_meta );
-        bam_fuzz_assert_txnm_preserved( pack_txnm, bam_txnm );
-
-        bam_fuzz_res_t pack_res = bam_fuzz_pack_frag( f->pack, pack_meta, pack_seq, g_bam_fuzz_now );
-        bam_fuzz_ingest_pack_outputs( f, &pack_res );
-        bam_fuzz_pump_pack( f, 8UL );
-      }
+  /* Every verify tile polls bam_verif and exactly one takes the frag */
+  for( ulong v=0UL; v<BAM_FUZZ_VERIFY_CNT; v++ ) {
+    bam_fuzz_range_t vr = bam_fuzz_verify_frag( f->verify[ v ], bam_meta, bam_seq ).out[ 0 ];
+    FD_TEST( vr.hi-vr.lo==(ulong)( v==bam_seq%BAM_FUZZ_VERIFY_CNT ) );
+    for( ulong verify_seq=vr.lo; verify_seq<vr.hi; verify_seq++ ) {
+      fd_frag_meta_t const * verify_meta;
+      fd_txn_m_t const * verify_txnm = bam_fuzz_link_txnm( &f->verify_out[ v ][ 0 ], verify_seq, FD_TPU_PARSED_MTU, &verify_meta );
+      bam_fuzz_assert_txnm_preserved( verify_txnm, bam_txnm );
+      FD_TEST( verify_meta->sig==bam_seq+1UL );
     }
+    f->verify_pub[ v ] = vr.hi;
   }
 
+  if( !( (bam_seq+1UL) % f->dedup_lag ) ) bam_fuzz_pump_dedup( f );
   bam_fuzz_pump_resolv( f, 4UL );
 }
 
@@ -543,6 +588,11 @@ bam_fuzz_drain_pending_txns( bam_fuzz_state_t * f,
     fd_frag_meta_t const * meta = bam_fuzz_link_frag( &f->bam_out, seq, sizeof(fd_txn_m_t), FD_TPU_PARSED_MTU );
     bam_fuzz_run_pipeline( f, meta, bam_fuzz_assert_bam_publish( f, meta ), seq );
   }
+
+  /* All of bam_verif is verified, so dedup takes every frag left */
+  if( bam_fuzz_pump_dedup( f ) ) bam_fuzz_pump_resolv( f, 4UL );
+  for( ulong v=0UL; v<BAM_FUZZ_VERIFY_CNT; v++ ) FD_TEST( f->verify_took[ v ]==f->verify_pub[ v ] );
+  FD_TEST( f->dedup_took==seq_after );
 }
 
 static void
@@ -1099,9 +1149,14 @@ LLVMFuzzerTestOneInput( uchar const * data,
     .depth  = f->env->stem_depths[ state->verify_out.idx ],
   };
 
-  f->verify = bam_fuzz_verify_new( g_bam_fuzz_wksp, &f->bam_out,       f->verify_out );
-  f->dedup  = bam_fuzz_dedup_new ( g_bam_fuzz_wksp, &f->verify_out[0], f->dedup_out  );
-  f->resolv = bam_fuzz_resolv_new( g_bam_fuzz_wksp, &f->dedup_out[0],  f->resolv_out );
+  bam_fuzz_link_t dedup_in[ BAM_FUZZ_VERIFY_CNT ];
+  for( ulong v=0UL; v<BAM_FUZZ_VERIFY_CNT; v++ ) {
+    f->verify[ v ] = bam_fuzz_verify_new( g_bam_fuzz_wksp, &f->bam_out, f->verify_out[ v ], v, BAM_FUZZ_VERIFY_CNT );
+    dedup_in[ v ] = f->verify_out[ v ][ 0 ];
+  }
+  f->dedup_lag = 1UL + (ulong)( (seed>>5) % (2UL*BAM_FUZZ_VERIFY_CNT) );
+  f->dedup  = bam_fuzz_dedup_new ( g_bam_fuzz_wksp, dedup_in, BAM_FUZZ_VERIFY_CNT, f->dedup_out );
+  f->resolv = bam_fuzz_resolv_new( g_bam_fuzz_wksp, &f->dedup_out[0], f->resolv_out );
   f->pack   = bam_fuzz_pack_new  ( g_bam_fuzz_wksp, &f->resolv_out[0], f->pack_out, &f->pack_execle_busy_fseq );
   f->execle = bam_fuzz_execle_new( g_bam_fuzz_wksp, &f->pack_out[ BAM_FUZZ_PACK_OUT_EXECLE ], f->execle_out, f->pack_execle_busy_fseq );
 
@@ -1143,7 +1198,7 @@ LLVMFuzzerTestOneInput( uchar const * data,
   bam_fuzz_pack_delete  ( f->pack   );
   bam_fuzz_resolv_delete( f->resolv );
   bam_fuzz_dedup_delete ( f->dedup  );
-  bam_fuzz_verify_delete( f->verify );
+  for( ulong v=0UL; v<BAM_FUZZ_VERIFY_CNT; v++ ) bam_fuzz_verify_delete( f->verify[ v ] );
   test_bam_env_destroy( f->env );
 
   fd_wksp_usage_t usage;

@@ -2,6 +2,9 @@
 #include "../dedup/fd_dedup_tile.c"
 #undef fd_tile_dedup
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 typedef struct {
   fd_dedup_ctx_t ctx;
 
@@ -214,6 +217,84 @@ test_bam_duplicate_and_preprocess_failed( void ) {
   FD_TEST( fd_tcache_leave( tcache ) );
 }
 
+/* Exit status of a child offering dedup bam_verif frag bam_seq on in_idx */
+static int
+test_bam_order_exit_status( fd_dedup_ctx_t * ctx,
+                            ulong            in_idx,
+                            ulong            bam_seq ) {
+  pid_t pid = fork();
+  FD_TEST( pid>=0 );
+  if( !pid ) {
+    fd_log_level_core_set( 8 );
+    FD_TEST( fd_dedup_tile_bam_before_frag( ctx, in_idx, 0UL, bam_seq+1UL )==-1 );
+    _exit( 0 );
+  }
+  int status;
+  FD_TEST( waitpid( pid, &status, 0 )==pid );
+  FD_TEST( WIFEXITED( status ) );
+  return WEXITSTATUS( status );
+}
+
+/* BAM before_frag: verify tiles take bam_verif round robin, so a BAM
+   frag (sig = its bam_verif seq plus one) waits on its in until every
+   earlier one is admitted.  Other frags never wait or move the
+   expected seq. */
+static void
+test_bam_verify_order( void ) {
+  test_env_t env[ 1 ];
+  test_env_init( env );
+  fd_dedup_ctx_t * ctx = &env->ctx;
+  ctx->in_kind[ 1 ] = IN_KIND_VERIFY;
+  ctx->in_kind[ 2 ] = IN_KIND_VERIFY;
+  ctx->in_kind[ 3 ] = IN_KIND_REPLAY;
+  fd_dedup_tile_bam_init( ctx, 4UL );
+  FD_TEST( ctx->verify_cnt==3UL && !ctx->bam_seq );
+
+  /* Verify tile i publishes bam_verif frags i and i+3 in order, tile 0
+     last.  The frag at the head of an in waits until the frags before
+     it are admitted. */
+  ulong const published[ 6 ] = { 2UL, 5UL, 1UL, 4UL, 0UL, 3UL };
+  ulong in_pub [ 3 ] = { 0UL };
+  ulong in_done[ 3 ] = { 0UL };
+  ulong admitted = 0UL;
+  for( ulong i=0UL; i<6UL; i++ ) {
+    in_pub[ published[ i ]%3UL ]++;
+    for( int progress=1; progress; ) {
+      progress = 0;
+      for( ulong in_idx=0UL; in_idx<3UL; in_idx++ ) {
+        if( in_done[ in_idx ]==in_pub[ in_idx ] ) continue;
+        ulong bam_seq = in_idx+3UL*in_done[ in_idx ];
+        int   res     = fd_dedup_tile_bam_before_frag( ctx, in_idx, 0UL, bam_seq+1UL );
+        FD_TEST( res==(bam_seq==admitted ? 0 : -1) );
+        if( res ) continue;
+        in_done[ in_idx ]++;
+        admitted++;
+        progress = 1;
+      }
+    }
+    FD_TEST( ctx->bam_seq==admitted && admitted==(i<4UL ? 0UL : i==4UL ? 3UL : 6UL) );
+  }
+  FD_TEST( admitted==6UL );
+
+  /* TPU frags from verify (sig 0) and replay frags (nonzero sig) pass
+     while a BAM frag waits. */
+  FD_TEST( fd_dedup_tile_bam_before_frag( ctx, 1UL, 0UL, 8UL )==-1 );
+  FD_TEST( fd_dedup_tile_bam_before_frag( ctx, 0UL, 0UL, 0UL )==0 );
+  FD_TEST( fd_dedup_tile_bam_before_frag( ctx, 3UL, 0UL, 7UL )==0 );
+  FD_TEST( fd_dedup_tile_bam_before_frag( ctx, 3UL, 0UL, 8UL )==0 );
+  FD_TEST( ctx->bam_seq==6UL );
+  FD_TEST( fd_dedup_tile_bam_before_frag( ctx, 0UL, 0UL, 7UL )==0 );
+  FD_TEST( fd_dedup_tile_bam_before_frag( ctx, 1UL, 0UL, 8UL )==0 );
+  FD_TEST( ctx->bam_seq==8UL );
+
+  /* Frag 9 can come before 8, but a repeated frag, or one from the
+     tile that owes frag 8, means frag 8 will never come. */
+  FD_TEST( test_bam_order_exit_status( ctx, 0UL,  9UL )==0 );
+  FD_TEST( test_bam_order_exit_status( ctx, 1UL,  7UL )==1 );
+  FD_TEST( test_bam_order_exit_status( ctx, 2UL, 11UL )==1 );
+  FD_TEST( ctx->bam_seq==8UL );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -221,6 +302,7 @@ main( int     argc,
 
   test_bam_block_engine_namespace();
   test_bam_duplicate_and_preprocess_failed();
+  test_bam_verify_order();
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();
   return 0;

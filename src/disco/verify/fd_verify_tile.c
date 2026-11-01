@@ -43,9 +43,9 @@ before_frag( fd_verify_ctx_t * ctx,
      prevent interleaving of bundle streams. */
   int is_bundle_packet = (ctx->in_kind[ in_idx ]==IN_KIND_BUNDLE && !sig);
 
-  if( FD_LIKELY( is_bundle_packet || ctx->in_kind[ in_idx ]==IN_KIND_QUIC ) ) {
+  if( FD_LIKELY( is_bundle_packet || ctx->in_kind[ in_idx ]==IN_KIND_QUIC || ctx->in_kind[ in_idx ]==IN_KIND_BAM ) ) {
     return (seq % ctx->round_robin_cnt) != ctx->round_robin_idx;
-  } else if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_BUNDLE || ctx->in_kind[ in_idx ]==IN_KIND_BAM ) ) {
+  } else if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_BUNDLE ) ) {
     return ctx->round_robin_idx!=0UL;
   }
 
@@ -95,7 +95,7 @@ after_frag( fd_verify_ctx_t *   ctx,
   (void)_tspub;
 
   fd_txn_m_t * txnm = (fd_txn_m_t *)fd_chunk_to_laddr( ctx->out_mem, ctx->out_chunk );
-  if( FD_UNLIKELY( txnm->source_tpu==FD_TXN_M_TPU_SOURCE_BAM ) ) { fd_verify_tile_bam_after_frag( ctx, txnm, tsorig, stem ); return; }
+  if( FD_UNLIKELY( txnm->source_tpu==FD_TXN_M_TPU_SOURCE_BAM ) ) { fd_verify_tile_bam_after_frag( ctx, txnm, seq, tsorig, stem ); return; }
   if( FD_UNLIKELY( txnm->payload_sz>FD_TPU_MTU ) ) {
     FD_LOG_ERR(( "verify: txn payload size %hu exceeds max %lu", txnm->payload_sz, FD_TPU_MTU ));
   }

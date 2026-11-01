@@ -1,7 +1,9 @@
-/* test_bam_verify_tile covers the verify tile's bam_verif input: it is
-   served only by verify:0, and a BAM txn that fails is forwarded as a
-   preprocess_failed marker for pack instead of being dropped.  Uses
-   libc malloc like test_verify_tile. */
+/* test_bam_verify_tile covers the verify tile's bam_verif input: verify
+   tiles take it round robin, every BAM frag is published with its
+   bam_verif seq plus one as sig (dedup restores bam_verif order), and a
+   BAM txn that fails is forwarded as a preprocess_failed marker for
+   pack instead of being dropped.  Uses libc malloc like
+   test_verify_tile. */
 
 #define FD_TILE_TEST
 #include "../verify/fd_verify_tile.c"
@@ -62,15 +64,16 @@ test_bam_load_balance( void ) {
   FD_TEST( ctx->in_kind[ IN_IDX_BAM  ]==IN_KIND_BAM  );
   FD_TEST( ctx->in_kind[ IN_IDX_QUIC ]==IN_KIND_QUIC );
 
-  /* BAM batches must stay ordered, so verify:0 takes every BAM frag
-     whatever its seq or sig and the other verify tiles take none. */
+  /* Dedup restores bam_verif order, so BAM frags go round robin by seq
+     like QUIC packets, whatever their sig (revert_on_error). */
   for( ulong rr_cnt=1UL; rr_cnt<=4UL; rr_cnt+=3UL ) {
     for( ulong rr_idx=0UL; rr_idx<rr_cnt; rr_idx++ ) {
       ctx->round_robin_cnt = rr_cnt;
       ctx->round_robin_idx = rr_idx;
-      for( ulong seq=0UL; seq<3UL; seq++ ) {
+      for( ulong seq=0UL; seq<9UL; seq++ ) {
         for( ulong sig=0UL; sig<2UL; sig++ ) {
-          FD_TEST( before_frag( ctx, IN_IDX_BAM, seq, sig )==(rr_idx!=0UL) );
+          FD_TEST( before_frag( ctx, IN_IDX_BAM,  seq, sig )==((seq%rr_cnt)!=rr_idx) );
+          FD_TEST( before_frag( ctx, IN_IDX_QUIC, seq, sig )==((seq%rr_cnt)!=rr_idx) );
         }
       }
     }
@@ -136,18 +139,21 @@ test_bam_atomic_verify_failure_result_owner( void ) {
       },
     };
 
-    after_frag( env->ctx, IN_IDX_BAM, 0UL, 0UL, sizeof(fd_txn_m_t), 0UL, 0UL, env->stem );
+    after_frag( env->ctx, IN_IDX_BAM, case_idx, 0UL, sizeof(fd_txn_m_t), 0UL, 0UL, env->stem );
 
     FD_TEST( env->seqs[ 0 ]==1UL );
+    FD_TEST( env->mcache[ 0 ].sig==case_idx+1UL );
     FD_TEST( txnm->bam.preprocess_failed );
     FD_TEST( txnm->bam.seq_id    ==77U );
     FD_TEST( txnm->bam.batch_idx ==cases[ case_idx ].batch_idx );
     FD_TEST( txnm->txn_t_sz      ==fd_txn_footprint( 0UL, 0UL ) );
   }
 
-  /* A failed member fails its later peers until the seq_id is resent
-     as a new batch (batch_idx back to zero).  Each frag arrives at the
-     out_chunk the previous publish advanced to. */
+  /* The members of a batch can land on different verify tiles, so
+     verify keeps no batch state: each member, before and after a resend
+     of the seq_id, is checked and published, and dedup fails the
+     members after a failed one.  Each frag arrives at the out_chunk the
+     previous publish advanced to. */
   test_env_init( env );
   for( ulong i=0UL; i<3UL; i++ ) {
     uchar batch_idx = (uchar)( i==1UL );
@@ -166,18 +172,20 @@ test_bam_atomic_verify_failure_result_owner( void ) {
       },
     };
 
-    after_frag( env->ctx, IN_IDX_BAM, 0UL, 0UL, sizeof(fd_txn_m_t), 0UL, 0UL, env->stem );
+    after_frag( env->ctx, IN_IDX_BAM, 10UL+i, 0UL, sizeof(fd_txn_m_t), 0UL, 0UL, env->stem );
 
-    FD_TEST( env->seqs[ 0 ]==1UL+(ulong)( i==2UL ) );
-    FD_TEST( env->ctx->bundle_failed );
-    FD_TEST( env->ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_RESULT_V_BUNDLE_PEER_FAILED_IDX ]==(ulong)( i>0UL ) );
+    FD_TEST( env->seqs[ 0 ]==i+1UL );
+    FD_TEST( env->mcache[ i ].sig==11UL+i );
+    FD_TEST( txnm->bam.preprocess_failed && txnm->bam.batch_idx==batch_idx );
+    FD_TEST( !env->ctx->bundle_failed && !env->ctx->bundle_id );
+    FD_TEST( !env->ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_RESULT_V_BUNDLE_PEER_FAILED_IDX ] );
   }
 
   /* A non-BAM frag keeps upstream's path: this empty one fails to parse
      and is dropped, with no failure marker. */
   *(fd_txn_m_t *)fd_chunk_to_laddr( env->ctx->out_mem, env->ctx->out_chunk ) = (fd_txn_m_t){ .source_tpu = FD_TXN_M_TPU_SOURCE_QUIC };
   after_frag( env->ctx, IN_IDX_QUIC, 0UL, 0UL, sizeof(fd_txn_m_t), 0UL, 0UL, env->stem );
-  FD_TEST( env->seqs[ 0 ]==2UL );
+  FD_TEST( env->seqs[ 0 ]==3UL );
 }
 
 FD_IMPORT_BINARY( test_sample_vote, "src/disco/pack/sample_vote.bin" );
@@ -197,25 +205,35 @@ test_bam_sigverify_failure_drops_parsed_txn( void ) {
   fd_ed25519_cache_t * cache = fd_ed25519_cache_join( fd_ed25519_cache_new( cache_mem, FD_VERIFY_ED25519_CACHE_ENT_CNT, 0UL ) );
   FD_TEST( cache );
 
-  /* Cover failure before admission, repeated valid signatures warming
-     the signer cache, then failure while that signer is cached. */
+  /* One revert batch covers failure before admission, repeated valid
+     signatures warming the signer cache, then failure while that
+     signer is cached.  Verify keeps no batch state, so the valid
+     members after a failed one are published unflagged too. */
   int const bad_sigs[] = { 1, 0, 0, 0, 1 };
-  for( ulong case_idx=0UL; case_idx<sizeof(bad_sigs)/sizeof(bad_sigs[0]); case_idx++ ) {
-    int bad_sig = bad_sigs[ case_idx ];
-    fd_txn_m_t * txnm = test_env_init( env );
-    fd_verify_ctx_t * ctx = env->ctx;
-    ctx->ed25519_cache = cache;
-    ctx->in_kind[ IN_IDX_BAM ] = IN_KIND_BAM;
-    for( ulong i=0UL; i<FD_TXN_SIG_MAX; i++ ) FD_TEST( (ctx->sha[ i ] = fd_sha512_join( fd_sha512_new( &sha[ i ] ) )) );
+  ulong const member_cnt = sizeof(bad_sigs)/sizeof(bad_sigs[0]);
+  ulong bad_cnt = 0UL;
+  test_env_init( env );
+  fd_verify_ctx_t * ctx = env->ctx;
+  ctx->ed25519_cache = cache;
+  ctx->in_kind[ IN_IDX_BAM ] = IN_KIND_BAM;
+  for( ulong i=0UL; i<FD_TXN_SIG_MAX; i++ ) FD_TEST( (ctx->sha[ i ] = fd_sha512_join( fd_sha512_new( &sha[ i ] ) )) );
+  for( ulong member_idx=0UL; member_idx<member_cnt; member_idx++ ) {
+    int bad_sig = bad_sigs[ member_idx ];
+    bad_cnt += (ulong)bad_sig;
 
     /* As the bam tile publishes it: payload plus its own parse. */
+    fd_txn_m_t * txnm = (fd_txn_m_t *)fd_chunk_to_laddr( ctx->out_mem, ctx->out_chunk );
     *txnm = (fd_txn_m_t) {
       .payload_sz = (ushort)test_sample_vote_sz,
       .source_tpu = FD_TXN_M_TPU_SOURCE_BAM,
       .bam = {
+        .bundle_id         = 100UL,
+        .bundle_txn_cnt    = member_idx ? 0UL : member_cnt,
         .max_schedule_slot = 100UL,
         .seq_id            = 99U,
-        .txn_cnt           = 1U,
+        .txn_cnt           = (uchar)member_cnt,
+        .batch_idx         = (uchar)member_idx,
+        .revert_on_error   = 1U,
       },
     };
     uchar *    payload = fd_txn_m_payload( txnm );
@@ -226,25 +244,25 @@ test_bam_sigverify_failure_drops_parsed_txn( void ) {
     FD_TEST( fd_bam_txn_is_simple_vote( txnt, payload ) );
     if( bad_sig ) payload[ txnt->signature_off ] ^= (uchar)1;
 
-    after_frag( ctx, IN_IDX_BAM, 0UL, 0UL, fd_txn_m_realized_footprint( txnm, 1, 0 ), 0UL, 0UL, env->stem );
+    after_frag( ctx, IN_IDX_BAM, 20UL+member_idx, 0UL, fd_txn_m_realized_footprint( txnm, 1, 0 ), 0UL, 0UL, env->stem );
 
-    FD_TEST( env->seqs[ 0 ]==1UL );
+    FD_TEST( env->seqs[ 0 ]==member_idx+1UL );
+    FD_TEST( env->mcache[ member_idx ].sig==21UL+member_idx );
+    FD_TEST( env->mcache[ member_idx ].sz==fd_txn_m_realized_footprint( txnm, 1, 0 ) );
     FD_TEST( txnm->payload_sz==test_sample_vote_sz );
-    FD_TEST( txnm->bam.seq_id==99U );
+    FD_TEST( txnm->bam.seq_id==99U && txnm->bam.batch_idx==member_idx );
+    FD_TEST( ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_RESULT_V_SIGNATURE_FAILED_IDX ]==bad_cnt );
+    FD_TEST( ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_RESULT_V_SUCCESS_IDX ]==member_idx+1UL-bad_cnt );
+    FD_TEST( !!txnm->bam.preprocess_failed==bad_sig );
     if( bad_sig ) {
-      FD_TEST( ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_RESULT_V_SIGNATURE_FAILED_IDX ]==1UL );
-      FD_TEST( txnm->bam.preprocess_failed );
       FD_TEST( txnm->txn_t_sz==fd_txn_footprint( 0UL, 0UL ) );
-      FD_TEST( env->mcache[ 0 ].sz==fd_txn_m_realized_footprint( txnm, 1, 0 ) );
       FD_TEST( !fd_bam_txn_is_simple_vote( fd_txn_m_txn_t_const( txnm ), fd_txn_m_payload_const( txnm ) ) );
     } else {
-      FD_TEST( ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_RESULT_V_SUCCESS_IDX ]==1UL );
-      FD_TEST( !txnm->bam.preprocess_failed );
       FD_TEST( fd_bam_txn_is_simple_vote( fd_txn_m_txn_t_const( txnm ), fd_txn_m_payload_const( txnm ) ) );
     }
-
-    for( ulong i=0UL; i<FD_TXN_SIG_MAX; i++ ) FD_TEST( fd_sha512_delete( fd_sha512_leave( ctx->sha[ i ] ) ) );
   }
+  FD_TEST( !ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_RESULT_V_BUNDLE_PEER_FAILED_IDX ] );
+  for( ulong i=0UL; i<FD_TXN_SIG_MAX; i++ ) FD_TEST( fd_sha512_delete( fd_sha512_leave( ctx->sha[ i ] ) ) );
 
   FD_TEST( fd_ed25519_cache_insert_cnt( cache )>0UL );
   FD_TEST( fd_ed25519_cache_hit_cnt( cache )>0UL );
@@ -257,7 +275,6 @@ test_bam_sigverify_failure_drops_parsed_txn( void ) {
   };
   fd_tcache_t * tcache = fd_tcache_join( fd_tcache_new( test_malloc( fd_tcache_align(), fd_tcache_footprint( TCACHE_DEPTH, 0UL ) ), TCACHE_DEPTH, 0UL ) );
   test_env_init( env );
-  fd_verify_ctx_t * ctx = env->ctx;
   ctx->ed25519_cache  = cache;
   ctx->tcache_depth   = fd_tcache_depth       ( tcache );
   ctx->tcache_map_cnt = fd_tcache_map_cnt     ( tcache );

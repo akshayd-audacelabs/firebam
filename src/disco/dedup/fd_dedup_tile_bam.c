@@ -1,13 +1,48 @@
 /* FireBAM part of the dedup tile, included once by fd_dedup_tile.c.
-   BAM may resend a signature, so it skips the signature tcache.  A
-   revert batch shares the bundle failure tracking
-   (fd_txn_m_failure_group_id) and is checked for duplicate members as a
-   Block Engine bundle is.  Every frag not in an already failed batch is
-   published, a failed one with preprocess_failed set so pack can answer
-   the batch, and all of it to resolv:0 (sig 1) so batches stay
-   ordered. */
+   BAM frags reach dedup out of order and leave in bam_verif order.  BAM
+   may resend a signature, so it skips the signature tcache.  A revert
+   batch shares the bundle failure tracking (fd_txn_m_failure_group_id)
+   and is checked for duplicate members as a Block Engine bundle is.
+   Every frag not in an already failed batch is published, a failed one
+   with preprocess_failed set so pack can answer the batch, and all of
+   it to resolv:0 (sig 1) so batches stay ordered. */
 
 #include "../bam/fd_bam_txn_m.h"
+
+/* bam_verif's first frag has seq 0, as every stem in starts there */
+static void
+fd_dedup_tile_bam_init( fd_dedup_ctx_t * ctx,
+                        ulong            in_cnt ) {
+  ctx->bam_seq    = 0UL;
+  ctx->verify_cnt = 0UL;
+  for( ulong i=0UL; i<in_cnt; i++ ) ctx->verify_cnt += ctx->in_kind[ i ]==IN_KIND_VERIFY;
+}
+
+/* Verify tiles take bam_verif frags round robin and publish each with
+   its bam_verif seq plus one as sig (other frags carry sig 0), so frag
+   n reaches dedup from verify tile n%verify_cnt, maybe after later
+   frags from the others.  A BAM frag stays on its in (-1 hands it back
+   to the stem) until every earlier one is admitted, so dedup and all
+   after it see bam_verif order.  This cannot deadlock: the frag waited
+   on was published to bam_verif before the later one, and on its own
+   in only frags admitted without waiting are ahead of it.  A frag
+   behind the expected one, or ahead of it from the same verify tile,
+   means a frag was repeated or lost, which would stall BAM for good. */
+static inline int
+fd_dedup_tile_bam_before_frag( fd_dedup_ctx_t * ctx,
+                               ulong            in_idx,
+                               ulong            seq FD_PARAM_UNUSED,
+                               ulong            sig ) {
+  if( FD_LIKELY( !sig || ctx->in_kind[ in_idx ]!=IN_KIND_VERIFY ) ) return 0;
+  ulong bam_seq = sig-1UL;
+  if( FD_UNLIKELY( bam_seq!=ctx->bam_seq ) ) {
+    if( FD_UNLIKELY( bam_seq<ctx->bam_seq || bam_seq%ctx->verify_cnt==ctx->bam_seq%ctx->verify_cnt ) )
+      FD_LOG_ERR(( "bam_verif frag %lu reached dedup while waiting for %lu, so a frag was lost or repeated", bam_seq, ctx->bam_seq ));
+    return -1;
+  }
+  ctx->bam_seq++;
+  return 0;
+}
 
 static void
 fd_dedup_tile_bam_after_frag( fd_dedup_ctx_t *    ctx,

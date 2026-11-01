@@ -53,13 +53,15 @@ topo_bam_links( fd_topo_t * topo,
 static void
 topo_bam_tile_links( fd_topo_t *      topo,
                      config_t const * config,
+                     ulong            verify_tile_cnt,
                      ulong            execle_tile_cnt,
                      ulong            shred_tile_cnt ) {
   /**/                 fd_topob_tile_in(  topo, "pack",   0UL,           "metric_in", "executed_txn", 0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
   /**/                 fd_topob_tile_out( topo, "motor",  0UL,                        "executed_txn", 0UL                                                );
 
+  /* Verify tiles take bam_verif round robin, dedup restores its order */
   /**/                 fd_topob_tile_out( topo, "bam",    0UL,                        "bam_verif",    0UL                                                );
-  /**/                 fd_topob_tile_in(  topo, "verify", 0UL,          "metric_in", "bam_verif",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
+  FOR(verify_tile_cnt) fd_topob_tile_in(  topo, "verify", i,             "metric_in", "bam_verif",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
 
   /**/                 fd_topob_tile_in(  topo, "sign",   0UL,           "metric_in", "bam_sign",     0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
   /**/                 fd_topob_tile_out( topo, "bam",    0UL,                        "bam_sign",     0UL                                                );

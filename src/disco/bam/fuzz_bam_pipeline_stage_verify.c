@@ -17,7 +17,9 @@ struct bam_fuzz_verify {
 bam_fuzz_verify_t *
 bam_fuzz_verify_new( fd_wksp_t *             wksp,
                      bam_fuzz_link_t const * in,
-                     bam_fuzz_link_t         out[ BAM_FUZZ_OUT_MAX ] ) {
+                     bam_fuzz_link_t         out[ BAM_FUZZ_OUT_MAX ],
+                     ulong                   rr_idx,
+                     ulong                   rr_cnt ) {
   bam_fuzz_verify_t * h = fd_wksp_alloc_laddr( wksp, alignof(bam_fuzz_verify_t), sizeof(bam_fuzz_verify_t), 1UL );
   FD_TEST( h );
   fd_memset( h, 0, sizeof(*h) );
@@ -37,8 +39,8 @@ bam_fuzz_verify_new( fd_wksp_t *             wksp,
 
   bam_fuzz_link_t const * o = bam_fuzz_outs_add( &h->outs, 0UL, wksp, BAM_FUZZ_VERIFY_MCACHE_DEPTH, FD_TPU_PARSED_MTU );
 
-  ctx->round_robin_cnt = 1UL;
-  ctx->round_robin_idx = 0UL;
+  ctx->round_robin_cnt = rr_cnt;
+  ctx->round_robin_idx = rr_idx;
   ctx->in_kind[ BAM_FUZZ_VERIFY_IN_BAM_IDX ] = IN_KIND_BAM;
   ctx->in     [ BAM_FUZZ_VERIFY_IN_BAM_IDX ] = (fd_verify_in_ctx_t){ .mem = in->mem, .chunk0 = in->chunk0, .wmark = in->wmark };
   ctx->out_mem    = o->mem;
@@ -71,7 +73,7 @@ bam_fuzz_verify_frag( bam_fuzz_verify_t *    h,
                       fd_frag_meta_t const * meta,
                       ulong                  seq ) {
   bam_fuzz_res_t res = bam_fuzz_outs_begin( &h->outs );
-  FD_TEST( !before_frag( h->ctx, BAM_FUZZ_VERIFY_IN_BAM_IDX, seq, meta->sig ) );
+  if( before_frag( h->ctx, BAM_FUZZ_VERIFY_IN_BAM_IDX, seq, meta->sig ) ) return res;
   during_frag( h->ctx, BAM_FUZZ_VERIFY_IN_BAM_IDX, seq, meta->sig, meta->chunk, meta->sz, meta->ctl );
   after_frag( h->ctx, BAM_FUZZ_VERIFY_IN_BAM_IDX, seq, meta->sig, meta->sz, meta->tsorig, meta->tspub, h->outs.stem );
   return bam_fuzz_outs_end( &h->outs, res );
