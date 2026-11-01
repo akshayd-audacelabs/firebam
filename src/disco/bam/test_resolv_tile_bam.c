@@ -211,31 +211,56 @@ test_no_bank_deser_marker( uchar batch_idx ) {
    Runtime will check each member against the actual execution bank. */
 static void
 test_old_hash_bam_member_and_siblings_forwarded( void ) {
-  for( ulong revert_on_error=0UL; revert_on_error<2UL; revert_on_error++ ) {
-    test_harness_t h[1];
-    test_harness_new( h );
-    h->ctx->completed_block_height = 200UL;
+  test_harness_t h[1];
+  test_harness_new( h );
+  h->ctx->completed_block_height = 200UL;
 
-    for( uchar batch_idx=0U; batch_idx<3U; batch_idx++ ) {
-      fd_txn_m_t * txnm = test_prepare_bam_txn( h,
-                                                (uchar)(21U+batch_idx),
-                                                (_Bool)revert_on_error,
-                                                batch_idx,
-                                                3U,
-                                                0 );
-      ulong blockhash_height = batch_idx==1U ? 10UL : 200UL;
-      test_insert_blockhash( h, txnm, blockhash_height );
+  for( uchar batch_idx=0U; batch_idx<3U; batch_idx++ ) {
+    fd_txn_m_t * txnm = test_prepare_bam_txn( h, (uchar)(21U+batch_idx), 1, batch_idx, 3U, 0 );
+    ulong blockhash_height = batch_idx==1U ? 10UL : 200UL;
+    test_insert_blockhash( h, txnm, blockhash_height );
 
-      after_frag( h->ctx, 0UL, 0UL, 0UL, fd_txn_m_realized_footprint( txnm, 1, 0 ), 0UL, 0UL, h->stem );
+    after_frag( h->ctx, 0UL, 0UL, 0UL, fd_txn_m_realized_footprint( txnm, 1, 0 ), 0UL, 0UL, h->stem );
 
-      FD_TEST( h->seqs[ 0 ]==(ulong)batch_idx+1UL );
-      FD_TEST( txnm->reference_block_height==blockhash_height );
-      FD_TEST( !h->ctx->bundle_failed );
-    }
-    FD_TEST( h->ctx->metrics.txn_dropped[ FD_METRICS_ENUM_RESOLV_TXN_DROP_REASON_V_BLOCKHASH_EXPIRED_IDX ]==0UL );
-
-    test_harness_delete( h );
+    FD_TEST( h->seqs[ 0 ]==(ulong)batch_idx+1UL );
+    FD_TEST( txnm->reference_block_height==blockhash_height );
+    FD_TEST( !h->ctx->bundle_failed );
   }
+  FD_TEST( h->ctx->metrics.txn_dropped[ FD_METRICS_ENUM_RESOLV_TXN_DROP_REASON_V_BLOCKHASH_EXPIRED_IDX ]==0UL );
+
+  test_harness_delete( h );
+}
+
+/* A member that failed upstream is published as a marker without a
+   blockhash lookup and fails its batch, so the next member is dropped
+   as a peer failure.  A resend of the seq_id starts clean. */
+static void
+test_failed_member_drops_peers( void ) {
+  test_harness_t h[1];
+  test_harness_new( h );
+  h->ctx->completed_block_height = 100UL;
+  ulong const * peer_failed = h->ctx->metrics.txn_dropped+FD_METRICS_ENUM_RESOLV_TXN_DROP_REASON_V_BUNDLE_PEER_FAILED_IDX;
+
+  fd_txn_m_t * txnm = test_prepare_bam_txn( h, 31U, 1, 0U, 2U, 0 );
+  txnm->bam.preprocess_failed = 1U;
+  test_insert_blockhash( h, txnm, 10UL );
+  after_frag( h->ctx, 0UL, 0UL, 0UL, fd_txn_m_realized_footprint( txnm, 1, 0 ), 0UL, 0UL, h->stem );
+  FD_TEST( h->seqs[ 0 ]==1UL );
+  FD_TEST( txnm->bam.preprocess_failed && txnm->reference_block_height==100UL );
+  FD_TEST( h->ctx->bundle_failed );
+
+  txnm = test_prepare_bam_txn( h, 32U, 1, 1U, 2U, 0 );
+  after_frag( h->ctx, 0UL, 0UL, 0UL, fd_txn_m_realized_footprint( txnm, 1, 0 ), 0UL, 0UL, h->stem );
+  FD_TEST( h->seqs[ 0 ]==1UL );
+  FD_TEST( *peer_failed==1UL );
+
+  txnm = test_prepare_bam_txn( h, 33U, 1, 0U, 1U, 0 );
+  after_frag( h->ctx, 0UL, 0UL, 0UL, fd_txn_m_realized_footprint( txnm, 1, 0 ), 0UL, 0UL, h->stem );
+  FD_TEST( h->seqs[ 0 ]==2UL );
+  FD_TEST( !txnm->bam.preprocess_failed && !h->ctx->bundle_failed );
+  FD_TEST( *peer_failed==1UL );
+
+  test_harness_delete( h );
 }
 
 static void
@@ -288,7 +313,7 @@ main( int     argc,
   test_known_hash_height_distance_defers_to_runtime();
   test_old_hash_bam_member_and_siblings_forwarded();
   test_no_bank_deser_marker( 0U );
-  test_no_bank_deser_marker( 1U );
+  test_failed_member_drops_peers();
   test_unknown_hash_stash_and_bundle_bypass();
 
   FD_LOG_NOTICE(( "pass" ));

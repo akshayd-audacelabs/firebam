@@ -95,7 +95,7 @@ typedef struct {
   fd_stem_context_t stem[1];
 } test_env_t;
 
-static fd_txn_m_t *
+static void
 test_env_init( test_env_t * env ) {
   fd_memset( env, 0, sizeof(test_env_t) );
   env->ctx->out_mem   = (fd_wksp_t *)env->dcache;
@@ -103,7 +103,6 @@ test_env_init( test_env_t * env ) {
   env->mcaches[ 0 ]   = env->mcache;
   env->depths [ 0 ]   = 16UL;
   *env->stem = (fd_stem_context_t){ .mcaches=env->mcaches, .seqs=env->seqs, .depths=env->depths, .out_reliable=env->out_reliable };
-  return (fd_txn_m_t *)fd_chunk_to_laddr( env->ctx->out_mem, env->ctx->out_chunk );
 }
 
 /* Publishing a verify failure directly races pack's batch result and produces
@@ -112,63 +111,29 @@ static void
 test_bam_atomic_verify_failure_result_owner( void ) {
   test_env_t env[1];
 
-  struct {
-    _Bool revert_on_error;
-    uchar batch_idx;
-    uchar txn_cnt;
-  } cases[] = {
-    { 0, 0U, 1U },
-    { 1, 0U, 2U },
-    { 1, 1U, 2U },
-  };
-
-  for( ulong case_idx=0UL; case_idx<sizeof(cases)/sizeof(cases[0]); case_idx++ ) {
-    fd_txn_m_t * txnm = test_env_init( env );
-    env->ctx->in_kind[ IN_IDX_BAM ] = IN_KIND_BAM;
-    *txnm = (fd_txn_m_t) {
-      .payload_sz = 0U,
-      .source_tpu = FD_TXN_M_TPU_SOURCE_BAM,
-      .bam = {
-        .bundle_id         = cases[ case_idx ].revert_on_error ? 78UL : 0UL,
-        .bundle_txn_cnt    = (cases[ case_idx ].revert_on_error && !cases[ case_idx ].batch_idx) ? cases[ case_idx ].txn_cnt : 0UL,
-        .max_schedule_slot = 100UL,
-        .seq_id            = 77U,
-        .txn_cnt           = cases[ case_idx ].txn_cnt,
-        .batch_idx         = cases[ case_idx ].batch_idx,
-        .revert_on_error   = cases[ case_idx ].revert_on_error,
-      },
-    };
-
-    after_frag( env->ctx, IN_IDX_BAM, case_idx, 0UL, sizeof(fd_txn_m_t), 0UL, 0UL, env->stem );
-
-    FD_TEST( env->seqs[ 0 ]==1UL );
-    FD_TEST( env->mcache[ 0 ].sig==case_idx+1UL );
-    FD_TEST( txnm->bam.preprocess_failed );
-    FD_TEST( txnm->bam.seq_id    ==77U );
-    FD_TEST( txnm->bam.batch_idx ==cases[ case_idx ].batch_idx );
-    FD_TEST( txnm->txn_t_sz      ==fd_txn_footprint( 0UL, 0UL ) );
-  }
-
   /* The members of a batch can land on different verify tiles, so
      verify keeps no batch state: each member, before and after a resend
-     of the seq_id, is checked and published, and dedup fails the
-     members after a failed one.  Each frag arrives at the out_chunk the
-     previous publish advanced to. */
+     of the seq_id, and a non-revert single are checked and published,
+     and dedup fails the members after a failed one.  None parses, so
+     each is published once as a marker with its parsed txn zeroed.
+     Each frag arrives at the out_chunk the previous publish advanced
+     to. */
   test_env_init( env );
-  for( ulong i=0UL; i<3UL; i++ ) {
+  for( ulong i=0UL; i<4UL; i++ ) {
     uchar batch_idx = (uchar)( i==1UL );
+    _Bool revert    = i<3UL;
     fd_txn_m_t * txnm = (fd_txn_m_t *)fd_chunk_to_laddr( env->ctx->out_mem, env->ctx->out_chunk );
     *txnm = (fd_txn_m_t) {
       .payload_sz = 0U,
       .source_tpu = FD_TXN_M_TPU_SOURCE_BAM,
       .bam = {
-        .bundle_id         = 89UL,
-        .bundle_txn_cnt    = batch_idx ? 0UL : 2UL,
+        .bundle_id         = revert ? 89UL : 0UL,
+        .bundle_txn_cnt    = ( revert && !batch_idx ) ? 2UL : 0UL,
         .max_schedule_slot = 100UL,
         .seq_id            = 88U,
-        .txn_cnt           = 2U,
+        .txn_cnt           = revert ? 2U : 1U,
         .batch_idx         = batch_idx,
-        .revert_on_error   = 1U,
+        .revert_on_error   = revert,
       },
     };
 
@@ -177,6 +142,7 @@ test_bam_atomic_verify_failure_result_owner( void ) {
     FD_TEST( env->seqs[ 0 ]==i+1UL );
     FD_TEST( env->mcache[ i ].sig==11UL+i );
     FD_TEST( txnm->bam.preprocess_failed && txnm->bam.batch_idx==batch_idx );
+    FD_TEST( txnm->bam.seq_id==88U && txnm->txn_t_sz==fd_txn_footprint( 0UL, 0UL ) );
     FD_TEST( !env->ctx->bundle_failed && !env->ctx->bundle_id );
     FD_TEST( !env->ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_RESULT_V_BUNDLE_PEER_FAILED_IDX ] );
   }
@@ -185,7 +151,7 @@ test_bam_atomic_verify_failure_result_owner( void ) {
      and is dropped, with no failure marker. */
   *(fd_txn_m_t *)fd_chunk_to_laddr( env->ctx->out_mem, env->ctx->out_chunk ) = (fd_txn_m_t){ .source_tpu = FD_TXN_M_TPU_SOURCE_QUIC };
   after_frag( env->ctx, IN_IDX_QUIC, 0UL, 0UL, sizeof(fd_txn_m_t), 0UL, 0UL, env->stem );
-  FD_TEST( env->seqs[ 0 ]==3UL );
+  FD_TEST( env->seqs[ 0 ]==4UL );
 }
 
 FD_IMPORT_BINARY( test_sample_vote, "src/disco/pack/sample_vote.bin" );

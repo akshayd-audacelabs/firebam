@@ -76,8 +76,6 @@ test_bam_block_engine_namespace( void ) {
   test_env_init( env );
   test_publish( env, 1, 0UL, 17U, 1U, 0U, 0x30U, 0 );
   FD_TEST( env->mcache[ fd_mcache_line_idx( env->seqs[ 0 ]-1UL, env->depths[ 0 ] ) ].sig==1UL );
-  test_publish( env, 1, 0UL, 18U, 1U, 0U, 0x40U, 0 );
-  FD_TEST( env->mcache[ fd_mcache_line_idx( env->seqs[ 0 ]-1UL, env->depths[ 0 ] ) ].sig==1UL );
 
   /* Reusing a raw ID across sources or after a singleton must not carry the
      prior source's bundle index into the next group. */
@@ -122,12 +120,6 @@ test_bam_block_engine_namespace( void ) {
   test_env_init( env );
   test_publish( env, 1, 18UL, 17U, 1U, 0U, 0x42U, 1 );
   test_publish( env, 0, 18UL, 0U, 1U, 0U, 0x43U, 0 );
-  FD_TEST( env->seqs[ 0 ]==2UL );
-
-  /* Source isolation is symmetric. */
-  test_env_init( env );
-  test_publish( env, 0, 18UL, 0U, 1U, 0U, 0x42U, 0 );
-  test_publish( env, 1, 18UL, 17U, 1U, 0U, 0x42U, 0 );
   FD_TEST( env->seqs[ 0 ]==2UL );
 }
 

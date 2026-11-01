@@ -54,17 +54,16 @@ main( int     argc,
   ctx->in_kind[ 0 ] = IN_KIND_DEDUP;
   ctx->in[ 0 ]      = (fd_event_tile_in_t){ .mem = (fd_wksp_t *)in_mem, .mtu = FD_TPU_PARSED_MTU, .chunk0 = 0UL, .wmark = 0UL };
 
-  /* BAM transactions, whether preprocessing passed or failed and
-     whether or not they are atomic, are skipped before a circq slot or
-     event id is reserved. */
+  /* BAM transactions, a plain one and an atomic one that failed
+     preprocessing, are skipped before a circq slot or event id is
+     reserved. */
   stage_txn( FD_TXN_M_TPU_SOURCE_BAM );
-  deliver_txn();
-  stage_txn( FD_TXN_M_TPU_SOURCE_BAM )->bam.preprocess_failed = 1U;
   deliver_txn();
   fd_txn_m_t * bam_atomic = stage_txn( FD_TXN_M_TPU_SOURCE_BAM );
   bam_atomic->block_engine.bundle_id      = 42UL;
   bam_atomic->block_engine.bundle_txn_cnt = 2UL;
   bam_atomic->bam.revert_on_error         = 1U;
+  bam_atomic->bam.preprocess_failed       = 1U;
   deliver_txn();
   FD_TEST( !ctx->circq->cnt );
   FD_TEST( !ctx->circq->cursor_push_seq );

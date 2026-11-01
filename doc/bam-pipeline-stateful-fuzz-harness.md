@@ -46,7 +46,7 @@ but still consume a record within the limit.
 | `1` | `REPLAY` | Replay the remembered batches with the same `seq_id`; create remembered batches first if absent. |
 | `2` | `DUP_SEQ` | Replay with changed fixture selectors (which may still select identical bytes). With `c & 0x80`, submit a 2–5-transaction atomic batch, perform one BAM publication callback, then submit a new-`seq_id` fixture selection; publication remains whole-batch. |
 | `3` | `NEW_SEQ_SAME_PAYLOAD` | Replay remembered payloads under new sequence IDs. |
-| `4` | `ADVANCE_SLOT` | Slot rollover, stale-slot behavior, and budget reset. |
+| `4` | `ADVANCE_SLOT` | Slot rollover and stale-slot behavior. Pack gets fixed block limits in each leader slot; `c` sets no budget. |
 | `5`, `6` | `LEADER_OFF`, `LEADER_ON` | Non-leader/null execution-bank state and resumed-leader state with a valid bank. |
 | `7`, `8` | `DISCONNECT`, `RECONNECT` | Queued result retention across synthetic scheduler stream resets. |
 | `9`, `10` | `RESULT_BURST`, `DRAIN_QUEUE` | Result queue fill, intentional drops, and wire/shadow-FIFO comparison. |
