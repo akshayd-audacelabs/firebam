@@ -163,9 +163,6 @@ typedef struct {
   ulong  txn_error_checkpoint_slot;
   ushort txn_error_checkpoint_gen;
   uchar  txn_error_checkpoint_cnt;
-
-  uint required_outside_slot;
-  uint required_result_drop;
 } bam_fuzz_state_t;
 
 static void
@@ -597,8 +594,6 @@ static void
 bam_fuzz_assert_invariants( bam_fuzz_state_t const * f ) {
   fd_bam_tile_t const * state = f->state;
   bam_fuzz_assert_shadow_queue( f );
-  if( FD_UNLIKELY( f->required_outside_slot ) ) FD_TEST( f->observed_outside_slot );
-  if( FD_UNLIKELY( f->required_result_drop ) ) FD_TEST( f->observed_result_drop );
   FD_TEST( bam_pending_txn_cnt( state->pending_txns ) <= bam_pending_txn_max( state->pending_txns ) );
   FD_TEST( state->verify_out.chunk >= state->verify_out.chunk0 );
   FD_TEST( state->verify_out.chunk <= state->verify_out.wmark );
@@ -889,7 +884,6 @@ bam_fuzz_force_result_drop( bam_fuzz_state_t * f,
   bam_fuzz_enqueue_synthetic_result( f, b, c );
   FD_TEST( state->metrics.feedback_results_dropped_cnt==drops_before+1UL );
   FD_TEST( state->feedback_queue_depth==FD_BAM_MAX_PENDING_RESULTS );
-  f->required_result_drop = 1U;
   FD_TEST( f->observed_result_drop );
   bam_fuzz_assert_shadow_queue( f );
 }
@@ -911,7 +905,6 @@ bam_fuzz_require_outside_slot_path( bam_fuzz_state_t * f,
   };
   spec.payload_seed[ 0 ] = (uint)c;
   bam_fuzz_deliver_specs( f, &spec, 1UL, 0UL );
-  f->required_outside_slot = 1U;
   FD_TEST( f->observed_outside_slot );
 }
 

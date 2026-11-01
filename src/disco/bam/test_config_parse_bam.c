@@ -53,18 +53,16 @@ test_bam_config( void ) {
   FD_TEST( fd_toml_parse( cfg_str_bam_invalid, sizeof(cfg_str_bam_invalid)-1, pod, scratch, sizeof(scratch), NULL ) == FD_TOML_SUCCESS );
   FD_TEST( !fd_config_extract_pod( pod, config ) );
 
-  /* BAM defaults: gRPC buffer floor, and BAM has a dedicated
-     verify-output ring, independent of TPU receive depth. */
+  /* BAM defaults: the gRPC buffer is at its floor, and the default
+     config validates with BAM enabled. */
 
   memset( config, 0, sizeof(config_t) );
   pod = fd_pod_join( fd_pod_new( pod_mem, sizeof(pod_mem) ) );
   FD_TEST( fd_toml_parse( firedancer_default_config, firedancer_default_config_sz, pod, scratch, sizeof(scratch), NULL ) == FD_TOML_SUCCESS );
   FD_TEST( fd_config_extract_pod( pod, config ) == config );
   FD_TEST( ((ulong)config->bam.development.buffer_size_kib<<10)==FD_BAM_GRPC_MIN_BUF_SZ );
-  config->bam.tiles.enabled                = 1;
-  config->tiles.verify.receive_buffer_size = 1U;
+  config->bam.tiles.enabled = 1;
   fd_config_validate( config );
-  FD_TEST( fd_config_extract_pod( pod, config )==config );
 }
 
 int
