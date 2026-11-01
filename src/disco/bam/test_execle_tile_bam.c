@@ -1416,6 +1416,8 @@ main( int     argc,
   limits->accdb_joiner_cnt        = 3UL; /* mini runtime plus two independent execle joins */
 
   mini = fd_svm_test_boot( &argc, &argv, limits );
+  /* Calibrate the tick rate in ~1 ms instead of ~0.5 s. */
+  fd_tempo_tick_per_ns_dev( NULL );
   fd_metrics_register( (ulong *)fd_metrics_new( metrics_scratch, 0UL ) );
 
   test_bam_fixture_path = fd_env_strip_cmdline_cstr( &argc, &argv, "--bam-fixture-output", NULL, NULL );

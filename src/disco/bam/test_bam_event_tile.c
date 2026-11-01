@@ -31,6 +31,8 @@ int
 main( int     argc,
       char ** argv ) {
   fd_boot( &argc, &argv );
+  /* Calibrate the tick rate in ~1 ms instead of ~0.5 s. */
+  fd_tempo_tick_per_ns_dev( NULL );
 
   ulong  circq_sz  = 1UL<<20;
   void * circq_mem = aligned_alloc( FD_CIRCQ_ALIGN, fd_ulong_align_up( fd_circq_footprint( circq_sz ), FD_CIRCQ_ALIGN ) );

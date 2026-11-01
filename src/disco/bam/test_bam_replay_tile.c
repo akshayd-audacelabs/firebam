@@ -54,6 +54,8 @@ int
 main( int     argc,
       char ** argv ) {
   fd_boot( &argc, &argv );
+  /* Calibrate the tick rate in ~1 ms instead of ~0.5 s. */
+  fd_tempo_tick_per_ns_dev( NULL );
 
   char const * _page_sz = fd_env_strip_cmdline_cstr ( &argc, &argv, "--page-sz",  NULL, "normal"                 );
   ulong        page_cnt = fd_env_strip_cmdline_ulong( &argc, &argv, "--page-cnt", NULL, 65536UL                  );

@@ -6929,6 +6929,8 @@ int
 main( int     argc,
       char ** argv ) {
   fd_boot( &argc, &argv );
+  /* Calibrate the tick rate in ~1 ms instead of ~0.5 s. */
+  fd_tempo_tick_per_ns_dev( NULL );
   fd_metrics_register( (ulong *)fd_metrics_new( metrics_scratch, 0UL ) );
 
   ulong cpu_idx = fd_tile_cpu_id( fd_tile_idx() );

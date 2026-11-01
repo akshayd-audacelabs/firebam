@@ -140,6 +140,8 @@ int
 main( int     argc,
       char ** argv ) {
   fd_boot( &argc, &argv );
+  /* Calibrate the tick rate in ~1 ms instead of ~0.5 s. */
+  fd_tempo_tick_per_ns_dev( NULL );
   test_bam_auth_authorize();
   FD_TEST( authorize_contact_info_client_id( FD_GOSSIP_CONTACT_INFO_CLIENT_FIREDANCER ) );
   FD_TEST( authorize_contact_info_client_id( FD_GOSSIP_CONTACT_INFO_CLIENT_FIRE_BAM   ) );
