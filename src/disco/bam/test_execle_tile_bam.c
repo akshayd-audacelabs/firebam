@@ -1,9 +1,10 @@
 /* FireBAM execle tile tests.  test_execle_tile.c is included verbatim so
    these tests share its fixtures.  Helpers whose FireBAM versions also
-   drive the bank_bam out link or BAM metadata are renamed below and
+   build sibling workers or attach BAM metadata are renamed below and
    redefined after the include; upstream's cases are compiled but not
    registered here.  The upstream helpers that only read execle_poh
-   assume no BAM result is attached, so cases with one parse it.
+   assume no BAM result is attached, so cases with one use the
+   test_*bam* versions.
    test_bam_latency_bench.c includes this file with main already
    renamed, hence push/pop_macro. */
 
@@ -11,12 +12,10 @@
 #undef  main
 #define main            test_execle_tile_upstream_main
 #define test_env_create test_execle_upstream_env_create
-#define test_stem       test_execle_upstream_stem
 #define test_execle_run test_execle_upstream_run
 int test_execle_tile_upstream_main( int argc, char ** argv );
 #include "../../discof/execle/test_execle_tile.c"
 #undef test_execle_run
-#undef test_stem
 #undef test_env_create
 #undef main
 #pragma pop_macro("main")
@@ -52,6 +51,41 @@ test_topo_link_kind( char const * name,
   FD_LOG_ERR(( "missing test topo link %s", name ));
 }
 
+/* The BAM result attached to the microblock at execle_poh seq, or
+   NULL. */
+static fd_bam_bundle_result_t const *
+test_out_poh_bam_result( test_env_t * env,
+                         ulong        seq ) {
+  fd_frag_meta_t const * meta = test_out_poh_meta( seq );
+  ulong sz = meta->sz;
+  return fd_bam_microblock_strip_result( fd_chunk_to_laddr_const( env->execle->out_poh->mem, meta->chunk ), &sz );
+}
+
+/* test_assert_nonbundle_out and test_assert_bundle_out for a BAM batch,
+   whose result execle attaches to its last microblock. */
+static void
+test_assert_bam_nonbundle_out( test_env_t * env,
+                               ulong        txn_cnt,
+                               uint         pack_idx ) {
+  fd_bank_t * bank = fd_svm_mini_bank( env->mini, env->bank_idx );
+  fd_frag_meta_t const * meta = test_out_poh_meta( 0UL );
+  FD_TEST( fd_frag_meta_seq_query( meta )==0UL );
+  FD_TEST( meta->sig==fd_disco_execle_sig( bank->f.slot, pack_idx ) );
+  FD_TEST( meta->sz==fd_bam_microblock_footprint( txn_cnt, 1 ) );
+}
+
+static void
+test_assert_bam_bundle_out( test_env_t * env,
+                            ulong        txn_cnt,
+                            uint         pack_idx ) {
+  fd_bank_t * bank = fd_svm_mini_bank( env->mini, env->bank_idx );
+  test_assert_bundle_out( env, txn_cnt-1UL, pack_idx );
+  fd_frag_meta_t const * meta = test_out_poh_meta( txn_cnt-1UL );
+  FD_TEST( fd_frag_meta_seq_query( meta )==txn_cnt-1UL );
+  FD_TEST( meta->sig==fd_disco_execle_sig( bank->f.slot, pack_idx+(uint)(txn_cnt-1UL) ) );
+  FD_TEST( meta->sz==fd_bam_microblock_footprint( 1UL, 1 ) );
+}
+
 static test_env_t *
 test_env_create_worker( test_env_t const * sibling ) {
   test_env_t * env = fd_wksp_alloc_laddr( mini->wksp, alignof(test_env_t), sizeof(test_env_t), TOPO_TAG );
@@ -84,15 +118,12 @@ test_env_create_worker( test_env_t const * sibling ) {
   fd_topo_link_t * pack_execle  = fd_topob_link( topo, "pack_execle", "execle", 32UL, MAX_MICROBLOCK_SZ, 1UL );
   fd_topo_link_t * execle_motor = fd_topob_link( topo, "execle_poh",  "execle", 32UL, MAX_MICROBLOCK_SZ, 1UL );
   fd_topo_link_t * execle_pack  = fd_topob_link( topo, "execle_pack", "execle", 32UL, MAX_MICROBLOCK_SZ, 1UL );
-  fd_topo_link_t * bank_bam     = fd_topob_link( topo, "bank_bam",    "execle", 32UL, sizeof(fd_bam_bundle_result_t), 1UL );
   test_topo_link_init( env, topo, pack_execle  );
   test_topo_link_init( env, topo, execle_motor );
   test_topo_link_init( env, topo, execle_pack  );
-  test_topo_link_init( env, topo, bank_bam     );
   fd_topob_tile_in ( topo, "execle", kind_id, "execle", "pack_execle", kind_id, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
   fd_topob_tile_out( topo, "execle", kind_id, "execle_poh",  kind_id );
   fd_topob_tile_out( topo, "execle", kind_id, "execle_pack", kind_id );
-  fd_topob_tile_out( topo, "execle", kind_id, "bank_bam",    kind_id );
 
   /* Share mini's accounts DB with the tile.  The tile re-joins the same
      accdb shmem (a second writer joiner) and opens it via the well-known
@@ -180,46 +211,6 @@ test_build_system_transfer_txns( fd_txn_p_t *       out,
   fd_txn_builder_delete( builder );
 }
 
-
-static fd_stem_context_t *
-test_stem( fd_execle_tile_t * ctx,
-           fd_stem_context_t * stem ) {
-  static fd_frag_meta_t * mcaches[3];
-  static ulong            seqs[3];
-  static ulong            depths[3];
-  static ulong            cr_avail[3];
-  static ulong            min_cr_avail;
-  static int              out_reliable[3];
-
-  fd_topo_link_t const * execle_motor = test_topo_link( "execle_poh"  );
-  fd_topo_link_t const * execle_pack  = test_topo_link( "execle_pack" );
-  fd_topo_link_t const * bank_bam     = test_topo_link( "bank_bam"    );
-
-  mcaches[ ctx->out_poh->idx  ] = execle_motor->mcache;
-  mcaches[ ctx->out_pack->idx ] = execle_pack->mcache;
-  mcaches[ ctx->out_bam->idx  ] = bank_bam->mcache;
-  depths [ ctx->out_poh->idx  ] = execle_motor->depth;
-  depths [ ctx->out_pack->idx ] = execle_pack->depth;
-  depths [ ctx->out_bam->idx  ] = bank_bam->depth;
-  seqs   [ ctx->out_poh->idx  ] = fd_mcache_seq_query( fd_mcache_seq_laddr_const( mcaches[ ctx->out_poh->idx  ] ) );
-  seqs   [ ctx->out_pack->idx ] = fd_mcache_seq_query( fd_mcache_seq_laddr_const( mcaches[ ctx->out_pack->idx ] ) );
-  seqs   [ ctx->out_bam->idx  ] = fd_mcache_seq_query( fd_mcache_seq_laddr_const( mcaches[ ctx->out_bam->idx  ] ) );
-  cr_avail[0] = cr_avail[1] = cr_avail[2] = ULONG_MAX;
-  min_cr_avail = ULONG_MAX;
-  out_reliable[0] = out_reliable[1] = out_reliable[2] = 0;
-
-  *stem = (fd_stem_context_t) {
-    .mcaches             = mcaches,
-    .seqs                = seqs,
-    .depths              = depths,
-    .cr_avail            = cr_avail,
-    .min_cr_avail        = &min_cr_avail,
-    .cr_decrement_amount = 1UL,
-    .out_reliable        = out_reliable,
-    .in_fseq             = test_in_fseq, /* no sleep object: credit return writes the fseq only */
-  };
-  return stem;
-}
 
 static fd_txn_bam_t test_bam[ MAX_TXN_PER_SLOT ]; /* Attached to BAM members, as pack does */
 
@@ -355,7 +346,6 @@ FD_UNIT_TEST( execle_bam_simple_ok ) {
   FD_TEST( result->execution_success );
   FD_TEST( result->scheduling_error==FD_BAM_SCHED_ERR_NONE );
   FD_TEST( result->feepayer_balance_lamports[0]==payer_start-fee-transfer );
-  FD_TEST( test_topo_link( "bank_bam" )->mcache->sz==0UL );
   FD_TEST( env->execle->txn_out[0].err.is_committable );
   FD_TEST( env->execle->txn_out[0].err.txn_err==FD_RUNTIME_EXECUTE_SUCCESS );
   FD_TEST( out_txn->flags & FD_TXN_P_FLAGS_SANITIZE_SUCCESS );
@@ -405,12 +395,10 @@ FD_UNIT_TEST( execle_bam_simple_fee_payer_fail ) {
   test_mark_bam_batch( txn, test_bam, 1UL, 102U, 0 );
   test_execle_run( env, txn, 1UL, 4U, 18UL, 0 );
 
-  test_assert_nonbundle_out( env, 1UL, 4U );
+  test_assert_bam_nonbundle_out( env, 1UL, 4U );
   test_assert_nonbundle_timing( env, 1UL );
-  fd_frag_meta_t const * bam_meta = test_topo_link( "bank_bam" )->mcache;
-  FD_TEST( fd_frag_meta_seq_query( bam_meta )==0UL );
-  FD_TEST( bam_meta->sz==sizeof(fd_bam_bundle_result_t) );
-  fd_bam_bundle_result_t const * result = fd_chunk_to_laddr( env->execle->out_bam->mem, bam_meta->chunk );
+  fd_bam_bundle_result_t const * result = test_out_poh_bam_result( env, 0UL );
+  FD_TEST( result );
   FD_TEST( result->seq_id==102U );
   FD_TEST( !result->execution_success );
   fd_txn_p_t const * out_txn = fd_chunk_to_laddr( env->execle->out_poh->mem, test_out_poh_meta( 0UL )->chunk );
@@ -518,7 +506,6 @@ FD_UNIT_TEST( execle_bam_bundle_ok ) {
   FD_TEST( result );
   FD_TEST( result->seq_id==103U );
   FD_TEST( result->execution_success );
-  FD_TEST( test_topo_link( "bank_bam" )->mcache->sz==0UL );
   FD_TEST( env->execle->txn_out[0].err.is_committable );
   FD_TEST( env->execle->txn_out[1].err.is_committable );
   for( ulong i=0UL; i<2UL; i++ ) {
@@ -607,11 +594,10 @@ FD_UNIT_TEST( execle_bundle_prepare_fail ) {
     }
     test_mark_bam_batch( txns, test_bam, 3UL, 106U, 1 );
     test_execle_run( env, txns, 3UL, 3U, 3UL, 1 );
-    test_assert_bundle_out( env, 3UL, 3U );
+    test_assert_bam_bundle_out( env, 3UL, 3U );
 
-    fd_frag_meta_t const * bam_meta = test_topo_link( "bank_bam" )->mcache;
-    FD_TEST( bam_meta->sz==sizeof(fd_bam_bundle_result_t) );
-    fd_bam_bundle_result_t const * result = fd_chunk_to_laddr( env->execle->out_bam->mem, bam_meta->chunk );
+    fd_bam_bundle_result_t const * result = test_out_poh_bam_result( env, 2UL );
+    FD_TEST( result );
     FD_TEST( result->seq_id==106U && result->bundle_txn_cnt==3U );
     FD_TEST( !result->execution_success && result->scheduling_error==FD_BAM_SCHED_ERR_NONE );
     FD_TEST( result->transaction_err_count==3U );
@@ -657,12 +643,12 @@ static char const * test_bam_fixture_path;
 
 typedef struct {
   fd_stem_context_t stem[1];
-  fd_frag_meta_t * mcaches[3];
-  ulong seqs[3];
-  ulong depths[3];
-  ulong credits[3];
+  fd_frag_meta_t * mcaches[2];
+  ulong seqs[2];
+  ulong depths[2];
+  ulong credits[2];
   ulong min_credit;
-  int reliable[3];
+  int reliable[2];
   ulong * in_fseq[1];
 } test_bam_worker_output_t;
 
@@ -671,8 +657,8 @@ test_bam_worker_output_init( test_bam_worker_output_t * out,
                              ulong                      worker,
                              test_env_t *               env ) {
   fd_memset( out, 0, sizeof(*out) );
-  char const * names[3] = { "execle_poh", "execle_pack", "bank_bam" };
-  for( ulong i=0UL; i<3UL; i++ ) {
+  char const * names[2] = { "execle_poh", "execle_pack" };
+  for( ulong i=0UL; i<2UL; i++ ) {
     fd_topo_link_t const * link = test_topo_link_kind( names[i], worker );
     out->mcaches[i] = link->mcache;
     out->depths[i] = link->depth;
@@ -991,17 +977,6 @@ test_bam_pair_run( int variant,
     terminal_seen |= 1UL<<batch;
     result->terminal[batch] = *r;
   }
-  for( ulong worker=0UL; worker<2UL; worker++ ) {
-    for( ulong i=0UL; i<output[worker].seqs[2]; i++ ) {
-      fd_frag_meta_t const * m = output[worker].mcaches[2]+fd_mcache_line_idx( i, output[worker].depths[2] );
-      fd_bam_bundle_result_t const * r = fd_chunk_to_laddr_const( env[worker]->execle->out_bam->mem, m->chunk );
-      ulong batch = (ulong)(r->seq_id-(100U+(uint)(2*variant)));
-      FD_TEST( m->sz==sizeof(*r) && batch<2UL && r->scheduler_gen==7U && r->slot==bank->f.slot );
-      FD_TEST( !(terminal_seen & (1UL<<batch)) );
-      terminal_seen |= 1UL<<batch;
-      result->terminal[batch] = *r;
-    }
-  }
   FD_TEST( terminal_seen==3UL );
   FD_TEST( result->terminal[0].execution_success==!atomic_failure );
   FD_TEST( result->terminal[1].execution_success==!duplicate );
@@ -1264,7 +1239,6 @@ test_bam_lookahead_execute( int                          atomic,
   fd_memcpy( expected, test_bam_initial, sizeof(expected) );
   for( ulong i=0UL; i<3UL; i++ ) { expected[payer[i]]-=fee+transfer[i]; expected[recipient[i]]+=transfer[i]; }
   for( ulong i=0UL; i<5UL; i++ ) FD_TEST( (result->balances[i]=test_read_lamports( env[0], &accounts[i] ))==expected[i] );
-  FD_TEST( !output[0].seqs[2] && !output[1].seqs[2] ); /* All terminal successes come from Motor. */
   ulong unexecuted_cnt;
   result->actual_cost = test_bam_settle( pack, bank, env, output, &unexecuted_cnt );
   FD_TEST( !unexecuted_cnt );
@@ -1353,6 +1327,8 @@ FD_UNIT_TEST( execle_bank_blockhash_validity ) {
     int expected_err = accepted ? FD_RUNTIME_EXECUTE_SUCCESS :
                        kind==6UL ? FD_RUNTIME_TXN_ERR_BLOCKHASH_FAIL_WRONG_NONCE : FD_RUNTIME_TXN_ERR_BLOCKHASH_NOT_FOUND;
     FD_TEST( env->execle->txn_out[0].err.txn_err==expected_err );
+    fd_bam_bundle_result_t const * result = test_out_poh_bam_result( env, 0UL );
+    FD_TEST( result && result->seq_id==400U+(uint)kind && result->execution_success==accepted );
     FD_TEST( test_read_lamports( env, &recipient )==1000000UL+(accepted ? 1000UL : 0UL) );
     if( !accepted ) FD_TEST( test_read_lamports( env, &payer )==1000000000UL );
     test_env_destroy( env );
@@ -1392,8 +1368,9 @@ FD_UNIT_TEST( execle_bam_same_nonce_batch ) {
 
   test_execle_run( env, txns, 3UL, 30U, 61UL, 1 );
   FD_TEST( env->execle->txn_out[2].err.txn_err==FD_RUNTIME_TXN_ERR_BLOCKHASH_FAIL_WRONG_NONCE );
-  fd_frag_meta_t const * bam_meta = test_topo_link( "bank_bam" )->mcache;
-  fd_bam_bundle_result_t const * result = fd_chunk_to_laddr( env->execle->out_bam->mem, bam_meta->chunk );
+  test_assert_bam_bundle_out( env, 3UL, 30U );
+  fd_bam_bundle_result_t const * result = test_out_poh_bam_result( env, 2UL );
+  FD_TEST( result );
   FD_TEST( result->seq_id==130U && result->bundle_txn_cnt==3U && !result->execution_success );
   FD_TEST( result->transaction_err_count==3U );
   for( ulong i=0UL; i<3UL; i++ )
@@ -1420,6 +1397,9 @@ FD_UNIT_TEST( execle_reserved_fee_payer_rejected ) {
   test_execle_run( env, txn, 1UL, 0U, 0UL, 0 );
   FD_TEST( !env->execle->txn_out[0].err.is_committable );
   FD_TEST( env->execle->txn_out[0].err.txn_err==FD_RUNTIME_TXN_ERR_INVALID_ACCOUNT_FOR_FEE );
+  test_assert_bam_nonbundle_out( env, 1UL, 0U );
+  fd_bam_bundle_result_t const * result = test_out_poh_bam_result( env, 0UL );
+  FD_TEST( result && result->seq_id==93U && !result->execution_success );
   FD_TEST( test_read_lamports( env, &fd_solana_system_program_id )==before );
   test_env_destroy( env );
 }

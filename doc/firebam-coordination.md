@@ -30,13 +30,11 @@ Firedancer (src/app/firedancer/topology.c)
   BAM scheduler gRPC/HTTP2 feed (TLS for HTTPS) --> bam --bam_verif--> verify
   verify --verify_dedup--> dedup --dedup_resolv--> resolv --resolv_pack--> pack
   pack --pack_execle--> execle --execle_poh--> motor --poh_shred--> shred
-  motor tile --executed_txn--> pack tile
   pack tile --pack_sign--> sign tile --sign_pack--> pack tile (tip crank)
 
 BAM feedback/control links
   pack tile --pack_bam_ldr--> bam tile
   pack tile --pack_bam_res--> bam tile
-  execle tiles --bank_bam--> bam tile
   motor tile --motor_bam--> bam tile
   replay tile (leader enabled) --replay_slot--> bam tile
   bam tile --bam_gossip--> gossip tile
@@ -57,11 +55,6 @@ configuration gates. Verify tiles take `bam_verif` round robin and publish
 each BAM frag with its `bam_verif` seq plus one as sig; dedup holds a BAM frag
 until all earlier ones have passed, so pack sees `bam_verif` order.
 
-- `executed_txn`: Motor publishes signature completion
-  events for BAM transactions only. Landed and completed-unlanded events both
-  retire scheduled tracking in pack; only landed events delete the signature
-  from pack and retire duplicate pending BAM work. Dedup does not consume the
-  link (BAM bypasses its signature cache).
 - `pack_bam_ldr`: Pack publishes `fd_bam_leader_state_t` with slot, tick,
   remaining CU budget, slot end time, and the current-slot BAM-work flag. BAM
   keeps the latest unsent snapshot and sends slot, tick, and remaining CU budget
@@ -70,17 +63,24 @@ until all earlier ones have passed, so pack sees `bam_verif` order.
   changes at most every 5 ms. The internal link is unreliable so old snapshots
   do not backpressure pack; BAM drops pending snapshots on reset.
 - `pack_bam_res`: Pack publishes `fd_bam_bundle_result_t` scheduling,
-  assembly, and rejection outcomes for atomic and non-revert batches.
-- `bank_bam`: Execle publishes terminal not-committed batch outcomes
-  directly. Committed batch feedback travels with
-  the microblock for Motor acceptance, including non-revert transactions with
+  assembly, and rejection outcomes for atomic and non-revert batches as soon
+  as it knows them. Verify marks BAM parse/signature failures as
+  `preprocess_failed`; dedup and resolv preserve rejection markers for pack
+  to report. Pack tracks a batch from admission until it is dispatched or
+  evicted. A duplicate of a pending batch is rejected with `CONTAINER_FULL`
+  (a same-`seq_id` resend replaces it); a duplicate of a dispatched batch is
+  inserted again, and execution answers it: `ALREADY_PROCESSED` once the
+  first copy committed, or a nonce error for a durable-nonce transaction,
+  which the status cache skips.
+- `motor_bam`: Execle attaches every batch result, committed or not, to the
+  batch's last microblock, including non-revert transactions with
   instruction errors or fees-only outcomes. The batch `execution_success`
   field denotes commitment; per-transaction execution may still have failed.
-  Verify marks BAM parse/signature failures as `preprocess_failed`; dedup and
-  resolv preserve rejection markers for pack to report on `pack_bam_res`.
-- `motor_bam`: Motor publishes provisional committed feedback after
-  accepting the microblock. BAM merges the three result links, and its own
-  decode-time rejections, into the FIFO described below.
+  Motor publishes the result after accepting the microblock. A microblock of
+  a slot before Motor's current one is dropped unrecorded: as jito-solana
+  does for work whose slot expired, Motor reports its result as
+  `POH_TIMEOUT` whatever the execution outcome, and logs a warning. BAM merges the two result links, and its own decode-time
+  rejections, into the FIFO described below.
 - `replay_slot`: Replay supplies resets, next-leader announcements, and
   completed-slot progress. BAM uses these to update its leader and epoch/recheck
   hints for the connection gate. A boot reset with no leader hint preserves the
@@ -170,9 +170,8 @@ transport reconnects and client resets within the current scheduler generation.
 Results enter in consumption order across producers, rather than scheduler
 dispatch order. Queued results with the same `seq_id`, slot, and scheduler
 generation coalesce, retaining the first queued result. BAM's FIFO holds at
-most `FD_BAM_MAX_PENDING_RESULTS`. Pack's pending-result queue is also bounded;
-overflow drops new results. BAM counts full-queue and stale-generation drops.
-BAM consumes `pack_bam_res`, `bank_bam`, and `motor_bam` unreliably, so a stalled
+most `FD_BAM_MAX_PENDING_RESULTS`; BAM counts full-queue and stale-generation
+drops. BAM consumes `pack_bam_res` and `motor_bam` unreliably, so a stalled
 BAM tile never backpressures pack, execution, or Motor; as in jito-solana's
 non-blocking result send, results overrun on those links are dropped and
 counted in BAM's link overrun metrics.

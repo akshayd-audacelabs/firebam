@@ -60,13 +60,11 @@ bam_fuzz_pack_new( fd_wksp_t *             wksp,
   ulong pack_footprint = fd_pack_footprint( BAM_FUZZ_PACK_PENDING_TXN_MAX, BUNDLE_META_SZ, BAM_FUZZ_PACK_EXECLE_CNT, &upper );
   ulong sig_ele_cnt    = BAM_FUZZ_PACK_PENDING_TXN_MAX*FD_PACK_MAX_TXN_PER_BUNDLE;
   ulong sig_chain_cnt  = pack_tile_bam_sig_map_chain_cnt( BAM_FUZZ_PACK_PENDING_TXN_MAX );
-  ulong result_cnt     = 2UL*BAM_FUZZ_PACK_PENDING_TXN_MAX;
   ulong l = FD_LAYOUT_INIT;
   l = FD_LAYOUT_APPEND( l, fd_pack_align(),                pack_footprint );
   l = FD_LAYOUT_APPEND( l, alignof(pack_bam_work_t),        BAM_FUZZ_PACK_PENDING_TXN_MAX*sizeof(pack_bam_work_t) );
   l = FD_LAYOUT_APPEND( l, alignof(pack_bam_sig_ele_t),     sig_ele_cnt*sizeof(pack_bam_sig_ele_t) );
   l = FD_LAYOUT_APPEND( l, pack_bam_sig_map_align(),        pack_bam_sig_map_footprint( sig_chain_cnt ) );
-  l = FD_LAYOUT_APPEND( l, alignof(fd_bam_bundle_result_t), result_cnt*sizeof(fd_bam_bundle_result_t) );
   ulong footprint = FD_LAYOUT_FINI( l, 4096UL );
   h->storage = fd_wksp_alloc_laddr( wksp, 4096UL, footprint, 1UL );
   FD_TEST( h->storage );
@@ -86,7 +84,6 @@ bam_fuzz_pack_new( fd_wksp_t *             wksp,
                               FD_SCRATCH_ALLOC_APPEND( alloc, pack_bam_sig_map_align(), pack_bam_sig_map_footprint( sig_chain_cnt ) ),
                               sig_chain_cnt, 0UL ) );
   FD_TEST( ctx->bam_sig_map );
-  ctx->bam_result_queue = FD_SCRATCH_ALLOC_APPEND( alloc, alignof(fd_bam_bundle_result_t), result_cnt*sizeof(fd_bam_bundle_result_t) );
   FD_TEST( FD_SCRATCH_ALLOC_FINI( alloc, 4096UL )<=(ulong)h->storage+footprint );
 
   h->execle_busy_fseq  = fd_fseq_join( fd_fseq_new( h->execle_busy_fseq_mem, ULONG_MAX ) );
@@ -100,6 +97,7 @@ bam_fuzz_pack_new( fd_wksp_t *             wksp,
   ctx->poh_out         = bam_fuzz_pack_out( h, BAM_FUZZ_PACK_OUT_MOTOR,      wksp, sizeof(fd_done_packing_t)      );
   ctx->bam_leader_out  = bam_fuzz_pack_out( h, BAM_FUZZ_PACK_OUT_BAM_LEADER, wksp, sizeof(fd_bam_leader_state_t)  );
   ctx->bam_result_out  = bam_fuzz_pack_out( h, BAM_FUZZ_PACK_OUT_BAM_RESULT, wksp, sizeof(fd_bam_bundle_result_t) );
+  ctx->bam_stem        = h->outs.stem; /* as before_credit sets it before any frag */
 
   ctx->in_kind[ BAM_FUZZ_PACK_IN_RESOLV_IDX ] = IN_KIND_RESOLV;
   ctx->in     [ BAM_FUZZ_PACK_IN_RESOLV_IDX ] = (fd_pack_in_ctx_t){ .mem = in->mem, .chunk0 = in->chunk0, .wmark = in->wmark };

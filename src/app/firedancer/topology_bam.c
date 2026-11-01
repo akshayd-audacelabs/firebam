@@ -21,9 +21,7 @@ FD_STATIC_ASSERT( offsetof( fd_config_t, bam )+sizeof( fd_config_bam_t )==sizeof
 #define FOR(cnt) for( ulong i=0UL; i<cnt; i++ )
 
 static void
-topo_bam_links( fd_topo_t * topo,
-                ulong       execle_tile_cnt ) {
-  fd_topob_wksp( topo, "executed_txn" );
+topo_bam_links( fd_topo_t * topo ) {
   fd_topob_wksp( topo, "bam"          );
   fd_topob_wksp( topo, "bam_verif"    );
   fd_topob_wksp( topo, "bam_sign"     );
@@ -31,21 +29,18 @@ topo_bam_links( fd_topo_t * topo,
   fd_topob_wksp( topo, "bam_gossip"   );
   fd_topob_wksp( topo, "pack_bam_ldr" );
   fd_topob_wksp( topo, "pack_bam_res" );
-  fd_topob_wksp( topo, "bank_bam"     );
   fd_topob_wksp( topo, "motor_bam"    );
   fd_topob_wksp( topo, "bam_shred"    );
   fd_topob_wksp( topo, "bam_status"   );
   fd_topob_wksp( topo, "bam_ctrl"     );
   fd_topob_wksp( topo, "bam_fee_cfg"  );
 
-  /**/                   fd_topob_link( topo, "executed_txn", "executed_txn", 16384UL,                                  FD_TXN_SIGNATURE_SZ,       1UL );
   /**/                   fd_topob_link( topo, "bam_verif",    "bam_verif",    FD_BAM_VERIFY_OUT_DEPTH,                     FD_TPU_PARSED_MTU,          FD_BAM_STEM_BURST );
   /**/                   fd_topob_link( topo, "bam_sign",     "bam_sign",     128UL,                                    256UL,                     1UL );
   /**/                   fd_topob_link( topo, "sign_bam",     "sign_bam",     128UL,                                    64UL,                      1UL );
   /**/                   fd_topob_link( topo, "bam_gossip",   "bam_gossip",   128UL,                                    sizeof(fd_bam_contact_update_t), 1UL );
   /**/                   fd_topob_link( topo, "pack_bam_ldr", "pack_bam_ldr", FD_BAM_MAX_PENDING_RESULTS,               sizeof(fd_bam_leader_state_t),  1UL );
   /**/                   fd_topob_link( topo, "pack_bam_res", "pack_bam_res", FD_BAM_RESULT_LINK_DEPTH,                 sizeof(fd_bam_bundle_result_t), 1UL );
-  FOR(execle_tile_cnt)   fd_topob_link( topo, "bank_bam",     "bank_bam",     FD_BAM_RESULT_LINK_DEPTH,                 sizeof(fd_bam_bundle_result_t), 1UL );
   /**/                   fd_topob_link( topo, "motor_bam",    "motor_bam",    FD_BAM_RESULT_LINK_DEPTH,                 sizeof(fd_bam_bundle_result_t), 1UL );
   /**/                   fd_topob_link( topo, "bam_shred",    "bam_shred",    128UL,                                    sizeof(fd_bam_shred_update_t),  1UL );
 }
@@ -54,11 +49,7 @@ static void
 topo_bam_tile_links( fd_topo_t *      topo,
                      config_t const * config,
                      ulong            verify_tile_cnt,
-                     ulong            execle_tile_cnt,
                      ulong            shred_tile_cnt ) {
-  /**/                 fd_topob_tile_in(  topo, "pack",   0UL,           "metric_in", "executed_txn", 0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
-  /**/                 fd_topob_tile_out( topo, "motor",  0UL,                        "executed_txn", 0UL                                                );
-
   /* Verify tiles take bam_verif round robin, dedup restores its order */
   /**/                 fd_topob_tile_out( topo, "bam",    0UL,                        "bam_verif",    0UL                                                );
   FOR(verify_tile_cnt) fd_topob_tile_in(  topo, "verify", i,             "metric_in", "bam_verif",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
@@ -73,8 +64,6 @@ topo_bam_tile_links( fd_topo_t *      topo,
   /**/                 fd_topob_tile_in(  topo, "bam",    0UL,           "metric_in", "pack_bam_ldr", 0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
   /**/                 fd_topob_tile_out( topo, "pack",   0UL,                        "pack_bam_res", 0UL                                                );
   /**/                 fd_topob_tile_in(  topo, "bam",    0UL,           "metric_in", "pack_bam_res", 0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
-  FOR(execle_tile_cnt) fd_topob_tile_out( topo, "execle", i,                          "bank_bam",     i                                                  );
-  FOR(execle_tile_cnt) fd_topob_tile_in(  topo, "bam",    0UL,           "metric_in", "bank_bam",     i,            FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
   /**/                 fd_topob_tile_out( topo, "motor",  0UL,                        "motor_bam",    0UL                                                );
   /**/                 fd_topob_tile_in(  topo, "bam",    0UL,           "metric_in", "motor_bam",    0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
   /**/                 fd_topob_tile_in(  topo, "bam",    0UL,           "metric_in", "replay_slot",  0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );

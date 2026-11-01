@@ -523,7 +523,7 @@ fd_topo_initialize( config_t * config ) {
     /**/                   fd_topob_link( topo, "poh_replay",    "poh_replay",    4096UL,                                   sizeof(fd_poh_leader_slot_ended_t), 1UL );
   }
 
-  if( FD_UNLIKELY( bam_enabled ) ) topo_bam_links( topo, execle_tile_cnt );
+  if( FD_UNLIKELY( bam_enabled ) ) topo_bam_links( topo );
 
   FOR(resolv_tile_cnt) fd_topob_link( topo, "resolv_replay", "resolv_replay", 4096UL,                                   sizeof(fd_resolv_slot_exchanged_t), 1UL );
 
@@ -789,7 +789,7 @@ fd_topo_initialize( config_t * config ) {
     FOR(shred_tile_cnt)  fd_topob_tile_in ( topo, "shred",   i,            "metric_in", "poh_shred",     0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   }
 
-  if( FD_UNLIKELY( bam_enabled ) ) topo_bam_tile_links( topo, config, verify_tile_cnt, execle_tile_cnt, shred_tile_cnt );
+  if( FD_UNLIKELY( bam_enabled ) ) topo_bam_tile_links( topo, config, verify_tile_cnt, shred_tile_cnt );
 
   FOR(shred_tile_cnt)    fd_topob_tile_in ( topo, "shred",   i,            "metric_in", "replay_epoch",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   FOR(shred_tile_cnt)    fd_topob_tile_in ( topo, "shred",   i,            "metric_in", "gossip_ciaddr", 0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );

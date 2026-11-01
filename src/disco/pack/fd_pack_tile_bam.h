@@ -13,12 +13,6 @@
 
 #define FD_PACK_BAM_RECENT_SLOT_CNT 32UL
 
-/* With BAM, Motor publishes BAM completions to pack on the
-   executed_txn link (topology_bam.c); upstream pack has no such input.
-   A value that collides with an upstream IN_KIND_* fails to compile as
-   a duplicate case. */
-#define IN_KIND_EXECUTED_TXN (5UL)
-
 typedef enum {
   PACK_TILE_BAM_BUNDLE_ASSEMBLY_ABANDON_NEW_SEQ_BEFORE_COMPLETE = 0,
   PACK_TILE_BAM_BUNDLE_ASSEMBLY_ABANDON_LEADER_SLOT_END,
@@ -33,19 +27,17 @@ typedef struct {
   uint             seq_id;
   ushort           scheduler_gen;
   uchar            txn_cnt;
-  uchar            saw_unlanded_completion;
-  uchar            indexed_mask; /* bit j set while sig[j] has an entry in bam_sig_map */
 } pack_bam_work_t;
 
-/* Cap pending and scheduled BAM batches to bound tracking memory.
-   Excess work receives a CONTAINER_FULL result. */
+/* Cap pending BAM batches to bound tracking memory.  Excess work
+   receives a CONTAINER_FULL result. */
 
 #define PACK_BAM_WORK_MAX (8192UL)
 
 /* Index live member signatures by their first 8 bytes; confirm all 64
    bytes on lookup. Each member uses pool slot
    work_idx*FD_PACK_MAX_TXN_PER_BUNDLE+txn_idx. Update the index when work
-   moves or a member completes. */
+   moves. */
 
 typedef struct {
   ulong key;      /* first 8 bytes of bam_work[ work_idx ].sig[ txn_idx ] */
@@ -95,7 +87,7 @@ typedef struct {
    callbacks) is set; pack_tile_bam_init checks BAM is all or nothing. */
 #define PACK_TILE_BAM_CTX                                                                                      \
   ulong *                  bam_status_fseq;                                                                    \
-  ulong                    bam_work_max; /* capacity of bam_work; result queue holds 2x this */                \
+  ulong                    bam_work_max; /* capacity of bam_work */                                            \
   ulong *                  bam_gen_fseq;                                                                       \
   ushort                   bam_ownership_gen;                                                                  \
   _Bool                    bam_override_snapshot;                                                              \
@@ -108,6 +100,7 @@ typedef struct {
      snapshots, pack_bam_res the results the BAM tile queues durably. */                                       \
   fd_pack_out_ctx_t        bam_leader_out;                                                                     \
   fd_pack_out_ctx_t        bam_result_out;                                                                     \
+  fd_stem_context_t *      bam_stem; /* saved by before_credit for result publication */                       \
   fd_bam_leader_state_t    last_bam_leader_state; /* last published */                                         \
   long                     bam_leader_state_next_publish_ticks;                                                \
                                                                                                                \
@@ -135,15 +128,11 @@ typedef struct {
   fd_bundle_crank_tip_payment_config_t bam_prev_config_before_ib[1];                                           \
   fd_acct_addr_t                       bam_tip_receiver_owner_before_ib[1];                                    \
                                                                                                                \
-  /* Pending and scheduled BAM batches awaiting completion */                                                  \
+  /* Pending BAM batches, tracked until they are dispatched or evicted */                                      \
   pack_bam_work_t *        bam_work;                                                                           \
   pack_bam_sig_ele_t *     bam_sig_pool; /* bam_work_max*FD_PACK_MAX_TXN_PER_BUNDLE */                         \
   pack_bam_sig_map_t *     bam_sig_map;                                                                        \
-  fd_bam_bundle_result_t * bam_result_queue;                                                                   \
-  ulong                    bam_result_queue_head;                                                              \
   ulong                    bam_work_cnt;                                                                       \
-  ulong                    bam_scheduled_work_cnt;                                                             \
-  ulong                    bam_pending_result_cnt;                                                             \
   ulong                    bam_pack_bundle_evicted_cnt; /* last fd_pack_bundle_evicted_cnt */                  \
                                                                                                                \
   ulong      bam_bundle_assembly_abandon_cnt  [ FD_METRICS_ENUM_PACK_BAM_BUNDLE_ASSEMBLY_ABANDON_REASON_CNT ]; \

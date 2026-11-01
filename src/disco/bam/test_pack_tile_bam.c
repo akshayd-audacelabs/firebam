@@ -116,8 +116,10 @@ test_pack_clear_evicted_sig( void const * sig ) {
   }
 }
 
-#define TEST_PACK_TILE_DCACHE_CHUNKS 16UL
 #define TEST_PACK_TILE_MCACHE_DEPTH  16UL
+/* Room for a full mcache of results, so every result still in the
+   mcache is also intact in the dcache. */
+#define TEST_PACK_TILE_DCACHE_CHUNKS ((TEST_PACK_TILE_MCACHE_DEPTH+1UL)*((sizeof(fd_bam_bundle_result_t)+FD_CHUNK_SZ-1UL)/FD_CHUNK_SZ))
 #define TEST_PACK_TILE_BAM_WORK_CAP   8UL
 #define TEST_D18_INSTR_ACCT_CNT       (FD_TXN_INSTR_ACCT_MAX+1UL)
 
@@ -132,7 +134,7 @@ test_fd_pack_contains_bam_bundle( fd_pack_t const *        pack,
   for( ulong i=0UL; i<test_pack_evicted_sig_cnt; i++ )
     if( FD_UNLIKELY( !memcmp( test_pack_evicted_sigs[ i ], sig0, sizeof(fd_ed25519_sig_t) ) ) ) return 0;
   if( FD_UNLIKELY( !test_query_ctx ) ) return 0;
-  for( ulong i=test_query_ctx->bam_scheduled_work_cnt; i<test_query_ctx->bam_work_cnt; i++ ) {
+  for( ulong i=0UL; i<test_query_ctx->bam_work_cnt; i++ ) {
     pack_bam_work_t const * work = &test_query_ctx->bam_work[ i ];
     if( FD_LIKELY( memcmp( work->sig[ 0 ], sig0, sizeof(fd_ed25519_sig_t) ) ) ) continue;
     if( FD_LIKELY( !match_identity ||
@@ -253,7 +255,6 @@ typedef struct {
   ulong          pending_txn_cnt;
   ulong          bundle_evicted_cnt;
   pack_bam_work_t bam_work[ TEST_PACK_TILE_BAM_WORK_CAP ];
-  fd_bam_bundle_result_t bam_result_queue[ 2UL*TEST_PACK_TILE_BAM_WORK_CAP ];
   pack_bam_sig_ele_t bam_sig_pool[ TEST_PACK_TILE_BAM_WORK_CAP*FD_PACK_MAX_TXN_PER_BUNDLE ];
   uchar bam_sig_map_mem[ 1024UL ] __attribute__((aligned(128)));
 } test_fake_pack_t;
@@ -317,12 +318,30 @@ test_pack_tile_out_delete( test_pack_tile_out_t * out ) {
   fd_memset( out, 0, sizeof(*out) );
 }
 
+/* Pack publishes each result on bam_result_out as soon as it is known.
+   A test reads what an action published as the out sequence numbers it
+   advanced: test_pack_tile_result_cnt before and after, then
+   test_pack_tile_result for each new seq. */
+static ulong
+test_pack_tile_result_cnt( test_pack_tile_harness_t const * h ) {
+  return h->out->seqs[ h->ctx->bam_result_out.out_idx ];
+}
+
+static fd_bam_bundle_result_t const *
+test_pack_tile_result( test_pack_tile_harness_t const * h,
+                       ulong                            seq ) {
+  test_pack_tile_out_t const * out = h->out;
+  ulong                        idx = h->ctx->bam_result_out.out_idx;
+  FD_TEST( seq<out->seqs[ idx ] && out->seqs[ idx ]-seq<=out->depths[ idx ] );
+  fd_frag_meta_t const * meta = &out->mcaches[ idx ][ fd_mcache_line_idx( seq, out->depths[ idx ] ) ];
+  FD_TEST( meta->seq==seq && meta->sz==sizeof(fd_bam_bundle_result_t) );
+  return fd_chunk_to_laddr_const( h->ctx->bam_result_out.mem, meta->chunk );
+}
+
 static fd_bam_bundle_result_t const *
 test_pack_tile_last_result( test_pack_tile_harness_t const * h ) {
-  test_pack_tile_out_t const * out = h->out;
-  FD_TEST( out->seqs[ 0 ] > 0UL );
-  fd_frag_meta_t const * meta = &out->mcache[ fd_mcache_line_idx( out->seqs[ 0 ] - 1UL, out->depths[ 0 ] ) ];
-  return (fd_bam_bundle_result_t const *)fd_chunk_to_laddr_const( out->dcache, meta->chunk );
+  FD_TEST( test_pack_tile_result_cnt( h ) );
+  return test_pack_tile_result( h, test_pack_tile_result_cnt( h )-1UL );
 }
 
 /* An out link 0 into the harness dcache for frags of up to mtu bytes. */
@@ -341,19 +360,29 @@ test_pack_tile_result_out( test_pack_tile_out_t const * out,
 }
 
 static fd_bam_bundle_result_t const *
-test_pack_tile_assert_last_result( test_pack_tile_harness_t const * h,
-                                   uint                             seq_id,
-                                   ulong                            slot,
-                                   uchar                            txn_cnt,
-                                   uint                             scheduling_error,
-                                   uchar                            transaction_err_count ) {
-  fd_bam_bundle_result_t const * res = test_pack_tile_last_result( h );
+test_pack_tile_assert_result( fd_bam_bundle_result_t const * res,
+                              uint                           seq_id,
+                              ulong                          slot,
+                              uchar                          txn_cnt,
+                              uint                           scheduling_error,
+                              uchar                          transaction_err_count ) {
   FD_TEST( res->seq_id == seq_id );
   FD_TEST( res->slot == slot );
   FD_TEST( res->bundle_txn_cnt == txn_cnt );
   FD_TEST( res->scheduling_error == scheduling_error );
   FD_TEST( res->transaction_err_count == transaction_err_count );
   return res;
+}
+
+static fd_bam_bundle_result_t const *
+test_pack_tile_assert_last_result( test_pack_tile_harness_t const * h,
+                                   uint                             seq_id,
+                                   ulong                            slot,
+                                   uchar                            txn_cnt,
+                                   uint                             scheduling_error,
+                                   uchar                            transaction_err_count ) {
+  return test_pack_tile_assert_result( test_pack_tile_last_result( h ), seq_id, slot, txn_cnt,
+                                       scheduling_error, transaction_err_count );
 }
 
 static void
@@ -394,12 +423,12 @@ test_pack_tile_harness_new( test_pack_tile_harness_t * h ) {
     h->ctx->bam_sig_map = pack_bam_sig_map_join( pack_bam_sig_map_new( h->fake_pack->bam_sig_map_mem, chain_cnt, 0UL ) );
     FD_TEST( h->ctx->bam_sig_map );
   }
-  h->ctx->bam_result_queue         = h->fake_pack->bam_result_queue;
   h->ctx->max_pending_transactions = TEST_PACK_TILE_BAM_WORK_CAP;
   fd_clock_tile_init( h->ctx->clock );
   h->ctx->leader_slot              = ULONG_MAX;
   h->ctx->highest_observed_block_height    = 0UL;
   h->ctx->bam_result_out           = test_pack_tile_result_out( h->out, sizeof(fd_bam_bundle_result_t) );
+  h->ctx->bam_stem                 = &h->out->stem; /* as before_credit saves it */
   h->ctx->bam_fee_cfg              = h->fee_cfg;
   test_query_ctx                   = h->ctx;
 }
@@ -508,15 +537,13 @@ test_pack_tile_bam_leader_state_is_rate_limited( void ) {
   test_pack_tile_harness_delete( h );
 }
 
-/* Searches all of bam_work regardless of state.  The tile itself always
-   knows which half of the partition it wants and so uses the state-scoped
-   lookup; tests use this to assert across both halves at once. */
+/* Scans bam_work for a sig0 without bam_sig_map, so tests can check
+   the tracked work independently of its index. */
 
 static inline ulong
 pack_tile_bam_work_find_by_sig0( fd_pack_ctx_t const * ctx,
                                  void const *          sig0 ) {
   for( ulong i=0UL; i<ctx->bam_work_cnt; i++ ) {
-    if( !(ctx->bam_work[i].indexed_mask & 1U) ) continue;
     if( FD_LIKELY( memcmp( ctx->bam_work[ i ].sig[ 0 ], sig0, sizeof(fd_ed25519_sig_t) ) ) ) continue;
     return i;
   }
@@ -658,7 +685,7 @@ test_pack_tile_bam_mode_edges_retire_pending_initializer( void ) {
   /* Re-observing one mode leaves its pending initializer alone. */
   FD_TEST( pack_tile_snapshot_bam_override( h->ctx )==0 );
   FD_TEST( test_delete_call_cnt==0UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==1UL );
+  FD_TEST( h->ctx->bam_work_cnt==1UL );
 
   /* Activation retires the pending normal/Block Engine initializer and
      reconciles the BAM copy deleted as collateral. */
@@ -669,9 +696,8 @@ test_pack_tile_bam_mode_edges_retire_pending_initializer( void ) {
   FD_TEST( !h->ctx->crank->ib_inserted );
   FD_TEST( h->ctx->crank->prev_config->discriminator==1UL );
   FD_TEST( h->ctx->bam_work_cnt==0UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==0UL );
-  FD_TEST( h->ctx->bam_pending_result_cnt==1UL );
-  fd_bam_bundle_result_t const * res = &h->ctx->bam_result_queue[ h->ctx->bam_result_queue_head ];
+  FD_TEST( test_pack_tile_result_cnt( h )==1UL );
+  fd_bam_bundle_result_t const * res = test_pack_tile_last_result( h );
   FD_TEST( res->seq_id==71U );
   FD_TEST( res->scheduler_gen==3U );
   FD_TEST( res->scheduling_error==FD_BAM_SCHED_ERR_CONTAINER_FULL );
@@ -691,37 +717,58 @@ test_pack_tile_bam_mode_edges_retire_pending_initializer( void ) {
   test_pack_tile_harness_delete( h );
 }
 
-static pack_bam_work_t *
-test_pack_tile_mark_bam_work_scheduled( test_pack_tile_harness_t * h,
-                                        void const *                sig0 ) {
-  ulong work_idx = pack_tile_bam_work_find_by_sig0( h->ctx, sig0 );
-  FD_TEST( work_idx<h->ctx->bam_work_cnt );
-
-  FD_TEST( work_idx>=h->ctx->bam_scheduled_work_cnt );
-
-  h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ]++;
-  return pack_tile_bam_work_mark_scheduled( h->ctx, work_idx );
+/* A legacy BAM transaction signed txn_sig, member batch_idx of its
+   batch, as pack schedules it. */
+static void
+test_pack_tile_make_bam_member( fd_txn_e_t * txne,
+                                void const * txn_sig,
+                                uchar        batch_idx ) {
+  fd_memset( txne, 0, sizeof(*txne) );
+  TXN(txne->txnp)->transaction_version = FD_TXN_VLEGACY;
+  TXN(txne->txnp)->signature_cnt       = 1U;
+  TXN(txne->txnp)->signature_off       = 1U;
+  fd_memcpy( txne->txnp->payload+1UL, txn_sig, sizeof(fd_ed25519_sig_t) );
+  txne->txnp->source_tpu = FD_TXN_M_TPU_SOURCE_BAM;
+  txne->bam.batch_idx    = batch_idx;
 }
 
+/* Pack scheduled the lead transaction of the batch led by sig0. */
 static void
-test_pack_tile_send_executed_txn( test_pack_tile_harness_t * h,
-                                  void const *                txn_sig,
-                                  ulong                       event_kind ) {
-  /* The signature reaches pack through during_frag, as from Motor. */
-  static uchar frag[ FD_TXN_SIGNATURE_SZ ] __attribute__((aligned(FD_CHUNK_ALIGN)));
-  fd_memcpy( frag, txn_sig, FD_TXN_SIGNATURE_SZ );
+test_pack_tile_schedule_bam_lead( test_pack_tile_harness_t * h,
+                                  void const *                sig0 ) {
+  fd_txn_e_t lead[1];
+  test_pack_tile_make_bam_member( lead, sig0, 0U );
+  pack_tile_bam_scheduled( h->ctx, lead, 1UL, fd_tickcount() );
+}
+
+/* Replay executed a committable transaction signed txn_sig.  The
+   signature reaches pack through during_frag, as from replay. */
+static void
+test_pack_tile_send_txn_executed( test_pack_tile_harness_t * h,
+                                  void const *                txn_sig ) {
+  static uchar frag_mem[ sizeof(fd_replay_txn_executed_t) ] __attribute__((aligned(FD_CHUNK_ALIGN)));
+  fd_replay_txn_executed_t * frag = (fd_replay_txn_executed_t *)frag_mem;
+  fd_memset( frag_mem, 0, sizeof(frag_mem) );
+  TXN(frag->txn)->transaction_version = FD_TXN_VLEGACY;
+  TXN(frag->txn)->signature_cnt       = 1U;
+  TXN(frag->txn)->signature_off       = 1U;
+  fd_memcpy( frag->txn->payload+1UL, txn_sig, FD_TXN_SIGNATURE_SZ );
+  frag->is_committable = 1;
   fd_wksp_t * mem = h->ctx->in[ 0 ].mem;
-  h->ctx->in[ 0 ].mem  = (fd_wksp_t *)frag;
-  h->ctx->in_kind[ 0 ] = IN_KIND_EXECUTED_TXN;
+  h->ctx->in[ 0 ].mem  = (fd_wksp_t *)frag_mem;
+  h->ctx->in_kind[ 0 ] = IN_KIND_REPLAY;
   fd_memset( h->ctx->executed_txn_sig, 0, FD_TXN_SIGNATURE_SZ );
-  during_frag( h->ctx, 0UL, 0UL, event_kind, 0UL, FD_TXN_SIGNATURE_SZ, 0UL );
-  FD_TEST( !memcmp( h->ctx->executed_txn_sig, txn_sig, FD_TXN_SIGNATURE_SZ ) );
+  during_frag( h->ctx, 0UL, 0UL, REPLAY_SIG_TXN_EXECUTED, 0UL, sizeof(frag_mem), 0UL );
+  FD_TEST( h->ctx->txn_committed && !memcmp( h->ctx->executed_txn_sig, txn_sig, FD_TXN_SIGNATURE_SZ ) );
   h->ctx->in[ 0 ].mem  = mem;
-  after_frag( h->ctx, 0UL, 0UL, event_kind, FD_TXN_SIGNATURE_SZ, 0UL, 0UL, &h->out->stem );
+  after_frag( h->ctx, 0UL, 0UL, REPLAY_SIG_TXN_EXECUTED, sizeof(frag_mem), 0UL, 0UL, &h->out->stem );
 }
 
+/* Removal moves the last work item into the hole, and its signatures
+   follow it in bam_sig_map.  Scheduling a lead removes its work the
+   same way. */
 static void
-test_pack_tile_bam_work_partition_mutations( void ) {
+test_pack_tile_bam_work_tracking_mutations( void ) {
   test_pack_tile_harness_t h[1];
   uchar sigs[ 3 ][ sizeof(fd_ed25519_sig_t) ];
   test_pack_tile_harness_new( h );
@@ -731,33 +778,26 @@ test_pack_tile_bam_work_partition_mutations( void ) {
     FD_TEST( pack_tile_track_bam_work( h->ctx, sigs[ i ], 0L, (uint)i, 0U, 100UL, 100UL, 1U ) );
   }
 
-  (void)test_pack_tile_mark_bam_work_scheduled( h, sigs[ 1 ] );
-  (void)test_pack_tile_mark_bam_work_scheduled( h, sigs[ 2 ] );
-  FD_TEST( h->ctx->bam_scheduled_work_cnt==2UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==1UL );
-  FD_TEST( h->ctx->bam_work[ 0 ].seq_id==1U );
+  ulong work_idx = pack_tile_bam_work_find( h->ctx, sigs[ 1 ], NULL );
+  FD_TEST( work_idx==1UL );
+  pack_tile_bam_work_swap_remove( h->ctx, work_idx );
+  FD_TEST( h->ctx->bam_work_cnt==2UL );
+  FD_TEST( h->ctx->bam_work[ 0 ].seq_id==0U );
   FD_TEST( h->ctx->bam_work[ 1 ].seq_id==2U );
-  FD_TEST( h->ctx->bam_work[ 2 ].seq_id==0U );
+  FD_TEST( pack_tile_bam_work_find( h->ctx, sigs[ 1 ], NULL )==h->ctx->bam_work_cnt );
+  FD_TEST( pack_tile_bam_work_find( h->ctx, sigs[ 2 ], NULL )==1UL );
 
-  ulong work_idx = pack_tile_bam_work_find( h->ctx, sigs[ 1 ], 1, NULL );
-  FD_TEST( work_idx<h->ctx->bam_work_cnt );
-  pack_tile_bam_work_swap_remove( h->ctx, work_idx );
-  FD_TEST( h->ctx->bam_scheduled_work_cnt==1UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==1UL );
-  FD_TEST( h->ctx->bam_work[ 0 ].seq_id==2U );
-  FD_TEST( h->ctx->bam_work[ 1 ].seq_id==0U );
-
-  work_idx = pack_tile_bam_work_find( h->ctx, sigs[ 0 ], 0, NULL );
-  FD_TEST( work_idx<h->ctx->bam_work_cnt );
-  pack_tile_bam_work_swap_remove( h->ctx, work_idx );
+  test_pack_tile_schedule_bam_lead( h, sigs[ 0 ] );
   FD_TEST( h->ctx->bam_work_cnt==1UL );
-  FD_TEST( h->ctx->bam_scheduled_work_cnt==1UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==0UL );
+  FD_TEST( h->ctx->bam_work[ 0 ].seq_id==2U );
+  FD_TEST( pack_tile_bam_work_find( h->ctx, sigs[ 0 ], NULL )==h->ctx->bam_work_cnt );
+  FD_TEST( pack_tile_bam_work_find( h->ctx, sigs[ 2 ], NULL )==0UL );
 
   pack_tile_bam_work_swap_remove( h->ctx, 0UL );
   FD_TEST( !h->ctx->bam_work_cnt );
-  FD_TEST( !h->ctx->bam_scheduled_work_cnt );
-  FD_TEST( !pack_tile_bam_pending_work_cnt( h->ctx ) );
+  FD_TEST( pack_tile_bam_work_find( h->ctx, sigs[ 2 ], NULL )==h->ctx->bam_work_cnt );
+  FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ]==1UL );
+  FD_TEST( !test_pack_tile_result_cnt( h ) );
   test_pack_tile_harness_delete( h );
 }
 
@@ -774,129 +814,96 @@ test_pack_tile_bam_signature_prefix_collision( void ) {
   FD_TEST( pack_tile_track_bam_work( h->ctx, sigs[ 0 ], 0L, 100U, 0U, 100UL, 100UL, 1U ) );
   FD_TEST( pack_tile_track_bam_work( h->ctx, sigs[ 1 ], 0L, 101U, 0U, 100UL, 100UL, 1U ) );
 
-  ulong work_idx = pack_tile_bam_work_find( h->ctx, sigs[ 1 ], 0, NULL );
+  ulong work_idx = pack_tile_bam_work_find( h->ctx, sigs[ 1 ], NULL );
   FD_TEST( work_idx<h->ctx->bam_work_cnt );
   FD_TEST( h->ctx->bam_work[ work_idx ].seq_id==101U );
 
   uchar matched_idx = UCHAR_MAX;
-  work_idx = pack_tile_bam_work_find( h->ctx, sigs[ 1 ], 0, &matched_idx );
+  work_idx = pack_tile_bam_work_find( h->ctx, sigs[ 1 ], &matched_idx );
   FD_TEST( work_idx<h->ctx->bam_work_cnt );
   FD_TEST( h->ctx->bam_work[ work_idx ].seq_id==101U );
   FD_TEST( matched_idx==0U );
 
   pack_tile_retire_all_pending_bam_work_by_sig( h->ctx, sigs[ 0 ] );
   FD_TEST( h->ctx->bam_work_cnt==1UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==1UL );
-  FD_TEST( h->ctx->bam_pending_result_cnt==1UL );
   FD_TEST( h->ctx->bam_work[ 0 ].seq_id==101U );
+  FD_TEST( test_pack_tile_result_cnt( h )==1UL );
+  fd_bam_bundle_result_t const * res = test_pack_tile_assert_last_result( h, 100U, 100UL, 1U, FD_BAM_SCHED_ERR_NONE, 1U );
+  FD_TEST( res->transaction_err[ 0 ]==bam_types_TransactionErrorReason_ALREADY_PROCESSED );
 
   test_pack_tile_harness_delete( h );
 }
 
+/* The three results published from out seq first_seq, one per
+   [_,X] batch first_seq_id+i, in any order. */
 static void
 test_pack_tile_assert_pending_duplicate_results( test_pack_tile_harness_t * h,
+                                                 ulong                      first_seq,
                                                  uint                       first_seq_id,
                                                  ulong                      slot ) {
   uchar seen[ 3 ] = { 0U };
-  for( uchar i=0U; i<3U; i++ ) {
-    FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
-    uint seq_id = test_pack_tile_last_result( h )->seq_id;
+  FD_TEST( test_pack_tile_result_cnt( h )==first_seq+3UL );
+  for( ulong i=0UL; i<3UL; i++ ) {
+    fd_bam_bundle_result_t const * res = test_pack_tile_result( h, first_seq+i );
+    uint seq_id = res->seq_id;
     FD_TEST( seq_id>=first_seq_id && seq_id<first_seq_id+3U );
     uchar seq_idx = (uchar)( seq_id-first_seq_id );
     FD_TEST( !seen[ seq_idx ] );
     seen[ seq_idx ] = 1U;
 
-    fd_bam_bundle_result_t const * res = test_pack_tile_assert_last_result(
-        h, seq_id, slot, 2U, FD_BAM_SCHED_ERR_NONE, 2U );
+    test_pack_tile_assert_result( res, seq_id, slot, 2U, FD_BAM_SCHED_ERR_NONE, 2U );
     FD_TEST( res->transaction_err[ 0 ]==bam_types_TransactionErrorReason_COMMIT_CANCELLED );
     FD_TEST( res->transaction_err[ 1 ]==bam_types_TransactionErrorReason_ALREADY_PROCESSED );
     FD_TEST( res->sanitize_success[ 0 ] && res->sanitize_success[ 1 ] );
   }
-  FD_TEST( !h->ctx->bam_pending_result_cnt );
 }
 
-/* Ignoring landed or completed-unlanded feedback leaks scheduled BAM records
-   until slot end.  Retire either outcome exactly once. */
+/* Pack schedules a batch as one microblock.  Its lead retires the work
+   at once and is counted SCHEDULED once; later members do not.  Every
+   member signature leaves bam_sig_map, so execution feedback for any
+   member finds nothing and publishes no second result. */
 static void
-test_pack_tile_bam_completion_outcomes( void ) {
-  struct {
-    ulong event_kind[ 3 ];
-    ulong completed_stage;
-    ulong delete_call_cnt;
-    uchar txn_cnt;
-  } const cases[] = {
-    {
-      { FD_EXECUTED_TXN_KIND_LANDED, FD_EXECUTED_TXN_KIND_LANDED, 0UL },
-      FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_LANDED_IDX, 2UL, 2U
-    },
-    {
-      { FD_EXECUTED_TXN_KIND_LANDED, FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED, FD_EXECUTED_TXN_KIND_LANDED },
-      FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_COMPLETED_UNLANDED_IDX, 2UL, 3U
-    },
-    {
-      { FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED, FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED, FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED },
-      FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_COMPLETED_UNLANDED_IDX, 0UL, 3U
-    },
-  };
-
-  for( ulong case_idx=0UL; case_idx<sizeof(cases)/sizeof(*cases); case_idx++ ) {
+test_pack_tile_bam_scheduling_retires_work( void ) {
+  for( uchar txn_cnt=1U; txn_cnt<=3U; txn_cnt++ ) {
     test_pack_tile_harness_t h[1];
-    uchar                    sigs[ 3 ][ sizeof(fd_ed25519_sig_t) ];
-    uchar                    txn_cnt = cases[ case_idx ].txn_cnt;
+    uchar                    sigs[ FD_PACK_MAX_TXN_PER_BUNDLE ][ sizeof(fd_ed25519_sig_t) ];
+    uchar                    other_sig[ sizeof(fd_ed25519_sig_t) ];
+    fd_txn_e_t               microblock[ 3 ];
 
     test_pack_tile_harness_new( h );
-    for( uchar i=0U; i<txn_cnt; i++ ) test_pack_tile_fill_sig( sigs[ i ], (uchar)( 10UL*case_idx + i + 1U ) );
-    FD_TEST( pack_tile_track_bam_work( h->ctx, sigs, 0L, (uint)( case_idx+1UL ), 0U, 100UL, 100UL, txn_cnt ) );
-    (void)test_pack_tile_mark_bam_work_scheduled( h, sigs[ 0 ] );
+    for( uchar i=0U; i<txn_cnt; i++ ) test_pack_tile_fill_sig( sigs[ i ], (uchar)( 10U*txn_cnt + i + 1U ) );
+    test_pack_tile_fill_sig( other_sig, 200U );
+    FD_TEST( pack_tile_track_bam_work( h->ctx, other_sig, 0L, 99U, 0U, 100UL, 100UL, 1U ) );
+    FD_TEST( pack_tile_track_bam_work( h->ctx, sigs, 0L, (uint)txn_cnt, 0U, 100UL, 100UL, txn_cnt ) );
+    for( uchar i=0U; i<txn_cnt; i++ ) test_pack_tile_make_bam_member( microblock+i, sigs[ i ], i );
 
+    /* Only the lead retires the batch */
+    if( FD_LIKELY( txn_cnt>1U ) ) pack_tile_bam_scheduled( h->ctx, microblock+1, (ulong)txn_cnt-1UL, fd_tickcount() );
+    FD_TEST( h->ctx->bam_work_cnt==2UL );
+    FD_TEST( !h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ] );
+
+    pack_tile_bam_scheduled( h->ctx, microblock, txn_cnt, fd_tickcount() );
+    FD_TEST( h->ctx->bam_work_cnt==1UL );
+    FD_TEST( h->ctx->bam_work[ 0 ].seq_id==99U );
     for( uchar i=0U; i<txn_cnt; i++ ) {
-      test_pack_tile_send_executed_txn( h, sigs[ i ], cases[ case_idx ].event_kind[ i ] );
-      if( i+1U<txn_cnt ) FD_TEST( h->ctx->bam_work_cnt == 1UL );
+      uchar matched_idx = UCHAR_MAX;
+      FD_TEST( pack_tile_bam_work_find( h->ctx, sigs[ i ], &matched_idx )==h->ctx->bam_work_cnt );
+      FD_TEST( matched_idx==UCHAR_MAX );
     }
+    FD_TEST( pack_tile_bam_work_find( h->ctx, other_sig, NULL )==0UL );
+    FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ]==1UL );
+    FD_TEST( h->ctx->bam_work_first_outcome_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_FIRST_RESULT_V_SCHEDULED_IDX ]==1UL );
 
-    ulong other_stage = cases[ case_idx ].completed_stage==FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_LANDED_IDX
-                      ? FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_COMPLETED_UNLANDED_IDX
-                      : FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_LANDED_IDX;
-    FD_TEST( h->ctx->bam_work_cnt == 0UL );
-    FD_TEST( test_delete_call_cnt == cases[ case_idx ].delete_call_cnt );
-    FD_TEST( h->ctx->bam_pending_result_cnt == 0UL );
-    FD_TEST( h->ctx->bam_work_item_stage_cnt[ cases[ case_idx ].completed_stage ] == 1UL );
-    FD_TEST( h->ctx->bam_work_item_stage_cnt[ other_stage ] == 0UL );
+    /* A rescheduled lead finds no work and counts nothing */
+    pack_tile_bam_scheduled( h->ctx, microblock, txn_cnt, fd_tickcount() );
+    FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ]==1UL );
+
+    for( uchar i=0U; i<txn_cnt; i++ ) test_pack_tile_send_txn_executed( h, sigs[ i ] );
+    FD_TEST( test_delete_call_cnt==(ulong)txn_cnt );
+    FD_TEST( h->ctx->bam_work_cnt==1UL );
+    FD_TEST( !test_pack_tile_result_cnt( h ) );
     test_pack_tile_harness_delete( h );
   }
-}
-
-/* Keeping completed BAM records consumes the fixed tracking table and rejects
-   later same-slot batches.  Completion must immediately free capacity. */
-static void
-test_pack_tile_bam_completion_tracking_reuses_capacity( void ) {
-  test_pack_tile_harness_t h[1];
-  uchar                    sigs[ 3 ][ sizeof(fd_ed25519_sig_t) ];
-
-  test_pack_tile_harness_new( h );
-  for( uchar i=0U; i<3U; i++ ) test_pack_tile_fill_sig( sigs[ i ], (uchar)( 70U + i ) );
-  FD_TEST( pack_tile_track_bam_work( h->ctx, sigs, 0L, 5U, 0U, 100UL, 100UL, 2U ) );
-  (void)test_pack_tile_mark_bam_work_scheduled( h, sigs[ 0 ] );
-
-  test_pack_tile_send_executed_txn( h, sigs[ 0 ], FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED );
-  test_pack_tile_send_executed_txn( h, sigs[ 0 ], FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED );
-  test_pack_tile_send_executed_txn( h, sigs[ 2 ], FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED );
-  FD_TEST( h->ctx->bam_work[ 0 ].indexed_mask == 2U );
-  test_pack_tile_send_executed_txn( h, sigs[ 1 ], FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED );
-  test_pack_tile_send_executed_txn( h, sigs[ 1 ], FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED );
-  FD_TEST( h->ctx->bam_work_cnt == 0UL );
-
-  for( ulong i=0UL; i<3UL*TEST_PACK_TILE_BAM_WORK_CAP; i++ ) {
-    test_pack_tile_fill_sig( sigs[ 0 ], (uchar)( 100UL + i ) );
-    FD_TEST( pack_tile_track_bam_work( h->ctx, sigs[ 0 ], 0L, (uint)( 100UL + i ), 0U, 100UL, 100UL, 1U ) );
-    (void)test_pack_tile_mark_bam_work_scheduled( h, sigs[ 0 ] );
-    test_pack_tile_send_executed_txn( h, sigs[ 0 ], FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED );
-    FD_TEST( h->ctx->bam_work_cnt == 0UL );
-  }
-
-  FD_TEST( h->ctx->bam_scheduled_work_cnt == 0UL );
-  FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_COMPLETED_UNLANDED_IDX ] == 1UL+3UL*TEST_PACK_TILE_BAM_WORK_CAP );
-  test_pack_tile_harness_delete( h );
 }
 
 static void
@@ -917,7 +924,7 @@ test_pack_tile_bam_overlapping_replay_reconciliation( void ) {
   after_frag( h->ctx, 0UL, 0UL, REPLAY_SIG_TXN_EXECUTED, 0UL, 0UL, 0UL, &h->out->stem );
 
   FD_TEST( h->ctx->bam_work_cnt==0UL );
-  test_pack_tile_assert_pending_duplicate_results( h, 110U, 101UL );
+  test_pack_tile_assert_pending_duplicate_results( h, 0UL, 110U, 101UL );
   test_pack_tile_harness_delete( h );
 }
 
@@ -977,22 +984,26 @@ test_pack_tile_preserves_first_seen_and_stamps_pack_arrival( void ) {
   test_pack_tile_harness_delete( h );
 }
 
-static void
-test_pack_tile_send_bam_resolv_frag( test_pack_tile_harness_t * h,
-                                     uint                       seq_id,
-                                     ushort                     scheduler_gen,
-                                     ushort                     ownership_gen,
-                                     ulong                      max_schedule_slot,
-                                     uchar                      batch_idx,
-                                     uchar                      txn_cnt,
-                                     _Bool                      revert_on_error,
-                                     ulong                      blockhash_height,
-                                     uchar                      signature_seed ) {
-  uchar resolved_buf[ FD_TPU_RESOLVED_MTU ] __attribute__((aligned(FD_CHUNK_ALIGN)));
+/* Prepares a BAM batch member with payload in resolved_buf and returns
+   its size. */
+static ulong
+test_pack_tile_prepare_bam_resolv_frag( test_pack_tile_harness_t * h,
+                                        uchar *                    resolved_buf,
+                                        uchar const *              payload,
+                                        ulong                      payload_sz,
+                                        uint                       seq_id,
+                                        ushort                     scheduler_gen,
+                                        ushort                     ownership_gen,
+                                        ulong                      max_schedule_slot,
+                                        uchar                      batch_idx,
+                                        uchar                      txn_cnt,
+                                        _Bool                      revert_on_error,
+                                        ulong                      blockhash_height,
+                                        uchar                      signature_seed ) {
   ulong sz = test_pack_tile_prepare_resolv_frag( h,
                                                  resolved_buf,
-                                                 test_pack_tile_non_vote,
-                                                 test_pack_tile_non_vote_sz,
+                                                 payload,
+                                                 payload_sz,
                                                  FD_TXN_M_TPU_SOURCE_BAM,
                                                  blockhash_height );
   fd_txn_m_t * txnm = (fd_txn_m_t *)resolved_buf;
@@ -1006,11 +1017,32 @@ test_pack_tile_send_bam_resolv_frag( test_pack_tile_harness_t * h,
   txnm->block_engine.bundle_id = fd_ulong_if( revert_on_error, (ulong)seq_id+1UL, 0UL );
   txnm->block_engine.bundle_txn_cnt = fd_ulong_if( revert_on_error && !batch_idx, (ulong)txn_cnt, 0UL );
   test_pack_tile_fill_sig( fd_txn_m_payload( txnm )+1UL, signature_seed );
+  return sz;
+}
 
+static void
+test_pack_tile_send_bam_resolv_frag( test_pack_tile_harness_t * h,
+                                     uint                       seq_id,
+                                     ushort                     scheduler_gen,
+                                     ushort                     ownership_gen,
+                                     ulong                      max_schedule_slot,
+                                     uchar                      batch_idx,
+                                     uchar                      txn_cnt,
+                                     _Bool                      revert_on_error,
+                                     ulong                      blockhash_height,
+                                     uchar                      signature_seed ) {
+  uchar resolved_buf[ FD_TPU_RESOLVED_MTU ] __attribute__((aligned(FD_CHUNK_ALIGN)));
+  ulong sz = test_pack_tile_prepare_bam_resolv_frag( h, resolved_buf, test_pack_tile_non_vote, test_pack_tile_non_vote_sz,
+                                                     seq_id, scheduler_gen, ownership_gen,
+                                                     max_schedule_slot, batch_idx, txn_cnt, revert_on_error,
+                                                     blockhash_height, signature_seed );
   during_frag( h->ctx, 0UL, 0UL, blockhash_height, 0UL, sz, 0UL );
   after_frag( h->ctx, 0UL, 0UL, blockhash_height, sz, 0UL, 0UL, &h->out->stem );
 }
 
+/* An ownership generation change evicts only pending work.  Dispatched
+   work is already untracked, so the barrier neither deletes it nor
+   publishes a pack result for it. */
 static void
 test_pack_tile_bam_ownership_generation_retirement_barrier( void ) {
   test_pack_tile_harness_t h[1];
@@ -1027,27 +1059,38 @@ test_pack_tile_bam_ownership_generation_retirement_barrier( void ) {
 
   FD_TEST( pack_tile_track_bam_work( h->ctx, pending_old_sig,   0L, 10U, 7U, ULONG_MAX, 100UL, 1U ) );
   FD_TEST( pack_tile_track_bam_work( h->ctx, scheduled_old_sig, 0L, 11U, 7U, ULONG_MAX, 100UL, 1U ) );
-  (void)test_pack_tile_mark_bam_work_scheduled( h, scheduled_old_sig );
+  test_pack_tile_schedule_bam_lead( h, scheduled_old_sig );
+  FD_TEST( h->ctx->bam_work_cnt==1UL );
 
   generation = (8UL<<1) | 1UL;
-  /* Only before_credit runs while a reliable output is backpressured. */
+  /* Only before_credit runs while a reliable output is backpressured.
+     It also saves the stem results are published on. */
+  h->ctx->bam_stem = NULL;
+  ulong evicted_before = FD_MCNT_GET( PACK, TXN_EVICTED );
   int busy = 0;
   before_credit( h->ctx, &h->out->stem, &busy );
 
+  FD_TEST( h->ctx->bam_stem==&h->out->stem );
   FD_TEST( generation==(8UL<<1) );
   FD_TEST( h->ctx->bam_ownership_gen==8U );
-  FD_TEST( h->ctx->bam_work_cnt==1UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==0UL );
-  FD_TEST( h->ctx->bam_scheduled_work_cnt==1UL );
+  FD_TEST( h->ctx->bam_work_cnt==0UL );
   FD_TEST( pack_tile_bam_work_find_by_sig0( h->ctx, pending_old_sig )==h->ctx->bam_work_cnt );
-  FD_TEST( pack_tile_bam_work_find_by_sig0( h->ctx, scheduled_old_sig )<h->ctx->bam_work_cnt );
+  FD_TEST( pack_tile_bam_work_find_by_sig0( h->ctx, scheduled_old_sig )==h->ctx->bam_work_cnt );
+  /* Only the pending work is deleted from pack, and neither gets a pack
+     result: the BAM tile forgets the old generation's work, and
+     execution answers dispatched work. */
   test_pack_tile_assert_deleted_sig( pending_old_sig );
+  FD_TEST( FD_MCNT_GET( PACK, TXN_EVICTED )==evicted_before+1UL );
+  FD_TEST( !test_pack_tile_result_cnt( h ) );
+  test_pack_tile_send_txn_executed( h, scheduled_old_sig );
+  FD_TEST( !test_pack_tile_result_cnt( h ) );
 
   /* An old fragment that was already upstream when pack acknowledged
      the barrier cannot recreate retired work. */
   test_pack_tile_send_bam_resolv_frag( h, 13U, 7U, 7U, ULONG_MAX, 0U, 1U, 0, 100UL, 40U );
-  FD_TEST( h->ctx->bam_work_cnt==1UL );
+  FD_TEST( h->ctx->bam_work_cnt==0UL );
   FD_TEST( test_insert_fini_call_cnt==0UL );
+  FD_TEST( !test_pack_tile_result_cnt( h ) );
 
   test_pack_tile_harness_delete( h );
 }
@@ -1263,6 +1306,52 @@ test_pack_tile_complete_real_bam_bundle( test_pack_tile_harness_t * h,
   test_pack_tile_complete_bam_bundle( h, bundle, txn_cnt, seq_id, slot, slot );
 }
 
+/* Admission is bounded only by bam_work_max.  Scheduling frees a slot
+   at once, so schedule and refill cycles never leak capacity. */
+static void
+test_pack_tile_bam_scheduling_frees_capacity( void ) {
+  test_pack_tile_harness_t h[1];
+  uchar                    sigs[ TEST_PACK_TILE_BAM_WORK_CAP ][ sizeof(fd_ed25519_sig_t) ];
+  fd_txn_e_t               txn[1];
+
+  test_pack_tile_harness_new( h );
+  for( uchar i=0U; i<TEST_PACK_TILE_BAM_WORK_CAP; i++ ) {
+    test_pack_tile_fill_sig( sigs[ i ], (uchar)( 70U + i ) );
+    FD_TEST( pack_tile_track_bam_work( h->ctx, sigs[ i ], 0L, (uint)( 5U + i ), 0U, 100UL, 100UL, 1U ) );
+  }
+
+  fd_memset( txn, 0, sizeof(txn) );
+  test_pack_tile_fill_sig( txn->txnp->payload+1UL, 150U );
+  test_pack_tile_complete_bam_bundle( h, (fd_txn_e_t *[1]){ txn }, 1U, 50U, 100UL, 100UL );
+  FD_TEST( h->ctx->bam_work_cnt==TEST_PACK_TILE_BAM_WORK_CAP );
+  FD_TEST( test_pack_tile_result_cnt( h )==1UL );
+  test_pack_tile_assert_last_result( h, 50U, 100UL, 1U, FD_BAM_SCHED_ERR_CONTAINER_FULL, 0U );
+  FD_TEST( h->ctx->bam_tracking_rejected_cnt==1UL );
+
+  test_pack_tile_schedule_bam_lead( h, sigs[ 0 ] );
+  FD_TEST( h->ctx->bam_work_cnt==TEST_PACK_TILE_BAM_WORK_CAP-1UL );
+  fd_memset( txn, 0, sizeof(txn) );
+  test_pack_tile_fill_sig( txn->txnp->payload+1UL, 151U );
+  test_pack_tile_complete_bam_bundle( h, (fd_txn_e_t *[1]){ txn }, 1U, 51U, 100UL, 100UL );
+  FD_TEST( h->ctx->bam_work_cnt==TEST_PACK_TILE_BAM_WORK_CAP );
+  FD_TEST( test_pack_tile_result_cnt( h )==1UL );
+
+  for( ulong i=0UL; i<3UL*TEST_PACK_TILE_BAM_WORK_CAP; i++ ) {
+    uchar sig[ sizeof(fd_ed25519_sig_t) ];
+    fd_memcpy( sig, h->ctx->bam_work[ 0 ].sig[ 0 ], sizeof(sig) );
+    test_pack_tile_schedule_bam_lead( h, sig );
+    FD_TEST( h->ctx->bam_work_cnt==TEST_PACK_TILE_BAM_WORK_CAP-1UL );
+    test_pack_tile_fill_sig( sig, (uchar)( 160UL + i ) );
+    FD_TEST( pack_tile_track_bam_work( h->ctx, sig, 0L, (uint)( 100UL + i ), 0U, 100UL, 100UL, 1U ) );
+  }
+
+  FD_TEST( h->ctx->bam_work_cnt==TEST_PACK_TILE_BAM_WORK_CAP );
+  FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ]==1UL+3UL*TEST_PACK_TILE_BAM_WORK_CAP );
+  FD_TEST( h->ctx->bam_tracking_rejected_cnt==1UL );
+  FD_TEST( test_pack_tile_result_cnt( h )==1UL );
+  test_pack_tile_harness_delete( h );
+}
+
 static void
 test_pack_tile_bam_missing_builder_cfg_accepted( void ) {
   test_pack_tile_harness_t h[1];
@@ -1277,7 +1366,7 @@ test_pack_tile_bam_missing_builder_cfg_accepted( void ) {
   FD_TEST( test_bundle_cancel_call_cnt == 0UL );
   FD_TEST( h->ctx->current_bundle->bundle == NULL );
   FD_TEST( h->ctx->bam_work_cnt == 1UL );
-  FD_TEST( h->ctx->bam_pending_result_cnt == 0UL );
+  FD_TEST( !test_pack_tile_result_cnt( h ) );
   FD_TEST( h->ctx->bam_fee_meta->is_bam );
   FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_ACCEPTED_IDX ] == 1UL );
   test_pack_tile_harness_delete( h );
@@ -1305,9 +1394,8 @@ test_pack_tile_bam_v1_signature_lifecycle( void ) {
 
   /* Initial insertion tracks the parsed tail signature. */
   test_pack_tile_complete_bam_bundle( h, (fd_txn_e_t *[1]){ first }, 1U, 41U, 100UL, 100UL );
-  ulong work_idx = pack_tile_bam_work_find_by_sig0( h->ctx, first_sig );
-  FD_TEST( work_idx<h->ctx->bam_work_cnt );
-  FD_TEST( work_idx>=h->ctx->bam_scheduled_work_cnt );
+  FD_TEST( pack_tile_bam_work_find_by_sig0( h->ctx, first_sig )<h->ctx->bam_work_cnt );
+  FD_TEST( pack_tile_bam_work_find( h->ctx, first_sig, NULL )<h->ctx->bam_work_cnt );
 
   /* A same-sequence resend replaces the pending copy before insertion. */
   resend->txnp->first_seen_nanos = 20L;
@@ -1316,14 +1404,14 @@ test_pack_tile_bam_v1_signature_lifecycle( void ) {
   FD_TEST( test_insert_fini_call_cnt==2UL );
   FD_TEST( h->ctx->bam_work_cnt==1UL );
 
-  /* Scheduling and execution feedback find the same parsed signature and
-     release the ownership record immediately on completion. */
+  /* Scheduling finds the same parsed signature and releases the
+     ownership record at once; execution feedback then finds nothing. */
   pack_tile_bam_work_mark_txn_scheduled( h->ctx, resend, 1200L );
-  FD_TEST( pack_tile_bam_work_find( h->ctx, resend_sig, 1, NULL )<h->ctx->bam_work_cnt );
-  test_pack_tile_send_executed_txn( h, resend_sig, FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED );
   FD_TEST( !h->ctx->bam_work_cnt );
-  FD_TEST( !pack_tile_bam_pending_work_cnt( h->ctx ) );
-  FD_TEST( !h->ctx->bam_scheduled_work_cnt );
+  FD_TEST( pack_tile_bam_work_find( h->ctx, resend_sig, NULL )==h->ctx->bam_work_cnt );
+  FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ]==1UL );
+  test_pack_tile_send_txn_executed( h, resend_sig );
+  FD_TEST( !test_pack_tile_result_cnt( h ) );
 
   /* A generation barrier deletes pending V1 work by its parsed tail signature. */
   test_delete_call_cnt = 0UL;
@@ -1338,7 +1426,6 @@ test_pack_tile_bam_v1_signature_lifecycle( void ) {
   FD_TEST( generation==(8UL<<1) );
   test_pack_tile_assert_deleted_sig( cleanup_sig );
   FD_TEST( !h->ctx->bam_work_cnt );
-  FD_TEST( !pack_tile_bam_pending_work_cnt( h->ctx ) );
 
   test_pack_tile_harness_delete( h );
 }
@@ -1533,7 +1620,6 @@ test_pack_tile_bam_disable_retires_pending_before_override_clear( void ) {
 
     FD_TEST( test_insert_fini_call_cnt==1UL );
     FD_TEST( h->ctx->bam_work_cnt==1UL );
-    FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==1UL );
     FD_TEST( fd_pack_avail_txn_cnt( pack )==1UL );
 
     if( FD_LIKELY( retire_before_clear ) ) {
@@ -1543,7 +1629,6 @@ test_pack_tile_bam_disable_retires_pending_before_override_clear( void ) {
       FD_TEST( generation==(8UL<<1) );
       FD_TEST( h->ctx->bam_ownership_gen==8U );
       FD_TEST( h->ctx->bam_work_cnt==0UL );
-      FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==0UL );
       FD_TEST( test_delete_call_cnt==1UL );
       FD_TEST( fd_pack_avail_txn_cnt( pack )==0UL );
     }
@@ -1562,8 +1647,9 @@ test_pack_tile_bam_disable_retires_pending_before_override_clear( void ) {
   }
 }
 
-/* Cleanup that stops at the first bundle containing landed X leaves orphaned
-   records for [B,X] and [C,X]; following all overlaps must not delete X twice. */
+/* Cleanup that stops at the first bundle containing executed X leaves
+   orphaned records for [B,X] and [C,X]; following all overlaps must not
+   delete X twice. */
 static void
 test_pack_tile_bam_overlapping_signature_poc_regression( void ) {
   test_pack_tile_harness_t h[1];
@@ -1589,10 +1675,12 @@ test_pack_tile_bam_overlapping_signature_poc_regression( void ) {
   }
   FD_TEST( fd_pack_avail_txn_cnt( pack )==6UL );
 
-  test_pack_tile_send_executed_txn( h, sigs[ 1 ], FD_EXECUTED_TXN_KIND_LANDED );
+  /* Replay executed X: pack deletes every pending copy, so all three
+     batches retire ALREADY_PROCESSED. */
+  test_pack_tile_send_txn_executed( h, sigs[ 1 ] );
   FD_TEST( fd_pack_avail_txn_cnt( pack )==0UL );
   FD_TEST( h->ctx->bam_work_cnt==0UL );
-  test_pack_tile_assert_pending_duplicate_results( h, first_seq_id, slot );
+  test_pack_tile_assert_pending_duplicate_results( h, 0UL, first_seq_id, slot );
 
   test_pack_tile_harness_delete( h );
   free( pack_mem );
@@ -1628,10 +1716,10 @@ test_pack_tile_bam_pack_evicted_bundle_is_reconciled( void ) {
   test_pack_tile_fill_sig( sigs[ 0 ], 30U );
   test_pack_tile_fill_sig( sigs[ 1 ], 31U );
 
-  void *      pack_mem               = NULL;
-  fd_pack_t * pack                   = NULL;
-  ulong       evicted_stage_before   = 0UL;
-  ulong       pending_results_before = 0UL;
+  void *      pack_mem             = NULL;
+  fd_pack_t * pack                 = NULL;
+  ulong       evicted_stage_before = 0UL;
+  ulong       results_before       = 0UL;
   for( uint rng_seq=0U;; rng_seq++ ) {
     FD_TEST( rng_seq<64U );
     test_pack_tile_harness_new( h );
@@ -1655,8 +1743,8 @@ test_pack_tile_bam_pack_evicted_bundle_is_reconciled( void ) {
     FD_TEST( fd_pack_avail_txn_cnt( pack )==pack_depth );
     FD_TEST( !fd_pack_bundle_evicted_cnt( pack ) );
 
-    evicted_stage_before   = h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_PENDING_EVICTED_IDX ];
-    pending_results_before = h->ctx->bam_pending_result_cnt;
+    evicted_stage_before = h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_PENDING_EVICTED_IDX ];
+    results_before       = test_pack_tile_result_cnt( h );
 
     test_pack_tile_complete_real_bam_bundle( h, valid_txn, (uchar const *[1]){ sigs[ 1 ] }, 1U, first_seq_id+1U, slot );
     FD_TEST( fd_pack_avail_txn_cnt( pack )==pack_depth );
@@ -1673,19 +1761,14 @@ test_pack_tile_bam_pack_evicted_bundle_is_reconciled( void ) {
 
   /* One work item was appended and the silently evicted one was retired. */
   FD_TEST( h->ctx->bam_work_cnt==1UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==1UL );
-  FD_TEST( !h->ctx->bam_scheduled_work_cnt );
   FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_PENDING_EVICTED_IDX ]
            ==evicted_stage_before+1UL );
-  FD_TEST( h->ctx->bam_pending_result_cnt==pending_results_before+1UL );
+  FD_TEST( test_pack_tile_result_cnt( h )==results_before+1UL );
 
   /* The retired sequence is reported as losing the priority contest, which
      is what actually happened to it. */
-  ulong result_idx = ( h->ctx->bam_result_queue_head + pending_results_before ) %
-                     ( 2UL*h->ctx->max_pending_transactions );
-  fd_bam_bundle_result_t const * res = &h->ctx->bam_result_queue[ result_idx ];
-  FD_TEST( res->scheduling_error==FD_BAM_SCHED_ERR_CONTAINER_FULL );
-  FD_TEST( res->seq_id==first_seq_id );
+  test_pack_tile_assert_result( test_pack_tile_result( h, results_before ), first_seq_id, slot, 1U,
+                                FD_BAM_SCHED_ERR_CONTAINER_FULL, 0U );
   FD_TEST( pack_tile_bam_work_find_by_sig0( h->ctx, sigs[ 0 ] )==h->ctx->bam_work_cnt );
 
   /* Replaying the evicted sequence must leave every tracked sig0 pending in
@@ -1754,7 +1837,6 @@ test_pack_tile_bam_sig0_shared_with_untracked_pack_txn_is_accepted( void ) {
   test_pack_tile_complete_real_bam_bundle( h, valid_txn, (uchar const *[1]){ shared_sig }, 1U, 900U, 104UL );
 
   FD_TEST( test_bundle_cancel_call_cnt==cancel_before );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==1UL );
   FD_TEST( h->ctx->bam_work_cnt==1UL );
   FD_TEST( pack_tile_bam_work_find_by_sig0( h->ctx, shared_sig )<h->ctx->bam_work_cnt );
   FD_TEST( !h->ctx->insert_result[ FD_PACK_INSERT_REJECT_DUPLICATE + FD_PACK_INSERT_RETVAL_OFF ] );
@@ -1793,7 +1875,7 @@ test_pack_tile_bam_overlapping_bundle_leading_sig_is_accepted( void ) {
 
   /* Bundle A = [X,Y], tracked.  bam_work holds sig[0]==X, sig[1]==Y. */
   test_pack_tile_complete_real_bam_bundle( h, valid_txn, (uchar const *[2]){ sig_x, sig_y }, 2U, 910U, 104UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==1UL );
+  FD_TEST( h->ctx->bam_work_cnt==1UL );
   FD_TEST( !fd_pack_contains_bam_bundle( pack, (fd_ed25519_sig_t const *)(void const *)sig_y, 0U, 0U, 0 ) );
   FD_TEST( pack_tile_bam_work_find_by_sig0( h->ctx, sig_y )==h->ctx->bam_work_cnt );
 
@@ -1802,14 +1884,14 @@ test_pack_tile_bam_overlapping_bundle_leading_sig_is_accepted( void ) {
   test_pack_tile_complete_real_bam_bundle( h, valid_txn, (uchar const *[2]){ sig_y, sig_z }, 2U, 911U, 104UL );
 
   FD_TEST( test_bundle_cancel_call_cnt==cancel_before );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==2UL );
+  FD_TEST( h->ctx->bam_work_cnt==2UL );
   FD_TEST( pack_tile_bam_work_find_by_sig0( h->ctx, sig_y )<h->ctx->bam_work_cnt );
 
   /* Replacing B must delete B exactly.  Signature-wide deletion by Y would
      also delete A because Y is A's non-leading transaction. */
   test_pack_tile_complete_real_bam_bundle( h, valid_txn, (uchar const *[2]){ sig_y, sig_z }, 2U, 911U, 104UL );
 
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==2UL );
+  FD_TEST( h->ctx->bam_work_cnt==2UL );
   FD_TEST( fd_pack_avail_txn_cnt( pack )==4UL );
   FD_TEST( fd_pack_contains_bam_bundle( pack, (fd_ed25519_sig_t const *)(void const *)sig_x, 910U, 0U, 1 ) );
   FD_TEST( fd_pack_contains_bam_bundle( pack, (fd_ed25519_sig_t const *)(void const *)sig_y, 911U, 0U, 1 ) );
@@ -1821,19 +1903,13 @@ test_pack_tile_bam_overlapping_bundle_leading_sig_is_accepted( void ) {
   FD_TEST( fd_pack_avail_txn_cnt( pack )==2UL );
   FD_TEST( !fd_pack_contains_bam_bundle( pack, (fd_ed25519_sig_t const *)(void const *)sig_y, 911U, 0U, 1 ) );
 
-  ulong pending_results_before = h->ctx->bam_pending_result_cnt;
+  ulong results_before = test_pack_tile_result_cnt( h );
   pack_tile_reconcile_pending_bam_work( h->ctx );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx )==1UL );
   FD_TEST( h->ctx->bam_work_cnt==1UL );
   FD_TEST( pack_tile_bam_work_find_by_sig0( h->ctx, sig_x )<h->ctx->bam_work_cnt );
   FD_TEST( fd_pack_avail_txn_cnt( pack )==2UL );
-  FD_TEST( h->ctx->bam_pending_result_cnt==pending_results_before+1UL );
-
-  ulong result_idx = ( h->ctx->bam_result_queue_head + pending_results_before ) %
-                     ( 2UL*h->ctx->max_pending_transactions );
-  fd_bam_bundle_result_t const * result = &h->ctx->bam_result_queue[ result_idx ];
-  FD_TEST( result->seq_id==911U );
-  FD_TEST( result->scheduling_error==FD_BAM_SCHED_ERR_CONTAINER_FULL );
+  FD_TEST( test_pack_tile_result_cnt( h )==results_before+1UL );
+  test_pack_tile_assert_last_result( h, 911U, 104UL, 2U, FD_BAM_SCHED_ERR_CONTAINER_FULL, 0U );
 
   test_pack_tile_harness_delete( h );
   free( pack_mem );
@@ -1881,7 +1957,7 @@ test_pack_tile_bam_old_member_does_not_override_missed_target( void ) {
                                          (uchar)( 160U+batch_idx ) );
     if( FD_LIKELY( batch_idx==1U ) ) {
       FD_TEST( h->ctx->current_bundle->txn_received==(ulong)batch_idx+1UL );
-      FD_TEST( h->ctx->bam_pending_result_cnt==0UL );
+      FD_TEST( !test_pack_tile_result_cnt( h ) );
     }
   }
 
@@ -1890,9 +1966,8 @@ test_pack_tile_bam_old_member_does_not_override_missed_target( void ) {
   FD_TEST( test_bundle_cancel_last_txn_cnt==3UL );
   FD_TEST( h->ctx->current_bundle->bundle==NULL );
   FD_TEST( !h->ctx->current_bundle_bam->is_bam );
-  FD_TEST( h->ctx->bam_pending_result_cnt==1UL );
+  FD_TEST( test_pack_tile_result_cnt( h )==1UL );
 
-  FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
   fd_bam_bundle_result_t const * rejected = test_pack_tile_assert_last_result( h,
                                                                               seq_id,
                                                                               max_schedule_slot,
@@ -1900,20 +1975,17 @@ test_pack_tile_bam_old_member_does_not_override_missed_target( void ) {
                                                                               FD_BAM_SCHED_ERR_OUTSIDE_SLOT,
                                                                               0U );
   FD_TEST( !rejected->transaction_err_count );
-  FD_TEST( h->ctx->bam_pending_result_cnt==0UL );
 
-  ulong published_result_cnt = h->out->seqs[ 0 ];
   pack_tile_abandon_current_bam_bundle( h->ctx, PACK_TILE_BAM_BUNDLE_ASSEMBLY_ABANDON_NEW_SEQ_BEFORE_COMPLETE );
   pack_tile_abandon_current_bam_bundle( h->ctx, PACK_TILE_BAM_BUNDLE_ASSEMBLY_ABANDON_LEADER_SLOT_END );
-  FD_TEST( h->ctx->bam_pending_result_cnt==0UL );
-  FD_TEST( h->out->seqs[ 0 ]==published_result_cnt );
+  FD_TEST( test_pack_tile_result_cnt( h )==1UL );
 
   test_pack_tile_harness_delete( h );
 }
 
-/* Stale pending work is deleted from pack at once, but its results queue in
-   FIFO order without being dropped.  A queued result does not shadow new
-   work on the same sig0, and later direct rejects queue behind it. */
+/* Stale pending work is deleted from pack and its results are published
+   at once, in bam_work order.  A published result does not shadow new
+   work on the same sig0, and later direct rejects follow it. */
 static void
 test_pack_tile_bam_stale_pending_work_results_fifo( void ) {
   test_pack_tile_harness_t h[1];
@@ -1932,42 +2004,30 @@ test_pack_tile_bam_stale_pending_work_results_fifo( void ) {
 
   FD_TEST( test_delete_call_cnt == 3UL );
   FD_TEST( !memcmp( test_delete_last_sig, sigs[ 2 ], sizeof(fd_ed25519_sig_t) ) );
-  FD_TEST( h->out->seqs[ 0 ] == 0UL );
   FD_TEST( h->ctx->bam_work_cnt == 0UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx ) == 0UL );
-  FD_TEST( h->ctx->bam_scheduled_work_cnt == 0UL );
-  FD_TEST( h->ctx->bam_pending_result_cnt == 3UL );
+  FD_TEST( test_pack_tile_result_cnt( h ) == 3UL );
+  for( ulong i=0UL; i<3UL; i++ ) {
+    test_pack_tile_assert_result( test_pack_tile_result( h, i ), (uint)( 100UL + i ), 100UL, (uchar)( 1UL+(i==2UL) ),
+                                  FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U );
+  }
   FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_PENDING_ENTERED_IDX ] == 3UL );
   FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_PENDING_EVICTED_IDX ] == 3UL );
 
   FD_TEST( pack_tile_track_bam_work( h->ctx, sigs[ 0 ], 0L, 201U, 0U, 102UL, 102UL, 1U ) );
   FD_TEST( h->ctx->bam_work_cnt == 1UL );
-  FD_TEST( h->ctx->bam_pending_result_cnt == 3UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx ) == 1UL );
+  FD_TEST( test_pack_tile_result_cnt( h ) == 3UL );
   ulong work_idx = pack_tile_bam_work_find_by_sig0( h->ctx, sigs[ 0 ] );
   FD_TEST( work_idx < h->ctx->bam_work_cnt );
-  FD_TEST( work_idx>=h->ctx->bam_scheduled_work_cnt );
   FD_TEST( h->ctx->bam_work[ work_idx ].seq_id == 201U );
 
   pack_tile_publish_bam_insert_reject( h->ctx, 200U, 0U, 200UL, 1U, 0UL, FD_PACK_INSERT_REJECT_DUPLICATE );
-  FD_TEST( h->out->seqs[ 0 ] == 0UL );
-  FD_TEST( h->ctx->bam_pending_result_cnt == 4UL );
+  FD_TEST( test_pack_tile_result_cnt( h ) == 4UL );
+  test_pack_tile_assert_last_result( h, 200U, 200UL, 1U, FD_BAM_SCHED_ERR_CONTAINER_FULL, 0U );
 
-  for( uchar i=0U; i<4U; i++ ) {
-    FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
-    if( i<3U ) test_pack_tile_assert_last_result( h, (uint)( 100U + i ), 100UL, (uchar)( 1U+(i==2U) ), FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U );
-    else       test_pack_tile_assert_last_result( h, 200U, 200UL, 1U, FD_BAM_SCHED_ERR_CONTAINER_FULL, 0U );
-    FD_TEST( h->out->seqs[ 0 ] == (ulong)i + 1UL );
-    FD_TEST( h->ctx->bam_pending_result_cnt == 3UL - (ulong)i );
-  }
-
-  /* Even with the queue drained, a direct reject goes through it. */
   pack_tile_publish_bam_insert_reject( h->ctx, 201U, 0U, 201UL, 1U, 0UL, FD_PACK_INSERT_REJECT_DUPLICATE );
-  FD_TEST( h->out->seqs[ 0 ] == 4UL );
-  FD_TEST( h->ctx->bam_pending_result_cnt == 1UL );
-  FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
+  FD_TEST( test_pack_tile_result_cnt( h ) == 5UL );
   test_pack_tile_assert_last_result( h, 201U, 201UL, 1U, FD_BAM_SCHED_ERR_CONTAINER_FULL, 0U );
-  FD_TEST( h->ctx->bam_pending_result_cnt == 0UL );
+  test_pack_tile_assert_result( test_pack_tile_result( h, 0UL ), 100U, 100UL, 1U, FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U );
 
   test_pack_tile_harness_delete( h );
 }
@@ -1996,7 +2056,6 @@ test_pack_tile_bam_pending_duplicate_before_insert( uint   new_seq_id,
 
   FD_TEST( pack_tile_track_bam_work( h->ctx, old_sigs, 10L, 10U, 0U, 100UL, 100UL, 2U ) );
   FD_TEST( h->ctx->bam_work_cnt == 1UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx ) == 1UL );
   FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_PENDING_ENTERED_IDX ] == 1UL );
 
   h->ctx->current_bundle_bam->scheduler_gen = new_gen;
@@ -2016,8 +2075,6 @@ test_pack_tile_bam_pending_duplicate_before_insert( uint   new_seq_id,
   FD_TEST( h->ctx->current_bundle_bam->is_bam == 0 );
 
   FD_TEST( h->ctx->bam_work_cnt == 1UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx ) == 1UL );
-  FD_TEST( h->ctx->bam_scheduled_work_cnt == 0UL );
   FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_PENDING_ENTERED_IDX ] == 1UL+(ulong)replace );
   FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_ACCEPTED_IDX ] == (ulong)replace );
   FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_REJECTED_PRE_PENDING_IDX ] == (ulong)!replace );
@@ -2026,38 +2083,38 @@ test_pack_tile_bam_pending_duplicate_before_insert( uint   new_seq_id,
   FD_TEST( work_idx<h->ctx->bam_work_cnt );
   FD_TEST( h->ctx->bam_work[ work_idx ].seq_id == 10U );
   FD_TEST( h->ctx->bam_work[ work_idx ].max_schedule_slot == 100UL );
-  FD_TEST( work_idx>=h->ctx->bam_scheduled_work_cnt );
   FD_TEST( h->ctx->bam_work[ work_idx ].txn_cnt == (replace ? 1U : 2U) );
 
-  FD_TEST( h->ctx->bam_pending_result_cnt == (ulong)!replace );
+  FD_TEST( test_pack_tile_result_cnt( h ) == (ulong)!replace );
   if( !replace ) {
-    FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
     /* A duplicate sig0 is retryable (CONTAINER_FULL), never ALREADY_PROCESSED,
        which would poison the node's per-slot rejection cache. */
     FD_TEST( test_pack_tile_assert_last_result( h, new_seq_id, new_slot, 1U, FD_BAM_SCHED_ERR_CONTAINER_FULL, 0U )->scheduler_gen==new_gen );
-    FD_TEST( h->ctx->bam_pending_result_cnt == 0UL );
   }
 
   test_pack_tile_harness_delete( h );
 }
 
-/* Scheduled work is never replaced, even by a same-sequence resend. */
+/* Once its lead is scheduled a batch is untracked, so a duplicate of
+   it, same-sequence resend or not, is inserted without a result:
+   execution answers it ALREADY_PROCESSED once the first copy commits. */
 static void
-test_pack_tile_bam_scheduled_duplicate_rejected_before_insert( uint  new_seq_id,
-                                                               ulong new_slot ) {
+test_pack_tile_bam_in_flight_duplicate_inserted( uint  new_seq_id,
+                                                 ulong new_slot ) {
   test_pack_tile_harness_t h[1];
-  uchar                    sig[ sizeof(fd_ed25519_sig_t) ];
+  fd_txn_e_t               first[1];
   fd_txn_e_t               new_txns[2];
 
   test_pack_tile_harness_new( h );
+  fd_memset( first, 0, sizeof(first) );
   fd_memset( new_txns, 0, sizeof(new_txns) );
 
-  test_pack_tile_fill_sig( sig, 41U );
-  FD_TEST( pack_tile_track_bam_work( h->ctx, sig, 10L, 20U, 0U, 100UL, 100UL, 1U ) );
-  pack_bam_work_t * scheduled = test_pack_tile_mark_bam_work_scheduled( h, sig );
-  FD_TEST( scheduled->seq_id == 20U );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx ) == 0UL );
-  FD_TEST( h->ctx->bam_scheduled_work_cnt == 1UL );
+  uchar const * sig = first->txnp->payload + 1UL;
+  test_pack_tile_fill_sig( first->txnp->payload + 1UL, 41U );
+  test_pack_tile_complete_bam_bundle( h, (fd_txn_e_t *[1]){ first }, 1U, 20U, 100UL, 100UL );
+  FD_TEST( h->ctx->bam_work_cnt == 1UL );
+  pack_tile_bam_scheduled( h->ctx, first, 1UL, fd_tickcount() );
+  FD_TEST( h->ctx->bam_work_cnt == 0UL );
 
   fd_memcpy( new_txns[ 0 ].txnp->payload + 1UL, sig, sizeof(fd_ed25519_sig_t) );
   test_pack_tile_fill_sig( new_txns[ 1 ].txnp->payload + 1UL, 51U );
@@ -2067,61 +2124,57 @@ test_pack_tile_bam_scheduled_duplicate_rejected_before_insert( uint  new_seq_id,
                                       2U, new_seq_id, new_slot, new_slot );
 
   FD_TEST( test_delete_call_cnt == 0UL );
-  FD_TEST( test_insert_fini_call_cnt == 0UL );
-  FD_TEST( test_bundle_cancel_call_cnt == 1UL );
-  FD_TEST( test_bundle_cancel_last_txn_cnt == 2UL );
+  FD_TEST( test_insert_fini_call_cnt == 2UL );
+  FD_TEST( test_bundle_cancel_call_cnt == 0UL );
   FD_TEST( h->ctx->current_bundle->bundle == NULL );
   FD_TEST( h->ctx->current_bundle_bam->is_bam == 0 );
 
   FD_TEST( h->ctx->bam_work_cnt == 1UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx ) == 0UL );
-  FD_TEST( h->ctx->bam_scheduled_work_cnt == 1UL );
   ulong work_idx = pack_tile_bam_work_find_by_sig0( h->ctx, sig );
   FD_TEST( work_idx<h->ctx->bam_work_cnt );
-  FD_TEST( h->ctx->bam_work[ work_idx ].seq_id == 20U );
-  FD_TEST( work_idx<h->ctx->bam_scheduled_work_cnt );
+  FD_TEST( h->ctx->bam_work[ work_idx ].seq_id == new_seq_id );
+  FD_TEST( h->ctx->bam_work[ work_idx ].max_schedule_slot == new_slot );
+  FD_TEST( h->ctx->bam_work[ work_idx ].txn_cnt == 2U );
 
   FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ] == 1UL );
-  FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_REJECTED_PRE_PENDING_IDX ] == 1UL );
-
-  FD_TEST( h->ctx->bam_pending_result_cnt == 1UL );
-  FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
-  test_pack_tile_assert_last_result( h, new_seq_id, new_slot, 2U, FD_BAM_SCHED_ERR_CONTAINER_FULL, 0U );
+  FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_ACCEPTED_IDX ] == 2UL );
+  FD_TEST( !h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_REJECTED_PRE_PENDING_IDX ] );
+  FD_TEST( !test_pack_tile_result_cnt( h ) );
 
   test_pack_tile_harness_delete( h );
 }
 
+/* Consecutive results wrapping the result dcache stay in order. */
 static void
-test_pack_tile_bam_result_queue_wrap_preserves_fifo( void ) {
+test_pack_tile_bam_result_dcache_wrap_preserves_order( void ) {
   test_pack_tile_harness_t h[1];
   test_pack_tile_harness_new( h );
 
-  ulong const cap = 2UL*h->ctx->max_pending_transactions;
-  h->ctx->bam_result_queue_head = cap-1UL;
+  fd_pack_out_ctx_t * out = &h->ctx->bam_result_out;
+  out->chunk = out->wmark;
 
   fd_bam_bundle_result_t first  = fd_bam_result_base( 100U, 0U, 100UL, 1U );
   fd_bam_bundle_result_t second = fd_bam_result_base( 101U, 0U, 101UL, 1U );
-  FD_TEST( pack_tile_enqueue_bam_result( h->ctx, &first  ) );
-  FD_TEST( pack_tile_enqueue_bam_result( h->ctx, &second ) );
-  FD_TEST( h->ctx->bam_result_queue[ cap-1UL ].seq_id==100U );
-  FD_TEST( h->ctx->bam_result_queue[ 0UL     ].seq_id==101U );
+  pack_tile_publish_bam_result( h->ctx, &first  );
+  FD_TEST( out->chunk==out->chunk0 );
+  pack_tile_publish_bam_result( h->ctx, &second );
 
-  FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
-  test_pack_tile_assert_last_result( h, 100U, 100UL, 1U, FD_BAM_SCHED_ERR_NONE, 0U );
-  FD_TEST( h->ctx->bam_result_queue_head==0UL );
-
-  FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
-  test_pack_tile_assert_last_result( h, 101U, 101UL, 1U, FD_BAM_SCHED_ERR_NONE, 0U );
-  FD_TEST( h->ctx->bam_result_queue_head==1UL );
-  FD_TEST( !h->ctx->bam_pending_result_cnt );
+  FD_TEST( test_pack_tile_result_cnt( h )==2UL );
+  FD_TEST( h->out->mcaches[ 0 ][ 0 ].chunk==out->wmark );
+  FD_TEST( h->out->mcaches[ 0 ][ 1 ].chunk==out->chunk0 );
+  test_pack_tile_assert_result( test_pack_tile_result( h, 0UL ), 100U, 100UL, 1U, FD_BAM_SCHED_ERR_NONE, 0U );
+  test_pack_tile_assert_result( test_pack_tile_result( h, 1UL ), 101U, 101UL, 1U, FD_BAM_SCHED_ERR_NONE, 0U );
 
   test_pack_tile_harness_delete( h );
 }
 
+/* Published results hold no tracking capacity: right after a full
+   eviction publishes one result per work item, a full bam_work_max of
+   new work is admitted. */
 static void
-test_pack_tile_bam_pending_results_reserve_direct_result_headroom( void ) {
+test_pack_tile_bam_published_results_do_not_reserve_capacity( void ) {
   test_pack_tile_harness_t h[1];
-  uchar                    sigs[ TEST_PACK_TILE_BAM_WORK_CAP ][ sizeof(fd_ed25519_sig_t) ];
+  uchar                    sigs[ TEST_PACK_TILE_BAM_WORK_CAP+1UL ][ sizeof(fd_ed25519_sig_t) ];
 
   test_pack_tile_harness_new( h );
 
@@ -2135,48 +2188,18 @@ test_pack_tile_bam_pending_results_reserve_direct_result_headroom( void ) {
   pack_tile_evict_invalid_pending_bam_work( h->ctx, 0 );
 
   FD_TEST( h->ctx->bam_work_cnt == 0UL );
-  FD_TEST( h->ctx->bam_pending_result_cnt == TEST_PACK_TILE_BAM_WORK_CAP );
+  FD_TEST( test_pack_tile_result_cnt( h ) == TEST_PACK_TILE_BAM_WORK_CAP );
+  for( ulong i=0UL; i<TEST_PACK_TILE_BAM_WORK_CAP; i++ ) {
+    test_pack_tile_assert_result( test_pack_tile_result( h, i ), (uint)( 300UL + i ), 100UL, 1U,
+                                  FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U );
+  }
 
-  for( uchar i=0U; i<TEST_PACK_TILE_BAM_WORK_CAP-1U; i++ ) {
+  for( uchar i=0U; i<=TEST_PACK_TILE_BAM_WORK_CAP; i++ ) {
     test_pack_tile_fill_sig( sigs[ i ], (uchar)( 120U + i ) );
-    FD_TEST( pack_tile_track_bam_work( h->ctx, sigs[ i ], 0L, (uint)( 400U + i ), 0U, 102UL, 102UL, 1U ) );
+    FD_TEST( pack_tile_track_bam_work( h->ctx, sigs[ i ], 0L, (uint)( 400U + i ), 0U, 102UL, 102UL, 1U )==(i<TEST_PACK_TILE_BAM_WORK_CAP) );
   }
-  test_pack_tile_fill_sig( sigs[ TEST_PACK_TILE_BAM_WORK_CAP-1U ], 130U );
-  FD_TEST( !pack_tile_track_bam_work( h->ctx, sigs[ TEST_PACK_TILE_BAM_WORK_CAP-1U ], 0L, 499U, 0U, 102UL, 102UL, 1U ) );
-  FD_TEST( h->ctx->bam_work_cnt == TEST_PACK_TILE_BAM_WORK_CAP-1UL );
-  FD_TEST( h->ctx->bam_pending_result_cnt == TEST_PACK_TILE_BAM_WORK_CAP );
-
-  fd_bam_bundle_result_t res = { .seq_id = 700U, .slot = 700UL, .bundle_txn_cnt = 1U };
-  h->ctx->bam_pending_result_cnt = 2UL*TEST_PACK_TILE_BAM_WORK_CAP;
-  FD_TEST( !pack_tile_enqueue_bam_result( h->ctx, &res ) );
-
-  test_pack_tile_harness_delete( h );
-}
-
-static void
-test_pack_tile_bam_scheduled_work_does_not_consume_result_headroom( void ) {
-  test_pack_tile_harness_t h[1];
-  uchar                    sigs[ 5 ][ sizeof(fd_ed25519_sig_t) ];
-
-  test_pack_tile_harness_new( h );
-
-  for( uchar i=0U; i<4U; i++ ) {
-    test_pack_tile_fill_sig( sigs[ i ], (uchar)( 150U + i ) );
-    FD_TEST( pack_tile_track_bam_work( h->ctx, sigs[ i ], 0L, (uint)( 500U + i ), 0U, 200UL, 200UL, 1U ) );
-    (void)test_pack_tile_mark_bam_work_scheduled( h, sigs[ i ] );
-  }
-
-  FD_TEST( h->ctx->bam_work_cnt == 4UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx ) == 0UL );
-  FD_TEST( h->ctx->bam_scheduled_work_cnt == 4UL );
-
-  h->ctx->bam_pending_result_cnt = 2UL*TEST_PACK_TILE_BAM_WORK_CAP - h->ctx->bam_scheduled_work_cnt;
-
-  test_pack_tile_fill_sig( sigs[ 4 ], 190U );
-  FD_TEST( pack_tile_track_bam_work( h->ctx, sigs[ 4 ], 0L, 600U, 0U, 201UL, 201UL, 1U ) );
-  FD_TEST( h->ctx->bam_work_cnt == 5UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( h->ctx ) == 1UL );
-  FD_TEST( h->ctx->bam_scheduled_work_cnt == 4UL );
+  FD_TEST( h->ctx->bam_work_cnt == TEST_PACK_TILE_BAM_WORK_CAP );
+  FD_TEST( test_pack_tile_result_cnt( h ) == TEST_PACK_TILE_BAM_WORK_CAP );
 
   test_pack_tile_harness_delete( h );
 }
@@ -2254,8 +2277,8 @@ test_pack_tile_bam_unsigned_advance_passes_pack( void ) {
     test_pack_tile_complete_bam_bundle( h, bundle, txn_cnt, seq_id, 1UL, 0UL );
 
     FD_TEST( fd_pack_avail_txn_cnt( pack )==txn_cnt );
-    FD_TEST( h->ctx->bam_work_cnt==1UL && pack_tile_bam_pending_work_cnt( h->ctx )==1UL );
-    FD_TEST( !h->ctx->bam_pending_result_cnt );
+    FD_TEST( h->ctx->bam_work_cnt==1UL );
+    FD_TEST( !test_pack_tile_result_cnt( h ) );
     test_pack_tile_harness_delete( h );
     free( pack_mem );
   }
@@ -2271,15 +2294,13 @@ test_pack_tile_bam_result_mapping_insert_reject( void ) {
 
   pack_tile_publish_bam_insert_reject( h->ctx, 77U, 0U, 123UL, 2U, 0UL, FD_PACK_INSERT_REJECT_DUPLICATE );
 
-  FD_TEST( h->out->seqs[ 0 ] == 0UL );
-  FD_TEST( h->ctx->bam_pending_result_cnt == 1UL );
-  FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
+  FD_TEST( test_pack_tile_result_cnt( h ) == 1UL );
   /* A duplicate sig0 is retryable, never ALREADY_PROCESSED. */
   test_pack_tile_assert_last_result( h, 77U, 123UL, 2U, FD_BAM_SCHED_ERR_CONTAINER_FULL, 0U );
 
   pack_tile_publish_bam_insert_reject( h->ctx, 82U, 0U, 128UL, 2U, 1UL, FD_PACK_INSERT_REJECT_ACCT_BLOCKLIST );
 
-  FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
+  FD_TEST( test_pack_tile_result_cnt( h ) == 2UL );
   fd_bam_bundle_result_t acct_blocklist = *test_pack_tile_assert_last_result( h, 82U, 128UL, 2U, FD_BAM_SCHED_ERR_NONE, 2U );
   FD_TEST( acct_blocklist.bundle_err           == FD_BAM_BUNDLE_ERR_NONE );
   FD_TEST( acct_blocklist.transaction_err[ 0 ] == bam_types_TransactionErrorReason_COMMIT_CANCELLED );
@@ -2288,7 +2309,7 @@ test_pack_tile_bam_result_mapping_insert_reject( void ) {
 
   pack_tile_publish_bam_insert_reject( h->ctx, 81U, 0U, 127UL, 2U, 1UL, FD_PACK_INSERT_REJECT_INSTR_ACCT_CNT );
 
-  FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
+  FD_TEST( test_pack_tile_result_cnt( h ) == 3UL );
   fd_bam_bundle_result_t const * instr_acct_cnt = test_pack_tile_assert_last_result( h, 81U, 127UL, 2U, FD_BAM_SCHED_ERR_NONE, 0U );
   FD_TEST( instr_acct_cnt->bundle_err   == FD_BAM_BUNDLE_ERR_DESER );
   FD_TEST( instr_acct_cnt->deser_index  == 1U );
@@ -2296,8 +2317,7 @@ test_pack_tile_bam_result_mapping_insert_reject( void ) {
 
   pack_tile_publish_bam_insert_reject( h->ctx, 78U, 0U, 124UL, 1U, ULONG_MAX, FD_PACK_INSERT_REJECT_PRIORITY );
 
-  FD_TEST( h->ctx->bam_pending_result_cnt == 1UL );
-  FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
+  FD_TEST( test_pack_tile_result_cnt( h ) == 4UL );
   test_pack_tile_assert_last_result( h, 78U, 124UL, 1U, FD_BAM_SCHED_ERR_CONTAINER_FULL, 0U );
 
   test_pack_tile_harness_delete( h );
@@ -2332,8 +2352,7 @@ test_pack_tile_bam_result_mapping_tracking_reject( void ) {
 
   FD_TEST( h->ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_REJECTED_PRE_PENDING_IDX ] == 1UL );
 
-  FD_TEST( h->ctx->bam_pending_result_cnt == 1UL );
-  FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
+  FD_TEST( test_pack_tile_result_cnt( h ) == 1UL );
   test_pack_tile_assert_last_result( h, 88U, 201UL, 2U, FD_BAM_SCHED_ERR_CONTAINER_FULL, 0U );
 
   test_pack_tile_harness_delete( h );
@@ -2379,7 +2398,7 @@ test_pack_tile_bam_atomic_abandon_result_mapping( void ) {
     FD_TEST( test_bundle_cancel_last_txn_cnt == 3UL );
     FD_TEST( h->ctx->current_bundle->bundle == NULL );
     FD_TEST( h->ctx->current_bundle_bam->is_bam == (uchar)!is_new_seq_abandon );
-    FD_TEST( h->ctx->bam_pending_result_cnt == (ulong)is_new_seq_abandon );
+    FD_TEST( test_pack_tile_result_cnt( h ) == (ulong)is_new_seq_abandon );
 
     if( FD_UNLIKELY( !is_new_seq_abandon ) ) {
       uchar resolved_buf[ FD_TPU_RESOLVED_MTU ] __attribute__((aligned(FD_CHUNK_ALIGN)));
@@ -2399,10 +2418,9 @@ test_pack_tile_bam_atomic_abandon_result_mapping( void ) {
       FD_TEST( h->ctx->current_bundle->bundle == NULL );
       FD_TEST( !h->ctx->current_bundle_bam->is_bam );
       FD_TEST( test_bundle_cancel_call_cnt == 1UL );
-      FD_TEST( h->ctx->bam_pending_result_cnt == 1UL );
+      FD_TEST( test_pack_tile_result_cnt( h ) == 1UL );
     }
 
-    FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
     fd_bam_bundle_result_t const * published = test_pack_tile_assert_last_result( h, seq_id, 600UL, 3U,
                                                                                  is_new_seq_abandon ? FD_BAM_SCHED_ERR_NONE : FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U );
     if( FD_LIKELY( is_new_seq_abandon ) ) {
@@ -2443,7 +2461,7 @@ test_pack_tile_bam_preprocess_marker_has_one_terminal_owner( void ) {
 
     if( FD_UNLIKELY( timeout_first ) ) {
       pack_tile_abandon_current_bam_bundle( h->ctx, PACK_TILE_BAM_BUNDLE_ASSEMBLY_ABANDON_SLOT_DEADLINE );
-      FD_TEST( h->ctx->bam_pending_result_cnt==0UL );
+      FD_TEST( !test_pack_tile_result_cnt( h ) );
       FD_TEST( h->ctx->current_bundle_bam->is_bam );
     }
 
@@ -2464,22 +2482,79 @@ test_pack_tile_bam_preprocess_marker_has_one_terminal_owner( void ) {
 
     FD_TEST( !h->ctx->current_bundle_bam->is_bam );
     FD_TEST( h->ctx->current_bundle->bundle==NULL );
-    FD_TEST( h->ctx->bam_pending_result_cnt==1UL );
+    FD_TEST( test_pack_tile_result_cnt( h )==1UL );
     FD_TEST( test_bundle_cancel_call_cnt==1UL );
 
     pack_tile_abandon_current_bam_bundle( h->ctx, PACK_TILE_BAM_BUNDLE_ASSEMBLY_ABANDON_SLOT_DEADLINE );
-    FD_TEST( h->ctx->bam_pending_result_cnt==1UL );
+    FD_TEST( test_pack_tile_result_cnt( h )==1UL );
 
-    FD_TEST( pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
     fd_bam_bundle_result_t const * published =
         test_pack_tile_assert_last_result( h, seq_id, 600UL, 3U, FD_BAM_SCHED_ERR_NONE, 0U );
     FD_TEST( published->bundle_err   == FD_BAM_BUNDLE_ERR_DESER );
     FD_TEST( published->deser_index  == 1U );
     FD_TEST( published->deser_reason == bam_types_DeserializationErrorReason_SANITIZE_ERROR );
-    FD_TEST( !pack_tile_drain_one_pending_bam_result( h->ctx, &h->out->stem ) );
 
     test_pack_tile_harness_delete( h );
   }
+}
+
+/* Pack publishes each result on bam_stem as soon as it is known, from
+   during_frag as from after_frag: the callback that decides the result
+   advances the result link by one, and nothing waits for a later
+   callback.  after_frag is given another stem to show results do not
+   use it. */
+static void
+test_pack_tile_bam_results_publish_immediately( void ) {
+  test_pack_tile_harness_t h[1];
+  test_pack_tile_out_t     other[1];
+  fd_rng_t                 pack_rng[1];
+  uchar                    buf[ FD_TPU_RESOLVED_MTU ] __attribute__((aligned(FD_CHUNK_ALIGN)));
+
+  test_pack_tile_harness_new( h );
+  test_pack_tile_out_new( other );
+  void * pack_mem = test_pack_tile_bam_attach_real_pack( h, pack_rng, 8UL );
+  test_cancel_use_real_pack = 1;
+  fd_txn_p_t invalid_txn[1], valid_txn[1];
+  test_pack_tile_make_d18_poc_txns( invalid_txn, valid_txn );
+  uchar const * payload    = valid_txn->payload;
+  ulong         payload_sz = valid_txn->payload_sz;
+
+  /* during_frag answers a member that failed preprocessing */
+  ulong sz = test_pack_tile_prepare_bam_resolv_frag( h, buf, payload, payload_sz, 410U, 0U, 0U, 600UL, 0U, 1U, 0, 500UL, 80U );
+  ((fd_txn_m_t *)buf)->bam.preprocess_failed = 1U;
+  during_frag( h->ctx, 0UL, 0UL, 500UL, 0UL, sz, 0UL );
+  FD_TEST( test_pack_tile_result_cnt( h )==1UL );
+  fd_bam_bundle_result_t const * res = test_pack_tile_assert_last_result( h, 410U, 600UL, 1U, FD_BAM_SCHED_ERR_NONE, 0U );
+  FD_TEST( res->bundle_err==FD_BAM_BUNDLE_ERR_DESER && !res->deser_index );
+  after_frag( h->ctx, 0UL, 0UL, 500UL, sz, 0UL, 0UL, &other->stem );
+  FD_TEST( test_pack_tile_result_cnt( h )==1UL );
+
+  /* during_frag answers a partial batch the next batch abandons; the
+     next batch's insertion in after_frag publishes nothing */
+  test_pack_tile_send_bam_resolv_frag( h, 411U, 0U, 0U, 600UL, 0U, 2U, 1, 500UL, 81U );
+  FD_TEST( test_pack_tile_result_cnt( h )==1UL );
+  sz = test_pack_tile_prepare_bam_resolv_frag( h, buf, payload, payload_sz, 412U, 0U, 0U, 600UL, 0U, 1U, 0, 500UL, 82U );
+  during_frag( h->ctx, 0UL, 0UL, 500UL, 0UL, sz, 0UL );
+  FD_TEST( test_pack_tile_result_cnt( h )==2UL );
+  res = test_pack_tile_assert_last_result( h, 411U, 600UL, 2U, FD_BAM_SCHED_ERR_NONE, 0U );
+  FD_TEST( res->bundle_err==FD_BAM_BUNDLE_ERR_DESER && res->deser_index==1U );
+  after_frag( h->ctx, 0UL, 0UL, 500UL, sz, 0UL, 0UL, &other->stem );
+  FD_TEST( test_pack_tile_result_cnt( h )==2UL );
+  FD_TEST( h->ctx->bam_work_cnt==1UL && h->ctx->bam_work[ 0 ].seq_id==412U );
+
+  /* after_frag answers a complete batch for a closed slot */
+  h->ctx->bam_min_admission_slot = 601UL;
+  sz = test_pack_tile_prepare_bam_resolv_frag( h, buf, payload, payload_sz, 413U, 0U, 0U, 600UL, 0U, 1U, 0, 500UL, 83U );
+  during_frag( h->ctx, 0UL, 0UL, 500UL, 0UL, sz, 0UL );
+  FD_TEST( test_pack_tile_result_cnt( h )==2UL );
+  after_frag( h->ctx, 0UL, 0UL, 500UL, sz, 0UL, 0UL, &other->stem );
+  FD_TEST( test_pack_tile_result_cnt( h )==3UL );
+  test_pack_tile_assert_last_result( h, 413U, 600UL, 1U, FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U );
+
+  for( ulong i=0UL; i<4UL; i++ ) FD_TEST( !other->seqs[ i ] );
+  test_pack_tile_out_delete( other );
+  test_pack_tile_harness_delete( h );
+  free( pack_mem );
 }
 
 /* Drive the actual Pack callbacks with a real two-worker pack and distinct
@@ -2489,6 +2564,7 @@ typedef struct {
   fd_rng_t rng[1];
   void * pack_mem;
   void * exec_dcache_mem[2];
+  void * poh_dcache_mem;
   ulong status;
   ulong generation;
   ulong busy[2];
@@ -2514,8 +2590,16 @@ test_pack_callbacks_new( test_pack_callbacks_t * e,
   ctx->bam_override_snapshot = 1;
   ctx->bam_leader_out.out_idx = ULONG_MAX;
   ctx->bam_result_out.out_idx = 2UL;
-  ctx->poh_out = (fd_pack_out_ctx_t){ .out_idx=1UL, .mem=(fd_wksp_t *)e->h->out->dcache,
-      .chunk0=ctx->bam_result_out.chunk0, .chunk=ctx->bam_result_out.chunk0, .wmark=ctx->bam_result_out.wmark };
+  {
+    ulong data_sz = fd_dcache_req_data_sz( sizeof(fd_done_packing_t), TEST_PACK_TILE_MCACHE_DEPTH, 1UL, 1 );
+    e->poh_dcache_mem = aligned_alloc( fd_dcache_align(), fd_dcache_footprint( data_sz, 0UL ) );
+    FD_TEST( e->poh_dcache_mem );
+    void * dc = fd_dcache_join( fd_dcache_new( e->poh_dcache_mem, data_sz, 0UL ) );
+    FD_TEST( dc );
+    ulong chunk0 = fd_dcache_compact_chunk0( dc, dc );
+    ctx->poh_out = (fd_pack_out_ctx_t){ .out_idx=1UL, .mem=dc, .chunk0=chunk0, .chunk=chunk0,
+        .wmark=fd_dcache_compact_wmark( dc, dc, sizeof(fd_done_packing_t) ) };
+  }
   for( ulong i=0UL; i<2UL; i++ ) {
     ulong data_sz = fd_dcache_req_data_sz( MAX_MICROBLOCK_SZ, TEST_PACK_TILE_MCACHE_DEPTH, 1UL, 1 );
     e->exec_dcache_mem[i] = aligned_alloc( fd_dcache_align(), fd_dcache_footprint( data_sz, 0UL ) );
@@ -2543,6 +2627,7 @@ test_pack_callbacks_delete( test_pack_callbacks_t * e ) {
   fd_rng_delete( fd_rng_leave( e->rng ) );
   free( e->pack_mem );
   for( ulong i=0UL; i<2UL; i++ ) free( e->exec_dcache_mem[i] );
+  free( e->poh_dcache_mem );
   test_pack_tile_harness_delete( e->h );
 }
 
@@ -2720,39 +2805,38 @@ test_pack_tile_bam_target_slot_callbacks( void ) {
     test_pack_callbacks_insert( e, 41U, 105UL, revert );
     FD_TEST( ctx->bam_current_slot_has_bam_work );
     test_pack_callbacks_insert( e, 42U, 104UL, revert );
-    FD_TEST( pack_tile_bam_pending_work_cnt( ctx )==2UL );
+    FD_TEST( ctx->bam_work_cnt==2UL );
     test_pack_callbacks_step( e );
     test_pack_callbacks_step( e );
-    FD_TEST( test_pack_callbacks_dispatch_count( e )==2UL && ctx->bam_scheduled_work_cnt==2UL );
+    /* Dispatch retires each batch from tracking. */
+    FD_TEST( test_pack_callbacks_dispatch_count( e )==2UL && !ctx->bam_work_cnt );
+    FD_TEST( ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ]==2UL );
     for( ulong i=0UL; i<2UL; i++ ) {
       fd_microblock_execle_trailer_t const * trailer;
       fd_txn_e_t const * txn = test_pack_callbacks_output( e, i, &trailer );
       FD_TEST( txn->bam.seq_id==(uint)(41UL+i) && txn->bam.revert_on_error==(uchar)revert );
       FD_TEST( trailer->bank_idx==104UL && trailer->bank_seq==1104UL );
-      /* Dispatched work is tracked under its dispatch slot. */
-      FD_TEST( ctx->bam_work[ i ].max_schedule_slot==104UL );
     }
 
-    /* Leader start retires stale scheduled tracking by dispatch slot. */
+    /* Leader start finds no dispatched work to answer. */
     test_pack_callbacks_leader( e, 105UL );
     FD_TEST( ctx->bam_min_admission_slot==105UL && !ctx->bam_work_cnt );
-    FD_TEST( !ctx->bam_pending_result_cnt );
+    FD_TEST( !test_pack_tile_result_cnt( e->h ) );
 
     test_pack_callbacks_insert( e, 45U, ULONG_MAX, revert );
-    FD_TEST( !pack_tile_bam_pending_work_cnt( ctx ) && ctx->bam_pending_result_cnt==1UL );
-    fd_bam_bundle_result_t const * res = &ctx->bam_result_queue[ ctx->bam_result_queue_head ];
-    FD_TEST( res->seq_id==45U && res->scheduling_error==FD_BAM_SCHED_ERR_OUTSIDE_SLOT );
+    FD_TEST( !ctx->bam_work_cnt && test_pack_tile_result_cnt( e->h )==1UL );
+    test_pack_tile_assert_last_result( e->h, 45U, ULONG_MAX, 1U, FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U );
 
     /* A backward leader slot is below the closed-slot floor, so even a
        future target stays pending. */
     test_pack_callbacks_leader( e, 104UL );
     test_pack_callbacks_insert( e, 46U, 106UL, revert );
-    FD_TEST( pack_tile_bam_pending_work_cnt( ctx )==1UL );
+    FD_TEST( ctx->bam_work_cnt==1UL );
     e->busy[0] = ctx->execle_expect[0];
     e->busy[1] = ctx->execle_expect[1];
     for( ulong j=0UL; j<8UL; j++ ) test_pack_callbacks_step( e );
     FD_TEST( !ctx->drain_execle && ctx->execle_idle_bitset==3UL );
-    FD_TEST( test_pack_callbacks_dispatch_count( e )==2UL && pack_tile_bam_pending_work_cnt( ctx )==1UL );
+    FD_TEST( test_pack_callbacks_dispatch_count( e )==2UL && ctx->bam_work_cnt==1UL );
     test_pack_callbacks_delete( e );
   }
 }
@@ -2775,7 +2859,7 @@ test_pack_tile_bam_secondary_callbacks( void ) {
     test_pack_callbacks_step( e );
     FD_TEST( ctx->execle_idle_bitset==2UL );
     test_pack_callbacks_step( e );
-    FD_TEST( !ctx->execle_idle_bitset && ctx->bam_scheduled_work_cnt==2UL );
+    FD_TEST( !ctx->execle_idle_bitset && !ctx->bam_work_cnt );
     FD_TEST( ctx->pack_idx==2U && test_pack_callbacks_dispatch_count( e )==2UL );
     FD_TEST( e->h->out->seqs[0]==1UL && e->h->out->seqs[3]==1UL );
     FD_TEST( test_bundle_cancel_call_cnt==cancels );
@@ -2807,9 +2891,9 @@ test_pack_tile_bam_conflict_lookahead_callbacks( void ) {
     test_pack_callbacks_insert_with_payer( e, 82U, scenario==1 ? 105UL : 104UL, revert, 100UL, 11U );
     test_pack_callbacks_insert_with_payer( e, 83U, scenario==2 ? 105UL : 104UL, revert, 100UL, scenario==6 ? 11U : 12U );
     if( scenario==1 || scenario==2 )
-      FD_TEST( pack_tile_bam_pending_work_cnt( ctx )==2UL && !ctx->bam_pending_result_cnt );
+      FD_TEST( ctx->bam_work_cnt==2UL && !test_pack_tile_result_cnt( e->h ) );
     /* Readiness for each skipped/selected batch comes from its own sidecar. */
-    for( ulong i=ctx->bam_scheduled_work_cnt; i<ctx->bam_work_cnt; i++ ) {
+    for( ulong i=0UL; i<ctx->bam_work_cnt; i++ ) {
       pack_bam_work_t * w = &ctx->bam_work[i];
       if( w->seq_id==83U && scenario==3 ) w->scheduler_gen++;
       if( w->seq_id==83U && scenario==4 ) w->txn_cnt++;
@@ -2820,13 +2904,14 @@ test_pack_tile_bam_conflict_lookahead_callbacks( void ) {
     /* As in jito-solana, a future target (scenarios 1 and 2) is ready. */
     ulong expected = scenario<=2 ? 2UL : 1UL;
     FD_TEST( test_pack_callbacks_dispatch_count( e )==expected );
-    FD_TEST( ctx->bam_scheduled_work_cnt==expected );
+    FD_TEST( ctx->bam_work_cnt==3UL-expected );
+    FD_TEST( ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ]==expected );
     if( scenario<=2 ) {
       fd_microblock_execle_trailer_t const * trailer;
       fd_txn_e_t const * txn = test_pack_callbacks_output( e, 1UL, &trailer );
       FD_TEST( txn->bam.seq_id==83U && trailer->bank_idx==104UL );
       FD_TEST( trailer->is_bundle==(uchar)revert && ctx->pack_idx==2U );
-      FD_TEST( pack_tile_bam_pending_work_cnt( ctx )==1UL );
+      FD_TEST( ctx->bam_work_cnt==1UL );
       /* B keeps its original ordering behind A despite C's dispatch. */
       e->busy[0] = ctx->execle_expect[0];
       for( ulong i=0UL; i<4UL; i++ ) test_pack_callbacks_step( e );
@@ -2838,8 +2923,52 @@ test_pack_tile_bam_conflict_lookahead_callbacks( void ) {
   }
 }
 
+/* With a real Pack, a duplicate of pending work is rejected
+   CONTAINER_FULL unless it is a same-sequence resend, which replaces
+   the work.  Once dispatched, the batch is untracked and Pack no longer
+   holds it, so a duplicate of either kind is inserted without a
+   result. */
 static void
-test_pack_tile_bam_ordinal_wrap_tracks_every_dispatched_batch( void ) {
+test_pack_tile_bam_duplicate_callbacks( void ) {
+  for( int revert=0; revert<2; revert++ )
+  for( int cross_seq=0; cross_seq<2; cross_seq++ ) {
+    test_pack_callbacks_t e[1];
+    fd_pack_ctx_t * ctx = test_pack_callbacks_new( e, FD_PACK_STRATEGY_BALANCED );
+    /* (uchar)297==41, so both seq_ids insert the same transaction */
+    uint dup_seq_id = cross_seq ? 297U : 41U;
+    test_pack_callbacks_leader( e, 104UL );
+    test_pack_callbacks_insert( e, 41U, 104UL, revert );
+    FD_TEST( ctx->bam_work_cnt==1UL && fd_pack_avail_txn_cnt( ctx->pack )==1UL );
+    uchar sig[ sizeof(fd_ed25519_sig_t) ];
+    fd_memcpy( sig, ctx->bam_work[ 0 ].sig[ 0 ], sizeof(sig) );
+
+    test_pack_callbacks_insert( e, dup_seq_id, 104UL, revert );
+    FD_TEST( ctx->bam_work_cnt==1UL && ctx->bam_work[ 0 ].seq_id==41U );
+    FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==1UL );
+    FD_TEST( test_pack_tile_result_cnt( e->h )==(ulong)cross_seq );
+    if( cross_seq ) test_pack_tile_assert_last_result( e->h, 297U, 104UL, 1U, FD_BAM_SCHED_ERR_CONTAINER_FULL, 0U );
+    ulong results = test_pack_tile_result_cnt( e->h );
+
+    test_pack_callbacks_step( e );
+    FD_TEST( test_pack_callbacks_dispatch_count( e )==1UL );
+    FD_TEST( !ctx->bam_work_cnt && !fd_pack_avail_txn_cnt( ctx->pack ) );
+    ulong cancels = test_bundle_cancel_call_cnt;
+    test_pack_callbacks_insert( e, dup_seq_id, 104UL, revert );
+    FD_TEST( test_pack_tile_result_cnt( e->h )==results );
+    FD_TEST( test_bundle_cancel_call_cnt==cancels );
+    FD_TEST( ctx->bam_work_cnt==1UL && ctx->bam_work[ 0 ].seq_id==dup_seq_id );
+    FD_TEST( !memcmp( ctx->bam_work[ 0 ].sig[ 0 ], sig, sizeof(sig) ) );
+    FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==1UL );
+    FD_TEST( fd_pack_contains_bam_bundle( ctx->pack, (fd_ed25519_sig_t const *)(void const *)sig, dup_seq_id, 9U, 1 ) );
+    FD_TEST( ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ]==1UL );
+    FD_TEST( ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_ACCEPTED_IDX ]==3UL-(ulong)cross_seq );
+    FD_TEST( ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_REJECTED_PRE_PENDING_IDX ]==(ulong)cross_seq );
+    test_pack_callbacks_delete( e );
+  }
+}
+
+static void
+test_pack_tile_bam_ordinal_wrap_retires_every_dispatched_batch( void ) {
   test_pack_callbacks_t e[1];
   fd_pack_ctx_t * ctx = test_pack_callbacks_new( e, FD_PACK_STRATEGY_BALANCED );
   test_pack_callbacks_insert( e, 42U, 200UL, 0 );
@@ -2871,18 +3000,18 @@ test_pack_tile_bam_ordinal_wrap_tracks_every_dispatched_batch( void ) {
     if( !(i & 1023UL) ) test_pack_callbacks_step( e );
   }
   FD_TEST( !test_pack_callbacks_dispatch_count( e ) );
-  FD_TEST( ctx->bam_work_cnt==2UL && pack_tile_bam_pending_work_cnt( ctx )==2UL );
-  FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==2UL && !ctx->bam_pending_result_cnt );
+  FD_TEST( ctx->bam_work_cnt==2UL );
+  FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==2UL && !test_pack_tile_result_cnt( e->h ) );
 
   test_pack_callbacks_leader( e, 200UL );
   for( int i=0; i<4 && (ctx->drain_execle || fd_pack_avail_txn_cnt( ctx->pack )); i++ )
     test_pack_callbacks_step( e );
-  FD_TEST( !fd_pack_avail_txn_cnt( ctx->pack ) );
-  FD_TEST( ctx->bam_scheduled_work_cnt==2UL && !pack_tile_bam_pending_work_cnt( ctx ) );
+  FD_TEST( !fd_pack_avail_txn_cnt( ctx->pack ) && !ctx->bam_work_cnt );
+  FD_TEST( ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ]==2UL );
 
   /* Renumbering preserves distinct singleton batches in their original
-     FIFO order, and both must remain tracked through completion.  Pack
-     emptied in two microblocks, so each carries one transaction. */
+     FIFO order, and each leaves tracking when dispatched.  Pack emptied
+     in two microblocks, so each carries one transaction. */
   FD_TEST( test_pack_callbacks_dispatch_count( e )==2UL );
   fd_ed25519_sig_t signatures[2];
   for( ulong i=0UL; i<2UL; i++ ) {
@@ -2890,12 +3019,12 @@ test_pack_tile_bam_ordinal_wrap_tracks_every_dispatched_batch( void ) {
     fd_txn_e_t const * out = test_pack_callbacks_output( e, i, &trailer );
     FD_TEST( out->bam.seq_id==42U+i && out->txnp->source_tpu==FD_TXN_M_TPU_SOURCE_BAM && !out->bam.batch_idx );
     fd_memcpy( signatures[i], fd_txn_get_signatures( TXN(out->txnp), out->txnp->payload ), sizeof(fd_ed25519_sig_t) );
-    FD_TEST( pack_tile_bam_work_find( ctx, signatures[i], 1, NULL )<ctx->bam_scheduled_work_cnt );
+    FD_TEST( pack_tile_bam_work_find( ctx, signatures[i], NULL )==ctx->bam_work_cnt );
   }
-  for( ulong i=0UL; i<2UL; i++ )
-    test_pack_tile_send_executed_txn( e->h, signatures[i], FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED );
-  FD_TEST( !ctx->bam_work_cnt && !ctx->bam_scheduled_work_cnt && !ctx->bam_pending_result_cnt );
-  FD_TEST( ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_COMPLETED_UNLANDED_IDX ]==2UL );
+  /* Their execution reaches pack with nothing left to answer. */
+  for( ulong i=0UL; i<2UL; i++ ) test_pack_tile_send_txn_executed( e->h, signatures[i] );
+  FD_TEST( !ctx->bam_work_cnt && !test_pack_tile_result_cnt( e->h ) );
+  FD_TEST( ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ]==2UL );
   test_pack_callbacks_delete( e );
 }
 
@@ -3032,7 +3161,7 @@ test_pack_tile_retention_callbacks( void ) {
   test_pack_tile_make_d26_poc_txn( nonce, 1 );
 
   test_pack_callbacks_insert_at( e, 88U, 501UL, 0, 10UL );
-  FD_TEST( pack_tile_bam_pending_work_cnt( ctx )==1UL );
+  FD_TEST( ctx->bam_work_cnt==1UL );
   test_pack_tile_insert_pending_single( ctx->pack, nonce, 99UL );
   test_pack_tile_insert_pending_single( ctx->pack, ordinary, 239UL );
   FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==3UL );
@@ -3046,13 +3175,13 @@ test_pack_tile_retention_callbacks( void ) {
   after_frag( ctx, 0UL, 0UL, 400UL, sz, 0UL, 0UL, &e->h->out->stem );
   FD_TEST( ctx->highest_observed_block_height==400UL && ctx->leader_slot==ULONG_MAX );
   FD_TEST( FD_MCNT_GET( PACK, TXN_DROPPED_EXPIRED )==expired_before+1UL );
-  FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==2UL && pack_tile_bam_pending_work_cnt( ctx )==1UL );
+  FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==2UL && ctx->bam_work_cnt==1UL );
 
   test_pack_tile_insert_pending_single( ctx->pack, ordinary, 340UL );
   FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==3UL );
   test_pack_callbacks_leader( e, 501UL );
   FD_TEST( FD_MCNT_GET( PACK, TXN_DROPPED_EXPIRED )==expired_before+2UL );
-  FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==2UL && pack_tile_bam_pending_work_cnt( ctx )==1UL );
+  FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==2UL && ctx->bam_work_cnt==1UL );
   FD_TEST( fd_pack_delete_transaction( ctx->pack,
              fd_txn_get_signatures( TXN(nonce), nonce->payload ) )==1UL );
   FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==1UL );
@@ -3068,22 +3197,22 @@ test_pack_tile_bam_blockhash_height_is_not_validity( void ) {
     fd_pack_ctx_t * ctx = test_pack_callbacks_new( e, FD_PACK_STRATEGY_BALANCED );
     FD_TEST( ctx->leader_slot==ULONG_MAX );
     test_pack_callbacks_insert_at( e, 71U, 400UL, revert, 10UL );
-    FD_TEST( pack_tile_bam_pending_work_cnt( ctx )==1UL );
+    FD_TEST( ctx->bam_work_cnt==1UL );
     test_pack_callbacks_insert_at( e, 72U, 400UL, revert, 1000UL );
     FD_TEST( ctx->highest_observed_block_height==1000UL );
     FD_TEST( ctx->leader_slot==ULONG_MAX );
-    FD_TEST( pack_tile_bam_pending_work_cnt( ctx )==2UL );
+    FD_TEST( ctx->bam_work_cnt==2UL );
     FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==2UL );
-    FD_TEST( !ctx->bam_pending_result_cnt );
+    FD_TEST( !test_pack_tile_result_cnt( e->h ) );
     /* Same observed history, actual execution bank at slot 400.  The
        old known hash and unknown-hash fallback must both survive. */
     test_pack_callbacks_leader( e, 400UL );
-    FD_TEST( pack_tile_bam_pending_work_cnt( ctx )==2UL );
+    FD_TEST( ctx->bam_work_cnt==2UL );
     FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==2UL );
     test_pack_callbacks_insert_at( e, 73U, 400UL, revert, 0UL );
-    FD_TEST( pack_tile_bam_pending_work_cnt( ctx )==3UL );
+    FD_TEST( ctx->bam_work_cnt==3UL );
     FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==3UL );
-    FD_TEST( !ctx->bam_pending_result_cnt );
+    FD_TEST( !test_pack_tile_result_cnt( e->h ) );
     test_pack_callbacks_step( e );
     FD_TEST( test_pack_callbacks_dispatch_count( e )==1UL );
     fd_microblock_execle_trailer_t const * trailer;
@@ -3093,8 +3222,13 @@ test_pack_tile_bam_blockhash_height_is_not_validity( void ) {
     /* Closing the actual target still retires all unscheduled members. */
     test_pack_tile_finish_leader_slot( e, "test" );
     FD_TEST( ctx->bam_min_admission_slot==401UL );
-    FD_TEST( !pack_tile_bam_pending_work_cnt( ctx ) );
+    FD_TEST( !ctx->bam_work_cnt );
     FD_TEST( !fd_pack_avail_txn_cnt( ctx->pack ) );
+    FD_TEST( test_pack_tile_result_cnt( e->h )==2UL );
+    uint seq_id0 = test_pack_tile_result( e->h, 0UL )->seq_id;
+    FD_TEST( seq_id0==72U || seq_id0==73U );
+    test_pack_tile_assert_result( test_pack_tile_result( e->h, 0UL ), seq_id0,     400UL, 1U, FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U );
+    test_pack_tile_assert_result( test_pack_tile_result( e->h, 1UL ), 145U-seq_id0, 400UL, 1U, FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U );
     test_pack_callbacks_delete( e );
   }
 }
@@ -3108,9 +3242,10 @@ test_pack_tile_bam_closed_admission_callbacks( void ) {
   test_pack_tile_finish_leader_slot( e, "test" );
   FD_TEST( ctx->bam_min_admission_slot==105UL && ctx->leader_slot==ULONG_MAX );
   test_pack_callbacks_insert( e, 61U, 104UL, 0 );
-  FD_TEST( !pack_tile_bam_pending_work_cnt( ctx ) && ctx->bam_pending_result_cnt==1UL );
+  FD_TEST( !ctx->bam_work_cnt && test_pack_tile_result_cnt( e->h )==1UL );
+  test_pack_tile_assert_last_result( e->h, 61U, 104UL, 1U, FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U );
   test_pack_callbacks_insert( e, 62U, 105UL, 1 );
-  FD_TEST( pack_tile_bam_pending_work_cnt( ctx )==1UL );
+  FD_TEST( ctx->bam_work_cnt==1UL );
   FD_TEST( ctx->highest_observed_block_height==100UL );
   /* Scheduling floors remain authoritative even though observed hash
      slots no longer constrain validity.  Unknown current slots are explicit. */
@@ -3122,55 +3257,41 @@ test_pack_tile_bam_closed_admission_callbacks( void ) {
   /* An unexpected backward bank does not reopen the closed slot. */
   test_pack_callbacks_leader( e, 103UL );
   test_pack_callbacks_insert( e, 63U, 104UL, 0 );
-  FD_TEST( pack_tile_bam_pending_work_cnt( ctx )==1UL && ctx->bam_min_admission_slot==105UL );
+  FD_TEST( ctx->bam_work_cnt==1UL && ctx->bam_min_admission_slot==105UL );
   /* Skip the target: rejection retains its original slot. */
   test_pack_callbacks_leader( e, 106UL );
-  FD_TEST( !pack_tile_bam_pending_work_cnt( ctx ) );
+  FD_TEST( !ctx->bam_work_cnt );
   FD_TEST( !test_pack_callbacks_dispatch_count( e ) );
   test_pack_callbacks_delete( e );
 }
 
+/* Results do not wait for after_credit.  A result decided while pack
+   skips and drains after_credit, with the result link out of credits,
+   is already on the link: pack_bam_res has no reliable consumer, so it
+   takes no credits.  after_credit then publishes nothing. */
 static void
-test_pack_tile_bam_result_drain_before_skip( void ) {
+test_pack_tile_bam_results_publish_while_skipping( void ) {
   test_pack_callbacks_t e[1];
   fd_pack_ctx_t * ctx = test_pack_callbacks_new( e, FD_PACK_STRATEGY_BALANCED );
-  ctx->drain_execle = 1;
+  test_pack_callbacks_leader( e, 104UL );
+  test_pack_tile_finish_leader_slot( e, "skip" );
+  FD_TEST( ctx->drain_execle && ctx->bam_min_admission_slot==105UL );
   ctx->execle_idle_bitset = 0UL;
-  /* after_credit runs only when every output has STEM_BURST credits.
-     Exercise real credit consumption, including an undrained FIFO tail
-     that must survive until the result consumer returns credit. */
-  for( ulong i=0UL; i<4UL; i++ ) e->h->out->cr_avail[i] = TEST_PACK_TILE_MCACHE_DEPTH;
-  e->h->out->cr_avail[2] = 4UL;
-  e->h->out->min_cr_avail = 4UL;
-  e->h->out->stem.cr_decrement_amount = 1UL;
-  fd_bam_bundle_result_t result = fd_bam_result_base( 70U, 9U, 104UL, 1U );
-  for( int i=0; i<4; i++ ) {
-    result.seq_id = (uint)(70+i);
-    FD_TEST( pack_tile_enqueue_bam_result( ctx, &result ) );
-  }
   ctx->skip_cnt = 100L;
-  for( ulong i=1UL; i<=3UL; i++ ) {
-    FD_TEST( e->h->out->min_cr_avail>=2UL ); /* Pack's STEM_BURST */
+  e->h->out->out_reliable[2] = 0;
+  e->h->out->cr_avail[2]     = 0UL;
+  for( uint i=0U; i<4U; i++ ) {
+    ulong results = test_pack_tile_result_cnt( e->h );
+    test_pack_callbacks_insert( e, 70U+i, 104UL, 0 );
+    FD_TEST( test_pack_tile_result_cnt( e->h )==results+1UL );
+    FD_TEST( test_pack_tile_assert_last_result( e->h, 70U+i, 104UL, 1U, FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U )->scheduler_gen==9U );
+    FD_TEST( !e->h->out->cr_avail[2] );
     int poll=1, busy=0;
     after_credit( ctx, &e->h->out->stem, &poll, &busy );
-    FD_TEST( busy && e->h->out->seqs[2]==i && ctx->bam_pending_result_cnt==4UL-i );
-    FD_TEST( e->h->out->cr_avail[2]==4UL-i && e->h->out->min_cr_avail==4UL-i );
-    fd_frag_meta_t const * meta = &e->h->out->mcaches[2][i-1UL];
-    fd_bam_bundle_result_t const * published = fd_chunk_to_laddr_const( e->h->out->dcache, meta->chunk );
-    FD_TEST( published->seq_id==(uint)(69UL+i) && published->scheduler_gen==9U && published->slot==104UL );
-    FD_TEST( ctx->drain_execle );
-    FD_TEST( !test_pack_callbacks_dispatch_count( e ) && !e->h->out->seqs[1] );
+    FD_TEST( test_pack_tile_result_cnt( e->h )==results+1UL );
+    FD_TEST( ctx->drain_execle && ctx->skip_cnt==99L-(long)i );
+    FD_TEST( !test_pack_callbacks_dispatch_count( e ) );
   }
-  FD_TEST( e->h->out->min_cr_avail<2UL && ctx->bam_pending_result_cnt==1UL );
-  FD_TEST( ctx->bam_result_queue[ctx->bam_result_queue_head].seq_id==73U );
-  /* Stem resumes the credited callback once the consumer advances. */
-  e->h->out->cr_avail[2] = e->h->out->min_cr_avail = 2UL;
-  int poll=1, busy=0;
-  after_credit( ctx, &e->h->out->stem, &poll, &busy );
-  FD_TEST( busy && !ctx->bam_pending_result_cnt && e->h->out->seqs[2]==4UL );
-  FD_TEST( e->h->out->cr_avail[2]==1UL && e->h->out->min_cr_avail==1UL );
-  FD_TEST( ctx->drain_execle );
-  FD_TEST( !test_pack_callbacks_dispatch_count( e ) && !e->h->out->seqs[1] );
   test_pack_callbacks_delete( e );
 }
 
@@ -3252,7 +3373,7 @@ test_pack_tile_bam_initializer_generation_callbacks( void ) {
     pack_tile_sync_bam_ownership_generation( ctx );
     FD_TEST( e->generation==(8UL<<1) && ctx->bam_ownership_gen==8U );
     FD_TEST( e->status==FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE && ctx->bam_override_snapshot );
-    FD_TEST( !pack_tile_bam_pending_work_cnt( ctx ) );
+    FD_TEST( !ctx->bam_work_cnt );
     if( scenario<2 ) {
       FD_TEST( !fd_pack_avail_txn_cnt( ctx->pack ) && !ctx->bam_ib_associated && !ctx->crank->ib_inserted );
       FD_TEST( !memcmp( ctx->crank->prev_config, ctx->bam_prev_config_before_ib, sizeof(expected) ) );
@@ -3263,7 +3384,7 @@ test_pack_tile_bam_initializer_generation_callbacks( void ) {
     test_pack_callbacks_insert( e, 82U, 104UL, 0 );
     if( scenario==2 || scenario==3 ) {
       test_pack_callbacks_step( e );
-      FD_TEST( test_pack_callbacks_dispatch_count( e )==1UL && pack_tile_bam_pending_work_cnt( ctx )==1UL );
+      FD_TEST( test_pack_callbacks_dispatch_count( e )==1UL && ctx->bam_work_cnt==1UL );
       /* Only the real initializer rebate releases Pending.  As in
          jito-solana, Failed blocks BAM work for the rest of the slot. */
       ctx->rebate->rebate->ib_result = scenario==2 ? 1 : 2;
@@ -3275,11 +3396,13 @@ test_pack_tile_bam_initializer_generation_callbacks( void ) {
     if( scenario<2 ) fd_pack_set_initializer_bundles_ready( ctx->pack );
     test_pack_callbacks_step( e );
     if( scenario==3 ) {
-      FD_TEST( !ctx->bam_scheduled_work_cnt && pack_tile_bam_pending_work_cnt( ctx )==1UL );
+      FD_TEST( ctx->bam_work_cnt==1UL );
+      FD_TEST( !ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ] );
       test_pack_callbacks_delete( e );
       continue;
     }
-    FD_TEST( ctx->bam_scheduled_work_cnt==1UL && !pack_tile_bam_pending_work_cnt( ctx ) );
+    FD_TEST( !ctx->bam_work_cnt );
+    FD_TEST( ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_SCHEDULED_IDX ]==1UL );
     fd_microblock_execle_trailer_t const * trailer;
     fd_txn_e_t const * txn = test_pack_callbacks_output( e, (ulong)(scenario>=2), &trailer );
     FD_TEST( txn->bam.seq_id==82U && trailer->bank_idx==104UL );
@@ -3316,7 +3439,7 @@ test_pack_tile_bam_readiness_identity_and_mode( void ) {
   candidate = fd_pack_peek_bundle_candidate( ctx->pack, 1, &hint, NULL );
   pack_tile_bam_index_remove_work( ctx, 0UL );
   FD_TEST( !pack_tile_bam_candidate_ready( ctx, candidate ) );
-  pack_tile_bam_index_insert_work( ctx, 0UL, 1U );
+  pack_tile_bam_index_insert_work( ctx, 0UL );
   FD_TEST( ctx->bam_candidate_identity_mismatch_cnt>=3UL );
   test_pack_callbacks_step( e );
   FD_TEST( test_pack_callbacks_dispatch_count( e )==1UL );
@@ -3346,8 +3469,9 @@ test_pack_tile_bam_expired_head_refreshes_crank_readiness( void ) {
   FD_TEST( test_bundle_cancel_call_cnt==cancels+1UL ); /* new head's crank preparation */
   FD_TEST( ctx->crank->metrics[2]==1UL ); /* invalid config, before signing */
   /* The failed crank leaves the builder's tip configuration unapplied. */
-  FD_TEST( ctx->bam_pending_result_cnt==1UL && !ctx->bam_scheduled_work_cnt );
-  FD_TEST( pack_tile_bam_pending_work_cnt( ctx )==1UL && !test_pack_callbacks_dispatch_count( e ) );
+  FD_TEST( test_pack_tile_result_cnt( e->h )==1UL );
+  test_pack_tile_assert_last_result( e->h, 95U, 104UL, 1U, FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U );
+  FD_TEST( ctx->bam_work_cnt==1UL && !test_pack_callbacks_dispatch_count( e ) );
   test_pack_callbacks_delete( e );
 }
 
@@ -3483,7 +3607,7 @@ test_pack_tile_bam_crank_binds_dispatch_to_builder( void ) {
     else          FD_TEST( next-before>=(long)(0.99e6*ctx->clock->epoch->w) );
     test_pack_callbacks_steps( e, 64UL );
     test_pack_callbacks_count( e, &bam_cnt, &ib_cnt );
-    FD_TEST( bam_cnt==2UL && !ib_cnt && pack_tile_bam_pending_work_cnt( ctx )==1UL );
+    FD_TEST( bam_cnt==2UL && !ib_cnt && ctx->bam_work_cnt==1UL );
     FD_TEST( ctx->crank->metrics[2]+ctx->crank->metrics[3]+ctx->crank->metrics[1]==1UL );
     FD_TEST( test_crank_sign_cnt==(ulong)( hole>0 ) );
     ctx->bam_crank_next_ticks = next;
@@ -3510,7 +3634,7 @@ test_pack_tile_bam_crank_binds_dispatch_to_builder( void ) {
       }
       test_pack_callbacks_ib_landed( e, 1 );
       test_pack_callbacks_count( e, &bam_cnt, &ib_cnt );
-      FD_TEST( bam_cnt==3UL && !pack_tile_bam_pending_work_cnt( ctx ) );
+      FD_TEST( bam_cnt==3UL && !ctx->bam_work_cnt );
     } else {
       /* The deferred initializer leaves with the slot; the next slot cranks
          again from the restored configuration and BAM work follows it. */
@@ -3527,7 +3651,7 @@ test_pack_tile_bam_crank_binds_dispatch_to_builder( void ) {
       FD_TEST( bam_cnt==2UL && ib_cnt==1UL && ctx->crank->metrics[1]==2UL && ctx->bam_tip_cfg_version==4U );
       test_pack_callbacks_ib_landed( e, 1 );
       test_pack_callbacks_count( e, &bam_cnt, &ib_cnt );
-      FD_TEST( bam_cnt==3UL && !pack_tile_bam_pending_work_cnt( ctx ) );
+      FD_TEST( bam_cnt==3UL && !ctx->bam_work_cnt );
     }
     test_pack_callbacks_delete( e );
   }
@@ -3573,7 +3697,7 @@ test_pack_tile_bam_activation_requires_bam_crank( void ) {
   test_pack_callbacks_steps( e, 16UL );
   ulong bam_cnt, ib_cnt;
   test_pack_callbacks_count( e, &bam_cnt, &ib_cnt );
-  FD_TEST( !bam_cnt && !ib_cnt && pack_tile_bam_pending_work_cnt( ctx )==1UL );
+  FD_TEST( !bam_cnt && !ib_cnt && ctx->bam_work_cnt==1UL );
 
   /* A usable BAM builder cranks; its initializer lands, then the batch runs. */
   test_pack_callbacks_builder_fill( e, 0x62, 4U );
@@ -3583,7 +3707,7 @@ test_pack_tile_bam_activation_requires_bam_crank( void ) {
   FD_TEST( !bam_cnt && ib_cnt==1UL );
   test_pack_callbacks_ib_landed( e, 1 );
   test_pack_callbacks_count( e, &bam_cnt, &ib_cnt );
-  FD_TEST( bam_cnt==1UL && !pack_tile_bam_pending_work_cnt( ctx ) );
+  FD_TEST( bam_cnt==1UL && !ctx->bam_work_cnt );
   test_pack_callbacks_delete( e );
 }
 
@@ -3600,7 +3724,7 @@ test_pack_tile_bam_crank_recertifies_each_slot( void ) {
     test_pack_callbacks_insert( e, (uint)slot, slot, 0 );
     test_pack_callbacks_step( e );
     FD_TEST( ctx->crank->metrics[0]==slot-103UL && test_pack_callbacks_dispatch_count( e )==slot-103UL );
-    FD_TEST( ctx->bam_tip_cfg_version==2U && !pack_tile_bam_pending_work_cnt( ctx ) );
+    FD_TEST( ctx->bam_tip_cfg_version==2U && !ctx->bam_work_cnt );
     test_pack_tile_finish_leader_slot( e, "recertify" );
     FD_TEST( !ctx->bam_tip_cfg_version );
     for( ulong w=0UL; w<2UL; w++ ) e->busy[w] = ctx->execle_expect[w];
@@ -3643,14 +3767,12 @@ test_pack_tile_bam_partial_close_reports_outside_slot( void ) {
   fd_pack_ctx_t * ctx = test_pack_callbacks_new( e, FD_PACK_STRATEGY_BALANCED );
   test_pack_callbacks_leader( e, 104UL );
   test_pack_tile_send_bam_resolv_frag( e->h, 101U, 9U, 7U, 105UL, 0U, 2U, 1, 104UL, 101U );
-  FD_TEST( ctx->current_bundle->txn_received==1UL && !ctx->bam_pending_result_cnt );
+  FD_TEST( ctx->current_bundle->txn_received==1UL && !test_pack_tile_result_cnt( e->h ) );
   test_pack_tile_finish_leader_slot( e, "partial-close" );
-  FD_TEST( ctx->bam_min_admission_slot==105UL && !ctx->bam_pending_result_cnt );
+  FD_TEST( ctx->bam_min_admission_slot==105UL && !test_pack_tile_result_cnt( e->h ) );
   test_pack_tile_send_bam_resolv_frag( e->h, 101U, 9U, 7U, 105UL, 1U, 2U, 1, 100UL, 102U );
-  FD_TEST( ctx->bam_pending_result_cnt==1UL && !pack_tile_bam_pending_work_cnt( ctx ) );
-  fd_bam_bundle_result_t const * res = &ctx->bam_result_queue[ ctx->bam_result_queue_head ];
-  FD_TEST( res->seq_id==101U && res->slot==105UL );
-  FD_TEST( res->scheduling_error==FD_BAM_SCHED_ERR_OUTSIDE_SLOT && !res->transaction_err_count );
+  FD_TEST( test_pack_tile_result_cnt( e->h )==1UL && !ctx->bam_work_cnt );
+  test_pack_tile_assert_last_result( e->h, 101U, 105UL, 2U, FD_BAM_SCHED_ERR_OUTSIDE_SLOT, 0U );
   test_pack_callbacks_delete( e );
 }
 
@@ -3686,7 +3808,7 @@ test_pack_tile_bam_unscheduled_metric( void ) {
   test_pack_callbacks_leader( e, 104UL );
   test_pack_callbacks_insert( e, 41U, 104UL, 0 );
   test_pack_callbacks_step( e );
-  FD_TEST( e->h->ctx->bam_scheduled_work_cnt==1UL );
+  FD_TEST( !e->h->ctx->bam_work_cnt && test_pack_callbacks_dispatch_count( e )==1UL );
   test_pack_callbacks_insert( e, 42U, 104UL, 0 );
   ulong before         = FD_MCNT_GET( PACK, BAM_WORK_SLOT_END_UNSCHEDULED );
   ulong expired_before = FD_MCNT_GET( PACK, TXN_DROPPED_EXPIRED );
@@ -3697,7 +3819,7 @@ test_pack_tile_bam_unscheduled_metric( void ) {
   FD_TEST( FD_MCNT_GET( PACK, TXN_DROPPED_EXPIRED )==expired_before+1UL );
   FD_TEST( FD_MCNT_GET( PACK, TXN_EVICTED )==evicted_before );
   test_pack_callbacks_insert( e, 43U, 105UL, 0 );
-  FD_TEST( pack_tile_bam_pending_work_cnt( e->h->ctx )==1UL );
+  FD_TEST( e->h->ctx->bam_work_cnt==1UL );
   test_pack_tile_finish_leader_slot( e, "metric-test" );
   FD_TEST( FD_MCNT_GET( PACK, BAM_WORK_SLOT_END_UNSCHEDULED )==before+1UL );
 
@@ -3706,20 +3828,20 @@ test_pack_tile_bam_unscheduled_metric( void ) {
   test_pack_callbacks_leader( e, 103UL );
   test_pack_tile_finish_leader_slot( e, "metric-backward" );
   FD_TEST( FD_MCNT_GET( PACK, BAM_WORK_SLOT_END_UNSCHEDULED )==before+2UL );
-  FD_TEST( !pack_tile_bam_pending_work_cnt( e->h->ctx ) );
+  FD_TEST( !e->h->ctx->bam_work_cnt );
   test_pack_callbacks_leader( e, 106UL );
   test_pack_callbacks_insert( e, 44U, 106UL, 0 );
   e->h->ctx->in_kind[0] = IN_KIND_REPLAY;
   after_frag( e->h->ctx, 0UL, 0UL, REPLAY_SIG_RESET, 0UL, 0UL, 0UL, &e->h->out->stem );
   FD_TEST( FD_MCNT_GET( PACK, BAM_WORK_SLOT_END_UNSCHEDULED )==before+3UL );
   test_pack_callbacks_insert( e, 45U, 109UL, 0 );
-  FD_TEST( pack_tile_bam_pending_work_cnt( e->h->ctx )==1UL );
+  FD_TEST( e->h->ctx->bam_work_cnt==1UL );
 
   /* Ownership retirement removes pending work before a later slot closes. */
   test_pack_callbacks_leader( e, 109UL );
   e->generation = (8UL<<1) | 1UL;
   pack_tile_sync_bam_ownership_generation( e->h->ctx );
-  FD_TEST( !pack_tile_bam_pending_work_cnt( e->h->ctx ) );
+  FD_TEST( !e->h->ctx->bam_work_cnt );
   test_pack_tile_finish_leader_slot( e, "metric-ownership" );
   FD_TEST( FD_MCNT_GET( PACK, BAM_WORK_SLOT_END_UNSCHEDULED )==before+3UL );
   test_pack_callbacks_delete( e );
@@ -3765,7 +3887,7 @@ test_pack_tile_bam_activation_purges_block_engine_bundles( void ) {
   test_pack_callbacks_insert_block_engine_bundle( e, 77UL, 1UL, 70U );
   test_pack_callbacks_insert( e, 40U, 104UL, 1 );
   test_pack_callbacks_insert_block_engine_bundle( e, 78UL, 2UL, 72U );
-  FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==4UL && pack_tile_bam_pending_work_cnt( ctx )==1UL );
+  FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==4UL && ctx->bam_work_cnt==1UL );
   fd_txn_p_t invalid_txn[1], valid_txn[1];
   test_pack_tile_make_d18_poc_txns( invalid_txn, valid_txn );
   ulong deleted;
@@ -3786,7 +3908,7 @@ test_pack_tile_bam_activation_purges_block_engine_bundles( void ) {
   ulong * prio_rejects = &ctx->insert_result[ FD_PACK_INSERT_REJECT_PRIORITY + FD_PACK_INSERT_RETVAL_OFF ];
   ulong prio_before = *prio_rejects;
   test_pack_callbacks_insert( e, 41U, 104UL, 1 );
-  FD_TEST( *prio_rejects==prio_before+1UL && pack_tile_bam_pending_work_cnt( ctx )==1UL );
+  FD_TEST( *prio_rejects==prio_before+1UL && ctx->bam_work_cnt==1UL );
 
   /* The first callback after the edge purges, even when not leader. */
   ulong deleted_before = FD_MCNT_GET( PACK, TXN_EVICTED );
@@ -3802,7 +3924,7 @@ test_pack_tile_bam_activation_purges_block_engine_bundles( void ) {
   FD_TEST( fd_pack_contains_initializer_bundle( ctx->pack, (fd_ed25519_sig_t const *)&sig, 0 ) );
 
   test_pack_callbacks_insert( e, 42U, 104UL, 1 );
-  FD_TEST( *prio_rejects==prio_before+1UL && pack_tile_bam_pending_work_cnt( ctx )==2UL );
+  FD_TEST( *prio_rejects==prio_before+1UL && ctx->bam_work_cnt==2UL );
   FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==4UL );
 
   /* Later callbacks and a deactivation edge delete nothing more. */
@@ -3891,12 +4013,12 @@ test_pack_tile_bam_tpu_drop_between_bam_members( void ) {
       after_frag( ctx, 0UL, 0UL, 104UL, sz, 0UL, 0UL, &e->h->out->stem );
       FD_TEST( !test_insert_txn_init_call_cnt && !ctx->cur_spot );
       FD_TEST( ctx->current_bundle->txn_received==1UL && ctx->current_bundle_bam->is_bam );
-      FD_TEST( !ctx->bam_pending_result_cnt );
+      FD_TEST( !test_pack_tile_result_cnt( e->h ) );
     }
 
     test_pack_tile_send_bam_resolv_frag( e->h, 101U, 9U, 7U, 104UL, 1U, 2U, 1, 104UL, 102U );
-    obs[ with_tpu ][ 0 ] = ctx->bam_pending_result_cnt;
-    obs[ with_tpu ][ 1 ] = pack_tile_bam_pending_work_cnt( ctx );
+    obs[ with_tpu ][ 0 ] = test_pack_tile_result_cnt( e->h );
+    obs[ with_tpu ][ 1 ] = ctx->bam_work_item_stage_cnt[ FD_METRICS_ENUM_PACK_BAM_WORK_STATE_V_ACCEPTED_IDX ];
     obs[ with_tpu ][ 2 ] = ctx->bam_work_cnt;
     obs[ with_tpu ][ 3 ] = fd_pack_avail_txn_cnt( ctx->pack );
     obs[ with_tpu ][ 4 ] = test_insert_fini_call_cnt;
@@ -3944,7 +4066,7 @@ test_pack_tile_bam_disabled_zero_capacity( void ) {
   fd_microblock_execle_trailer_t const * trailer;
   fd_txn_e_t const * txn = test_pack_callbacks_output( e, 0UL, &trailer );
   FD_TEST( trailer->is_bundle && txn->txnp->source_tpu==FD_TXN_M_TPU_SOURCE_BUNDLE );
-  FD_TEST( !ctx->bam_work_cnt && !ctx->bam_pending_result_cnt && !e->h->out->seqs[2] );
+  FD_TEST( !ctx->bam_work_cnt && !test_pack_tile_result_cnt( e->h ) );
 
   test_pack_tile_finish_leader_slot( e, "zero-capacity" );
   FD_TEST( ctx->leader_slot==ULONG_MAX && !ctx->bam_min_admission_slot );
@@ -3953,11 +4075,11 @@ test_pack_tile_bam_disabled_zero_capacity( void ) {
   test_pack_callbacks_delete( e );
 }
 
-/* unprivileged_init maps the executed_txn input that topology_bam.c
-   wires from Motor to pack under BAM (upstream pack has no such
-   input and would FD_LOG_ERR on it).  A malloc-backed topology, as in
-   test_bam_verify_tile, puts it between upstream's inputs; a signature
-   sent on it then reaches the BAM handlers through the mapped in. */
+/* Under BAM, pack has only upstream's inputs: execution feedback comes
+   from replay, as without BAM.  A malloc-backed topology, as in
+   test_bam_verify_tile, maps them with unprivileged_init (which would
+   FD_LOG_ERR on any other input), and an executed signature sent on
+   the replay in reaches pack through the mapped in. */
 
 #define TEST_PACK_INIT_ALLOC_MAX (16UL)
 static void * test_pack_init_allocs[ TEST_PACK_INIT_ALLOC_MAX ];
@@ -3989,12 +4111,11 @@ test_pack_init_link( fd_topo_t *  topo,
 }
 
 static void
-test_pack_tile_unprivileged_init_maps_executed_txn( void ) {
+test_pack_tile_unprivileged_init_maps_replay_feedback( void ) {
   fd_topo_t * topo = fd_topob_new( test_pack_init_alloc( alignof(fd_topo_t), sizeof(fd_topo_t) ), "pack-bam-init" );
   fd_topob_wksp( topo, "wksp" )->wksp = NULL; /* objects are malloc'd, offsets are addresses */
   test_pack_init_link( topo, "resolv_pack",  FD_TPU_RESOLVED_MTU );
-  test_pack_init_link( topo, "executed_txn", FD_TXN_SIGNATURE_SZ );
-  test_pack_init_link( topo, "replay_out",   sizeof(fd_became_leader_t) );
+  test_pack_init_link( topo, "replay_out",   fd_ulong_max( sizeof(fd_became_leader_t), sizeof(fd_replay_txn_executed_t) ) );
   test_pack_init_link( topo, "pack_execle",  FD_PACK_EXECLE_MTU );
   test_pack_init_link( topo, "pack_poh",     sizeof(fd_done_packing_t) );
 
@@ -4005,7 +4126,6 @@ test_pack_tile_unprivileged_init_maps_executed_txn( void ) {
   tile->pack.max_shreds_per_block     = FD_SHRED_BLK_MAX;
   tile->pack.schedule_strategy        = FD_PACK_STRATEGY_BALANCED;
   fd_topob_tile_in ( topo, "pack", 0UL, "wksp", "resolv_pack",  0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
-  fd_topob_tile_in ( topo, "pack", 0UL, "wksp", "executed_txn", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
   fd_topob_tile_in ( topo, "pack", 0UL, "wksp", "replay_out",   0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
   fd_topob_tile_out( topo, "pack", 0UL, "pack_execle", 0UL );
   fd_topob_tile_out( topo, "pack", 0UL, "pack_poh",    0UL );
@@ -4018,29 +4138,36 @@ test_pack_tile_unprivileged_init_maps_executed_txn( void ) {
   privileged_init( topo, tile );
   unprivileged_init( topo, tile );
   fd_pack_ctx_t * ctx = fd_topo_obj_laddr( topo, tile->tile_obj_id );
-  ulong in_idx = fd_topo_find_tile_in_link( topo, tile, "executed_txn", 0UL );
+  ulong in_idx = fd_topo_find_tile_in_link( topo, tile, "replay_out", 0UL );
   FD_TEST( in_idx==1UL );
-  FD_TEST( ctx->in_kind[ 0 ]==IN_KIND_RESOLV && ctx->in_kind[ in_idx ]==IN_KIND_EXECUTED_TXN && ctx->in_kind[ 2 ]==IN_KIND_REPLAY );
+  FD_TEST( ctx->in_kind[ 0 ]==IN_KIND_RESOLV && ctx->in_kind[ in_idx ]==IN_KIND_REPLAY );
   FD_TEST( !ctx->bam_work_max && !ctx->bam_status_fseq ); /* no BAM objects: BAM tracking stays off */
 
-  /* A landed completion copies the signature out of that in's dcache
-     and deletes it from pack (stubbed). */
+  /* A committable execution copies the signature out of that in's
+     dcache and deletes it from pack (stubbed). */
   int use_real_pack = test_delete_use_real_pack;
   test_delete_use_real_pack = 0;
   uchar txn_sig[ FD_TXN_SIGNATURE_SZ ];
   for( ulong i=0UL; i<FD_TXN_SIGNATURE_SZ; i++ ) txn_sig[ i ] = (uchar)( 0x40UL+i );
   ulong chunk = ctx->in[ in_idx ].chunk0;
-  fd_memcpy( fd_chunk_to_laddr( ctx->in[ in_idx ].mem, chunk ), txn_sig, FD_TXN_SIGNATURE_SZ );
+  fd_replay_txn_executed_t * executed = fd_chunk_to_laddr( ctx->in[ in_idx ].mem, chunk );
+  TXN(executed->txn)->transaction_version = FD_TXN_VLEGACY;
+  TXN(executed->txn)->signature_cnt       = 1U;
+  TXN(executed->txn)->signature_off       = 1U;
+  fd_memcpy( executed->txn->payload+1UL, txn_sig, FD_TXN_SIGNATURE_SZ );
+  executed->is_committable = 1;
   ulong delete_cnt   = test_delete_call_cnt;
   ulong executed_cnt = FD_MCNT_GET( PACK, TXN_DROPPED_ALREADY_EXECUTED );
-  during_frag( ctx, in_idx, 0UL, FD_EXECUTED_TXN_KIND_LANDED, chunk, FD_TXN_SIGNATURE_SZ, 0UL );
-  FD_TEST( !memcmp( ctx->executed_txn_sig, txn_sig, FD_TXN_SIGNATURE_SZ ) );
-  after_frag( ctx, in_idx, 0UL, FD_EXECUTED_TXN_KIND_LANDED, FD_TXN_SIGNATURE_SZ, 0UL, 0UL, NULL );
+  during_frag( ctx, in_idx, 0UL, REPLAY_SIG_TXN_EXECUTED, chunk, sizeof(fd_replay_txn_executed_t), 0UL );
+  FD_TEST( ctx->txn_committed && !memcmp( ctx->executed_txn_sig, txn_sig, FD_TXN_SIGNATURE_SZ ) );
+  after_frag( ctx, in_idx, 0UL, REPLAY_SIG_TXN_EXECUTED, sizeof(fd_replay_txn_executed_t), 0UL, 0UL, NULL );
   FD_TEST( test_delete_call_cnt==delete_cnt+1UL && !memcmp( test_delete_last_sig, txn_sig, FD_TXN_SIGNATURE_SZ ) );
   FD_TEST( FD_MCNT_GET( PACK, TXN_DROPPED_ALREADY_EXECUTED )==executed_cnt+1UL );
-  /* An unlanded BAM completion only retires BAM work. */
-  after_frag( ctx, in_idx, 0UL, FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED, FD_TXN_SIGNATURE_SZ, 0UL, 0UL, NULL );
-  FD_TEST( test_delete_call_cnt==delete_cnt+1UL );
+  /* An uncommittable execution deletes nothing. */
+  executed->is_committable = 0;
+  during_frag( ctx, in_idx, 0UL, REPLAY_SIG_TXN_EXECUTED, chunk, sizeof(fd_replay_txn_executed_t), 0UL );
+  after_frag( ctx, in_idx, 0UL, REPLAY_SIG_TXN_EXECUTED, sizeof(fd_replay_txn_executed_t), 0UL, 0UL, NULL );
+  FD_TEST( !ctx->txn_committed && test_delete_call_cnt==delete_cnt+1UL );
   test_delete_use_real_pack = use_real_pack;
 
   fd_pack_delete( fd_pack_leave( ctx->pack ) );
@@ -4056,7 +4183,7 @@ main( int     argc,
   test_pack_tile_bam_unscheduled_metric();
   test_pack_tile_bam_end_slot_hook_off_without_bam();
   test_pack_tile_bam_disabled_zero_capacity();
-  test_pack_tile_unprivileged_init_maps_executed_txn();
+  test_pack_tile_unprivileged_init_maps_replay_feedback();
   test_pack_tile_bam_activation_purges_block_engine_bundles();
   test_pack_tile_bam_tpu_dropped_until_deactivation();
   test_pack_tile_bam_tpu_drop_between_bam_members();
@@ -4065,13 +4192,14 @@ main( int     argc,
   test_pack_tile_block_engine_bundle_straddles_slot_end();
   test_pack_tile_bam_secondary_callbacks();
   test_pack_tile_bam_conflict_lookahead_callbacks();
-  test_pack_tile_bam_ordinal_wrap_tracks_every_dispatched_batch();
+  test_pack_tile_bam_duplicate_callbacks();
+  test_pack_tile_bam_ordinal_wrap_retires_every_dispatched_batch();
   test_pack_tile_bundle_ordinal_wrap_keeps_block_engine_groups();
   test_pack_tile_bam_copy_of_nonce_txn_verifies();
   test_pack_tile_retention_callbacks();
   test_pack_tile_bam_blockhash_height_is_not_validity();
   test_pack_tile_bam_closed_admission_callbacks();
-  test_pack_tile_bam_result_drain_before_skip();
+  test_pack_tile_bam_results_publish_while_skipping();
   test_pack_tile_bam_initializer_generation_callbacks();
   test_pack_tile_bam_readiness_identity_and_mode();
   test_pack_tile_bam_partial_close_reports_outside_slot();
@@ -4082,13 +4210,13 @@ main( int     argc,
   test_pack_tile_bam_deleted_initializer_restores_crank_state();
 
   test_pack_tile_bam_leader_state_is_rate_limited();
-  test_pack_tile_bam_work_partition_mutations();
+  test_pack_tile_bam_work_tracking_mutations();
   test_pack_tile_bam_signature_prefix_collision();
   test_pack_tile_bam_pack_evicted_bundle_is_reconciled();
   test_pack_tile_bam_sig0_shared_with_untracked_pack_txn_is_accepted();
   test_pack_tile_bam_overlapping_bundle_leading_sig_is_accepted();
-  test_pack_tile_bam_completion_outcomes();
-  test_pack_tile_bam_completion_tracking_reuses_capacity();
+  test_pack_tile_bam_scheduling_retires_work();
+  test_pack_tile_bam_scheduling_frees_capacity();
   test_pack_tile_bam_overlapping_replay_reconciliation();
   test_pack_tile_bam_overlapping_signature_poc_regression();
   test_pack_tile_bam_old_member_does_not_override_missed_target();
@@ -4098,17 +4226,17 @@ main( int     argc,
   test_pack_tile_bam_pending_duplicate_before_insert( 11U, 0U, 101UL );
   test_pack_tile_bam_pending_duplicate_before_insert( 11U, 0U, 100UL );
   test_pack_tile_bam_pending_duplicate_before_insert( 10U, 1U, 100UL );
-  test_pack_tile_bam_scheduled_duplicate_rejected_before_insert( 21U, 101UL );
-  test_pack_tile_bam_scheduled_duplicate_rejected_before_insert( 20U, 100UL );
-  test_pack_tile_bam_result_queue_wrap_preserves_fifo();
-  test_pack_tile_bam_pending_results_reserve_direct_result_headroom();
-  test_pack_tile_bam_scheduled_work_does_not_consume_result_headroom();
+  test_pack_tile_bam_in_flight_duplicate_inserted( 21U, 101UL );
+  test_pack_tile_bam_in_flight_duplicate_inserted( 20U, 100UL );
+  test_pack_tile_bam_result_dcache_wrap_preserves_order();
+  test_pack_tile_bam_published_results_do_not_reserve_capacity();
   test_pack_tile_bam_instr_acct_reject_serializes_exact_member();
   test_pack_tile_bam_unsigned_advance_passes_pack();
   test_pack_tile_bam_result_mapping_insert_reject();
   test_pack_tile_bam_result_mapping_tracking_reject();
   test_pack_tile_bam_atomic_abandon_result_mapping();
   test_pack_tile_bam_preprocess_marker_has_one_terminal_owner();
+  test_pack_tile_bam_results_publish_immediately();
   test_pack_tile_bam_ownership_generation_retirement_barrier();
   test_pack_tile_preserves_first_seen_and_stamps_pack_arrival();
   test_pack_tile_bam_disable_retires_pending_before_override_clear();

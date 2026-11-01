@@ -60,7 +60,7 @@ typedef struct { bam_fuzz_range_t out[ BAM_FUZZ_OUT_MAX ]; } bam_fuzz_res_t;
 #define BAM_FUZZ_PACK_OUT_BAM_LEADER (2UL)
 #define BAM_FUZZ_PACK_OUT_BAM_RESULT (3UL)
 #define BAM_FUZZ_EXECLE_OUT_MOTOR    (0UL)
-#define BAM_FUZZ_EXECLE_OUT_BANK_BAM (1UL)
+#define BAM_FUZZ_EXECLE_OUT_MOTOR_BAM (1UL) /* results motor forwards, see bam_fuzz_execle_frag */
 
 /* bam_fuzz_link_new creates an mcache and a compact dcache for depth
    frags of up to mtu bytes in wksp. */
@@ -172,7 +172,9 @@ void bam_fuzz_execle_delete( bam_fuzz_execle_t * h );
 
 /* A verify adapter publishes nothing for a frag outside its share.
    Dedup sets *held and consumes nothing when the frag on in_idx must
-   wait for earlier BAM frags. */
+   wait for earlier BAM frags.  No motor stage runs, so the execle
+   adapter also publishes the BAM result each of its microblocks
+   carries, as motor does with one execle tile. */
 
 bam_fuzz_res_t bam_fuzz_verify_frag( bam_fuzz_verify_t * h, fd_frag_meta_t const * meta, ulong seq );
 bam_fuzz_res_t bam_fuzz_dedup_frag ( bam_fuzz_dedup_t *  h, ulong in_idx, fd_frag_meta_t const * meta, ulong seq, int * held );

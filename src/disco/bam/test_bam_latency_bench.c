@@ -191,7 +191,6 @@ bench_run( int             dual,
         worker_for[txn_index] = i;
         result->busy_ns[i] += worker->execution_end-worker->execution_begin;
         published[i] = worker->output.seqs[0];
-        FD_TEST( !worker->output.seqs[2] ); /* no immediate execution failures */
         acknowledged[i] = issued[i];
         idle |= 1UL<<i;
       }
@@ -230,7 +229,6 @@ bench_run( int             dual,
         /* Only idle workers' credit arrays can be changed by this thread. */
         worker->output.credits[0] = worker->output.depths[0]-(published[i]-consumed[i]);
         worker->output.credits[1] = worker->output.depths[1];
-        worker->output.credits[2] = worker->output.depths[2];
         worker->output.min_credit = worker->output.credits[0];
         result->dispatched[i]++;
         idle &= ~(1UL<<i);

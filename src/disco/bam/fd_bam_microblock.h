@@ -4,13 +4,12 @@
 /* BAM result feedback helpers for the execution, motor and pack tiles. */
 
 #include "../tiles.h"       /* fd_microblock_trailer_t, MAX_MICROBLOCK_SZ, fd_stem_publish */
-#include "../fd_txn_m.h"    /* FD_TXN_M_TPU_SOURCE_BAM */
 #include "fd_bam_types.h"   /* fd_bam_bundle_result_t */
 
-/* Producers publish BAM failures immediately, but successful execution
-   feedback is provisional until motor accepts the corresponding
-   microblock.  Such feedback is carried on the internal execle -> motor
-   link right after the ordinary trailer:
+/* Execle attaches the result of a BAM batch it executed to the batch's
+   last microblock, so the result reaches the BAM tile only after motor
+   handles that microblock.  The result rides the internal execle ->
+   motor link right after the ordinary trailer:
 
      [ fd_txn_p_t ... ][ trailer ][ optional fd_bam_bundle_result_t ]
 
@@ -41,9 +40,9 @@ fd_bam_microblock_footprint( ulong txn_cnt,
          sizeof(fd_microblock_trailer_t);
 }
 
-/* fd_bam_microblock_attach_result appends the provisional successful
-   result res to the one-transaction microblock whose trailer is at
-   trailer, and returns the new microblock size. */
+/* fd_bam_microblock_attach_result appends the result res to the
+   one-transaction microblock whose trailer is at trailer, and returns
+   the new microblock size. */
 
 static inline ulong
 fd_bam_microblock_attach_result( fd_microblock_trailer_t *      trailer,
@@ -52,7 +51,7 @@ fd_bam_microblock_attach_result( fd_microblock_trailer_t *      trailer,
   return fd_bam_microblock_footprint( 1UL, 1 );
 }
 
-/* fd_bam_microblock_strip_result returns the provisional result the
+/* fd_bam_microblock_strip_result returns the result the
    *sz byte microblock at data carries and removes it from *sz, or
    returns NULL if it carries none: a microblock of any other size is
    read as an ordinary one. */
@@ -91,36 +90,30 @@ fd_bam_publish_result( fd_stem_context_t *            stem,
   return 1;
 }
 
-/* executed_txn link event kinds, carried in the mcache sig field */
-#define FD_EXECUTED_TXN_KIND_LANDED                  (0UL)
-#define FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED  (1UL)
-
-/* fd_bam_publish_txn_completions publishes the first signature of each
-   BAM transaction in a microblock motor accepted on the executed_txn
-   link, with sig FD_EXECUTED_TXN_KIND_LANDED if it executed
-   successfully and FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED
-   otherwise.  Pack uses these to retire BAM work.  Other sources are
-   skipped; pack learns of them as upstream does.  out_idx==ULONG_MAX
-   (link not wired, BAM disabled) is a no-op. */
+/* fd_bam_publish_dropped_result publishes the result the microblock at
+   data carries, if any, when motor drops the microblock instead of
+   recording it.  The microblock's slot has ended, so as jito-solana does
+   for work whose slot expired, the batch is reported not committed with
+   a POH_TIMEOUT scheduling error, BAM's catch-all for work PoH did not
+   record, whatever its execution outcome. */
 
 static inline void
-fd_bam_publish_txn_completions( fd_stem_context_t * stem,
-                                ulong               out_idx,
-                                void *              out_mem,
-                                ulong *             out_chunk,
-                                ulong               out_chunk0,
-                                ulong               out_wmark,
-                                fd_txn_p_t const *  txns,
-                                ulong               txn_cnt ) {
+fd_bam_publish_dropped_result( fd_stem_context_t * stem,
+                               ulong               out_idx,
+                               void *              out_mem,
+                               ulong *             out_chunk,
+                               ulong               out_chunk0,
+                               ulong               out_wmark,
+                               void const *        data,
+                               ulong               sz ) {
   if( FD_UNLIKELY( out_idx==ULONG_MAX ) ) return;
-  for( ulong i=0UL; i<txn_cnt; i++ ) {
-    if( FD_UNLIKELY( txns[ i ].source_tpu!=FD_TXN_M_TPU_SOURCE_BAM ) ) continue;
-    ulong event_kind = (txns[ i ].flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS) ? FD_EXECUTED_TXN_KIND_LANDED : FD_EXECUTED_TXN_KIND_BAM_COMPLETED_UNLANDED;
-    fd_memcpy( fd_chunk_to_laddr( out_mem, *out_chunk ),
-               fd_txn_get_signatures( TXN(txns+i), txns[ i ].payload ), FD_TXN_SIGNATURE_SZ );
-    fd_stem_publish( stem, out_idx, event_kind, *out_chunk, FD_TXN_SIGNATURE_SZ, 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
-    *out_chunk = fd_dcache_compact_next( *out_chunk, FD_TXN_SIGNATURE_SZ, out_chunk0, out_wmark );
-  }
+  fd_bam_bundle_result_t const * carried = fd_bam_microblock_strip_result( data, &sz );
+  if( FD_LIKELY( !carried ) ) return;
+  fd_bam_bundle_result_t res = fd_bam_result_base( carried->seq_id, carried->scheduler_gen, carried->slot, carried->bundle_txn_cnt );
+  res.scheduling_error = FD_BAM_SCHED_ERR_POH_TIMEOUT;
+  FD_LOG_WARNING(( "motor dropped the microblock carrying the result of BAM batch seq_id=%u slot=%lu, reporting POH_TIMEOUT",
+                   res.seq_id, res.slot ));
+  fd_bam_publish_result( stem, out_idx, out_mem, out_chunk, out_chunk0, out_wmark, &res );
 }
 
 #endif /* HEADER_fd_src_disco_bam_fd_bam_microblock_h */

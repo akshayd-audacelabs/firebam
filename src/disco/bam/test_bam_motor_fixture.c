@@ -7,12 +7,12 @@
 struct test_bam_motor_fixture {
   fd_motor_tile_t ctx[1];
   fd_stem_context_t stem[1];
-  fd_frag_meta_t * mcaches[4];
-  ulong seqs[4];
-  ulong depths[4];
-  ulong credits[4];
+  fd_frag_meta_t * mcaches[3];
+  ulong seqs[3];
+  ulong depths[3];
+  ulong credits[3];
   ulong min_credit;
-  int reliable[4];
+  int reliable[3];
   ulong ledger_seq;
   ulong result_seq;
   test_bam_motor_summary_t summary;
@@ -38,9 +38,9 @@ test_bam_motor_fixture_new( fd_wksp_t * wksp,
   fd_memset( f, 0, sizeof(*f) );
   f->summary.slot = slot;
   f->summary.expect_pack_idx = pack_idx;
-  fd_poh_out_t * outputs[4] = { f->ctx->shred_out, f->ctx->replay_out, f->ctx->executed_txn_out, f->ctx->bam_out };
-  ulong mtus[4] = { FD_POH_SHRED_MTU, sizeof(fd_poh_leader_slot_ended_t), FD_TXN_SIGNATURE_SZ, sizeof(fd_bam_bundle_result_t) };
-  for( ulong i=0UL; i<4UL; i++ ) {
+  fd_poh_out_t * outputs[3] = { f->ctx->shred_out, f->ctx->replay_out, f->ctx->bam_out };
+  ulong mtus[3] = { FD_POH_SHRED_MTU, sizeof(fd_poh_leader_slot_ended_t), sizeof(fd_bam_bundle_result_t) };
+  for( ulong i=0UL; i<3UL; i++ ) {
     void * mc = fd_wksp_alloc_laddr( wksp, fd_mcache_align(), fd_mcache_footprint( TEST_MOTOR_DEPTH, 0UL ), TEST_MOTOR_TAG );
     FD_TEST( mc );
     f->mcaches[i] = fd_mcache_join( fd_mcache_new( mc, TEST_MOTOR_DEPTH, 0UL, 0UL ) );
@@ -103,8 +103,8 @@ test_bam_motor_fixture_consume( test_bam_motor_fixture_t * f,
     }
     FD_TEST( !remaining );
   }
-  while( f->result_seq<f->seqs[3] ) {
-    fd_frag_meta_t const * m = f->mcaches[3]+fd_mcache_line_idx( f->result_seq++, TEST_MOTOR_DEPTH );
+  while( f->result_seq<f->seqs[2] ) {
+    fd_frag_meta_t const * m = f->mcaches[2]+fd_mcache_line_idx( f->result_seq++, TEST_MOTOR_DEPTH );
     FD_TEST( m->sz==sizeof(fd_bam_bundle_result_t) && f->summary.result_cnt<16UL );
     fd_memcpy( &f->summary.results[f->summary.result_cnt++],
                fd_chunk_to_laddr_const( f->ctx->bam_out->mem, m->chunk ), sizeof(fd_bam_bundle_result_t) );

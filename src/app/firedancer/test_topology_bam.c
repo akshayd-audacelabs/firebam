@@ -276,7 +276,7 @@ test_topology( int          bundle_enabled,
   if( !leader_enabled ) {
     /* Without block production, bundle/BAM settings must not leave
        their tiles, links or crank configuration behind. */
-    static char const * const bam_links[] = { "pack_sign", "sign_pack", "bam_verif", "bam_sign", "bam_gossip", "bam_shred", "executed_txn", "pack_bam_ldr", "pack_bam_res", "bank_bam", "motor_bam" };
+    static char const * const bam_links[] = { "pack_sign", "sign_pack", "bam_verif", "bam_sign", "bam_gossip", "bam_shred", "pack_bam_ldr", "pack_bam_res", "motor_bam" };
     FD_TEST( fd_topo_find_tile( topo, "bundle", 0UL )==ULONG_MAX );
     FD_TEST( fd_topo_find_tile( topo, "bam",    0UL )==ULONG_MAX );
     for( ulong i=0UL; i<sizeof(bam_links)/sizeof(bam_links[0]); i++ )
@@ -337,31 +337,19 @@ test_topology( int          bundle_enabled,
   FD_TEST( (fd_topo_find_tile( topo, "bam",    0UL )!=ULONG_MAX)==bam_enabled );
   if( bam_enabled ) {
     fd_topo_tile_t const * bam = &topo->tiles[ fd_topo_find_tile( topo, "bam", 0UL ) ];
-    /* BAM consumes terminal worker results as one contiguous polled
-       block, followed immediately by the Motor result input. */
-    ulong worker_cnt = fd_topo_tile_name_cnt( topo, "execle" );
-    ulong bank_in = fd_topo_find_tile_in_link( topo, bam, "bank_bam", 0UL );
-    FD_TEST( worker_cnt && bank_in!=ULONG_MAX );
-    for( ulong i=0UL; i<worker_cnt; i++ ) {
-      ulong in = fd_topo_find_tile_in_link( topo, bam, "bank_bam", i );
-      FD_TEST( in==bank_in+i && bam->in_link_poll[ in ] && !bam->in_link_reliable[ in ] );
-      fd_topo_tile_t const * worker = &topo->tiles[ fd_topo_find_tile( topo, "execle", i ) ];
-      ulong out = fd_topo_find_tile_out_link( topo, worker, "bank_bam", i );
-      FD_TEST( out!=ULONG_MAX && worker->out_link_id[ out ]==bam->in_link_id[ in ] );
-    }
+    /* Execution results reach BAM only through Motor, after it handles
+       the microblock carrying them, and pack answers everything else.
+       Result feedback never backpressures its producers. */
     ulong motor_in = fd_topo_find_tile_in_link( topo, bam, "motor_bam", 0UL );
-    FD_TEST( motor_in==bank_in+worker_cnt && bam->in_link_poll[ motor_in ] && !bam->in_link_reliable[ motor_in ] );
-    /* Result feedback never backpressures its producers. */
+    FD_TEST( motor_in!=ULONG_MAX && bam->in_link_poll[ motor_in ] && !bam->in_link_reliable[ motor_in ] );
     ulong pack_res_in = fd_topo_find_tile_in_link( topo, bam, "pack_bam_res", 0UL );
     FD_TEST( pack_res_in!=ULONG_MAX && bam->in_link_poll[ pack_res_in ] && !bam->in_link_reliable[ pack_res_in ] );
-    ulong result_cnt = 0UL;
     for( ulong i=0UL; i<bam->in_cnt; i++ ) {
       fd_topo_link_t const * link = &topo->links[ bam->in_link_id[ i ] ];
-      int is_result = !strcmp( link->name, "pack_bam_res" ) || !strcmp( link->name, "bank_bam" ) || !strcmp( link->name, "motor_bam" );
+      int is_result = !strcmp( link->name, "pack_bam_res" ) || !strcmp( link->name, "motor_bam" );
       FD_TEST( !is_result || link->depth==FD_BAM_RESULT_LINK_DEPTH );
-      result_cnt += !strcmp( link->name, "bank_bam" ) || !strcmp( link->name, "motor_bam" );
+      FD_TEST( strcmp( topo->tiles[ fd_topo_find_link_producer( topo, link ) ].name, "execle" ) );
     }
-    FD_TEST( result_cnt==worker_cnt+1UL );
     ulong replay_in = fd_topo_find_tile_in_link( topo, bam, "replay_slot", 0UL );
     FD_TEST( replay_in!=ULONG_MAX );
     ulong sign_in = fd_topo_find_tile_in_link( topo, bam, "sign_bam", 0UL );
@@ -409,19 +397,8 @@ test_topology( int          bundle_enabled,
     }
   }
 
-  /* executed_txn lets pack retire BAM work.  Upstream Firedancer has
-     no such link, so without BAM leaders must not pay its
-     per-transaction publish.  It carries only BAM completions, so dedup
-     (which BAM bypasses) does not consume it. */
-  FD_TEST( (fd_topo_find_link( topo, "executed_txn", 0UL )!=ULONG_MAX)==bam_enabled );
-  fd_topo_tile_t const * pack_tile  = &topo->tiles[ fd_topo_find_tile( topo, "pack",  0UL ) ];
-  fd_topo_tile_t const * dedup_tile = &topo->tiles[ fd_topo_find_tile( topo, "dedup", 0UL ) ];
-  FD_TEST( (fd_topo_find_tile_in_link( topo, pack_tile,  "executed_txn", 0UL )!=ULONG_MAX)==bam_enabled );
-  FD_TEST( fd_topo_find_tile_in_link( topo, dedup_tile, "executed_txn", 0UL )==ULONG_MAX );
-
   ulong motor_id = fd_topo_find_tile( topo, "motor", 0UL );
   FD_TEST( motor_id!=ULONG_MAX );
-  FD_TEST( (fd_topo_find_tile_out_link( topo, &topo->tiles[ motor_id ], "executed_txn", 0UL )!=ULONG_MAX)==bam_enabled );
   FD_TEST( (fd_topo_find_tile_out_link( topo, &topo->tiles[ motor_id ], "motor_bam", 0UL )!=ULONG_MAX)==bam_enabled );
 
   fd_topo_obj_t const * accdb = fd_topo_find_obj( topo, "accdb", NULL, ULONG_MAX );

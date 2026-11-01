@@ -705,7 +705,8 @@ test_bam_current_slot_work_status_bits( fd_wksp_t * wksp ) {
   test_bam_env_destroy( env );
 }
 
-/* Overruns of the result links (in 1-3 here) count as dropped results. */
+/* Overruns of the result links (ins 1 and 3 here) count as dropped
+   results; overruns of other links do not. */
 
 static void
 test_bam_feedback_results_overrun_dropped( fd_wksp_t * wksp ) {
@@ -719,9 +720,9 @@ test_bam_feedback_results_overrun_dropped( fd_wksp_t * wksp ) {
   test_bam_env_t env[1];
   fd_bam_tile_t * state = test_bam_env_create( env, wksp );
   state->metrics.feedback_results_dropped_cnt = 1UL;
-  state->bank_bam_in_idx = 1UL; state->bank_bam_in_cnt = 2UL; state->pack_bam_result_in_idx = 3UL;
+  state->motor_bam_in_idx = 1UL; state->pack_bam_result_in_idx = 3UL;
   fd_bam_test_metrics_write( state );
-  FD_TEST( FD_MCNT_GET( BAM, FEEDBACK_RESULT_DROPPED )==1UL+110UL*(2UL+4UL+8UL) );
+  FD_TEST( FD_MCNT_GET( BAM, FEEDBACK_RESULT_DROPPED )==1UL+110UL*(2UL+8UL) );
   test_bam_env_destroy( env );
   fd_metrics_register( (ulong *)fd_metrics_new( metrics_scratch, 0UL ) );
 }
@@ -1019,7 +1020,7 @@ test_bam_stem_iter( fd_bam_tile_t *     state,
 
 /* With forwarding work queued and bam_verif short of STEM_BURST
    credits, the stem must keep consuming the feedback ins (motor_bam,
-   bank_bam, pack_bam_res).  They are unreliable, so falling behind
+   pack_bam_res).  They are unreliable, so falling behind
    would overrun them and drop results.  With no feedback waiting and a queued batch that does not
    fit, the stem must stay backpressured so an efficient-mode park is
    woken by verify returning credits.  With nothing queued it must not,
@@ -1040,7 +1041,7 @@ test_bam_verify_backpressure_keeps_feedback_polling( fd_wksp_t * wksp ) {
   int              reliable[ 4 ] = { 1, 0, 1, 1 };
   ulong            min_cr_avail  = 7UL;
 
-  /* Polled ins: motor_bam (the only bank_in) and pack_bam_res. */
+  /* Polled ins: motor_bam and pack_bam_res. */
   ulong const       in_depth = 8UL;
   fd_frag_meta_t *  in_mcache[ 2 ];
   fd_stem_tile_in_t ins[ 2 ];
@@ -1074,9 +1075,8 @@ test_bam_verify_backpressure_keeps_feedback_polling( fd_wksp_t * wksp ) {
     uchar                  bytes[ sizeof(fd_bam_bundle_result_t) ];
   } in_frag[ 2 ];
   uchar * in_buf[ 2 ] = { in_frag[ 0 ].bytes, in_frag[ 1 ].bytes };
-  state->bank_bam_in_cnt        = 1UL;
-  state->bank_bam_in_idx        = 0UL;
-  state->bank_in[ 0 ]           = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in_buf[ 0 ] };
+  state->motor_bam_in_idx       = 0UL;
+  state->motor_result_in        = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in_buf[ 0 ] };
   state->pack_bam_result_in_idx = 1UL;
   state->pack_result_in         = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in_buf[ 1 ] };
 
@@ -3417,8 +3417,8 @@ test_bam_scheduler_stream_replays_only_retained_leader_state( fd_wksp_t * wksp )
 }
 
 /* next_deadline schedules the retry at backoff_until.  A step during
-   backoff returns at once instead of sleeping, so bank_bam, pack_bam_res,
-   and motor_bam keep draining.  A sleep blocks, so count voluntary context
+   backoff returns at once instead of sleeping, so pack_bam_res and
+   motor_bam keep draining.  A sleep blocks, so count voluntary context
    switches rather than elapsed time. */
 static void
 test_bam_backoff_step_returns_without_sleep( fd_wksp_t * wksp ) {
@@ -4789,9 +4789,8 @@ test_bam_ingress_frag_copied_before_overrun_check( fd_wksp_t * wksp ) {
     uchar                  bytes[ 1024 ];
   } in[ 4 ];
   fd_memset( in, 0, sizeof(in) );
-  state->bank_bam_in_cnt        = 1UL;
-  state->bank_bam_in_idx        = 0UL;
-  state->bank_in[ 0 ]           = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in[ 0 ].bytes };
+  state->motor_bam_in_idx       = 0UL;
+  state->motor_result_in        = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in[ 0 ].bytes };
   state->pack_bam_result_in_idx = 1UL;
   state->pack_result_in         = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)in[ 1 ].bytes };
   state->pack_bam_leader_in_idx = 2UL;
@@ -4924,8 +4923,11 @@ test_bam_pack_result_channel_contract( fd_wksp_t * wksp ) {
   test_bam_env_destroy( env );
 }
 
+/* Execution results arrive only on motor_bam and everything else pack
+   answers on pack_bam_res.  Both queue durably; a frag of the wrong size
+   or on another in queues nothing. */
 static void
-test_bam_bank_result_channel_contract( fd_wksp_t * wksp ) {
+test_bam_motor_result_channel_contract( fd_wksp_t * wksp ) {
   test_bam_env_t env[1];
   fd_bam_tile_t * state = test_bam_env_create( env, wksp );
 
@@ -4936,13 +4938,13 @@ test_bam_bank_result_channel_contract( fd_wksp_t * wksp ) {
   ingress[0].result = test_make_bundle_result( 501U, 1501UL, 1U );
   ingress[1].result = test_make_bundle_result( 502U, 1502UL, 2U );
 
-  state->bank_bam_in_cnt    = 2UL;
-  state->bank_bam_in_idx    = 5UL;
-  state->bank_in[0] = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)ingress[0].bytes };
-  state->bank_in[1] = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)ingress[1].bytes };
+  state->motor_bam_in_idx       = 5UL;
+  state->motor_result_in        = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)ingress[0].bytes };
+  state->pack_bam_result_in_idx = 6UL;
+  state->pack_result_in         = (fd_bam_in_ctx_t){ .mem = (fd_wksp_t *)ingress[1].bytes };
 
-  fd_bam_test_receive_ingress_frag( state, state->bank_bam_in_idx,      0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
-  fd_bam_test_receive_ingress_frag( state, state->bank_bam_in_idx+1UL, 0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
+  fd_bam_test_receive_ingress_frag( state, state->motor_bam_in_idx,       0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
+  fd_bam_test_receive_ingress_frag( state, state->pack_bam_result_in_idx, 0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
 
   FD_TEST( state->feedback_queue_depth == 2U );
   FD_TEST( state->bam_results_head == 0U );
@@ -4952,8 +4954,8 @@ test_bam_bank_result_channel_contract( fd_wksp_t * wksp ) {
   FD_TEST( state->bam_results[1].seq_id == ingress[1].result.seq_id );
   FD_TEST( state->bam_results[1].slot == ingress[1].result.slot );
 
-  fd_bam_test_receive_ingress_frag( state, state->bank_bam_in_idx+2UL, 0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
-  fd_bam_test_receive_ingress_frag( state, state->bank_bam_in_idx+1UL, 0UL, 0UL, sizeof(fd_bam_leader_state_t) );
+  fd_bam_test_receive_ingress_frag( state, 7UL,                     0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
+  fd_bam_test_receive_ingress_frag( state, state->motor_bam_in_idx, 0UL, 0UL, sizeof(fd_bam_leader_state_t) );
 
   FD_TEST( state->feedback_queue_depth == 2U );
   FD_TEST( state->bam_results_tail == 2U );
@@ -7029,7 +7031,7 @@ main( int     argc,
   test_bam_pack_leader_channel_contract( wksp );
   test_bam_pack_leader_slot_change_flushes_immediately( wksp );
   test_bam_pack_result_channel_contract( wksp );
-  test_bam_bank_result_channel_contract( wksp );
+  test_bam_motor_result_channel_contract( wksp );
   test_bam_scheduler_result_publishes_message( wksp );
   test_bam_txn_err_mapping_matches_jito();
 

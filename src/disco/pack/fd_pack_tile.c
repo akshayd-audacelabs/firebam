@@ -519,7 +519,7 @@ before_credit( fd_pack_ctx_t *     ctx,
     fd_pack_insert_txn_cancel( ctx->pack, ctx->cur_spot );
     ctx->cur_spot = NULL;
   }
-  if( FD_UNLIKELY( ctx->bam_work_max ) ) pack_tile_sync_bam_ownership_generation( ctx ); /* even while backpressured */
+  if( FD_UNLIKELY( ctx->bam_work_max ) ) pack_tile_bam_before_credit( ctx, stem ); /* even while backpressured */
 }
 
 static inline int
@@ -552,7 +552,7 @@ after_credit( fd_pack_ctx_t *     ctx,
 
 static inline __attribute__((always_inline)) void
 after_credit_impl( fd_pack_ctx_t * ctx, fd_stem_context_t * stem, int * charge_busy, int const bam ) {
-  _Bool bam_override = bam && pack_tile_bam_after_credit_begin( ctx, stem, charge_busy );
+  _Bool bam_override = bam && pack_tile_bam_after_credit_begin( ctx );
   if( FD_UNLIKELY( (ctx->skip_cnt--)>0L ) ) return; /* It would take ages for this to hit LONG_MIN */
 
   long now = fd_tickcount();
@@ -1011,7 +1011,6 @@ during_frag_impl( fd_pack_ctx_t * ctx, ulong in_idx, ulong sig, ulong chunk, ulo
 
     break;
   }
-  case IN_KIND_EXECUTED_TXN: pack_tile_bam_executed_txn_during_frag( ctx, dcache_entry, sz ); break;
   }
 }
 
@@ -1221,7 +1220,6 @@ after_frag_impl( fd_pack_ctx_t * ctx, ulong in_idx, ulong sig, fd_stem_context_t
     ctx->cur_spot = NULL;
     break;
   }
-  case IN_KIND_EXECUTED_TXN: pack_tile_bam_executed_txn_after_frag( ctx, sig ); break;
   }
 
   update_metric_state( ctx, now, FD_PACK_METRIC_STATE_TRANSACTIONS, fd_pack_avail_txn_cnt( ctx->pack )>0 );
@@ -1312,7 +1310,6 @@ unprivileged_init( fd_topo_t const *      topo,
     else if( FD_LIKELY( !strcmp( link->name, "execle_pack"  ) ) ) ctx->in_kind[ i ] = IN_KIND_EXECLE;
     else if( FD_LIKELY( !strcmp( link->name, "sign_pack"    ) ) ) ctx->in_kind[ i ] = IN_KIND_SIGN;
     else if( FD_LIKELY( !strcmp( link->name, "replay_out"   ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
-    else if( FD_LIKELY( !strcmp( link->name, "executed_txn" ) ) ) ctx->in_kind[ i ] = IN_KIND_EXECUTED_TXN;
     else FD_LOG_ERR(( "pack tile has unexpected input link %lu %s", i, link->name ));
   }
 

@@ -29,9 +29,10 @@ they disagree, and report relevant discrepancies.
 ## BAM invariants
 
 - Leader snapshots on `pack_bam_ldr` are latest-value-wins. Results from
-  `pack_bam_res`, `bank_bam`, and `motor_bam` form a durable FIFO across ordinary
-  reconnects within a scheduler generation. Committed execution feedback
-  remains provisional until Motor accepts the microblock.
+  `pack_bam_res` and `motor_bam` form a durable FIFO across ordinary
+  reconnects within a scheduler generation. Execution results ride the
+  batch's last microblock and reach BAM only through Motor, which reports
+  the result of a microblock it drops as `POH_TIMEOUT`.
 - Preserve `revert_on_error` atomicity and the `bam_status`/`bam_gen` ownership
   handshake when changing scheduling or mode transitions.
 - When inbound limits change, compare `src/disco/bam/fd_bam_types.h` with

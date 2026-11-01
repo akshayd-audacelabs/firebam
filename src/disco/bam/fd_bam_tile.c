@@ -94,8 +94,9 @@ metrics_write( fd_bam_tile_t * ctx ) {
   FD_MCNT_SET(       BAM, ATOMIC_BATCH_PUBLISHED,                ctx->metrics.atomic_batch_published_cnt );
   /* Results lost to overruns of the unreliable result links also count. */
   ulong dropped_cnt = ctx->metrics.feedback_results_dropped_cnt;
-  for( ulong i=0UL; i<=ctx->bank_bam_in_cnt; i++ ) {
-    ulong in_idx = i<ctx->bank_bam_in_cnt ? ctx->bank_bam_in_idx+i : ctx->pack_bam_result_in_idx;
+  ulong const result_in_idx[ 2 ] = { ctx->motor_bam_in_idx, ctx->pack_bam_result_in_idx };
+  for( ulong i=0UL; i<2UL; i++ ) {
+    ulong in_idx = result_in_idx[ i ];
     if( FD_UNLIKELY( in_idx>=fd_metrics_base_tl[ 0 ] ) ) continue;
     volatile ulong const * link = fd_metrics_link_in( fd_metrics_base_tl, in_idx );
     dropped_cnt += link[ FD_METRICS_COUNTER_LINK_FRAG_POLLING_OVERRUN_OFF ] + link[ FD_METRICS_COUNTER_LINK_FRAG_READING_OVERRUN_OFF ];
@@ -381,7 +382,7 @@ fd_bam_tile_begin_scheduler_generation( fd_bam_tile_t * ctx ) {
    chunks, or unexpected in_idx; after_frag must no-op. */
 enum {
   FD_BAM_FRAG_STAGED_NONE                  = 0U,
-  FD_BAM_FRAG_STAGED_RESULT                = 1U, /* fd_bam_bundle_result_t from bank_bam, motor_bam or pack_bam_res */
+  FD_BAM_FRAG_STAGED_RESULT                = 1U, /* fd_bam_bundle_result_t from motor_bam or pack_bam_res */
   FD_BAM_FRAG_STAGED_LEADER                = 2U, /* fd_bam_leader_state_t from pack_bam_ldr */
   FD_BAM_FRAG_STAGED_REPLAY_RESET          = 3U, /* fd_poh_reset_t: next_leader_slot is a local leader schedule hint */
   FD_BAM_FRAG_STAGED_REPLAY_SLOT_COMPLETED = 4U, /* fd_replay_slot_completed_t: epoch bound and slot-based schedule recheck */
@@ -509,7 +510,6 @@ bam_during_frag( fd_bam_tile_t * ctx,
   uchar                   staged_kind = FD_BAM_FRAG_STAGED_RESULT;
   char const *            frag_what   = "BAM result fragment";
 
-  ulong bank_in_idx = in_idx - ctx->bank_bam_in_idx;
   if( FD_UNLIKELY( in_idx == ctx->replay_in_idx ) ) {
     frag_in     = &ctx->replay_in;
     if( sig==REPLAY_SIG_RESET ) {
@@ -527,8 +527,9 @@ bam_during_frag( fd_bam_tile_t * ctx,
     } else {
       return;
     }
-  } else if( FD_UNLIKELY( bank_in_idx < ctx->bank_bam_in_cnt ) ) {
-    frag_in = &ctx->bank_in[ bank_in_idx ];
+  } else if( FD_LIKELY( in_idx == ctx->motor_bam_in_idx ) ) {
+    frag_in   = &ctx->motor_result_in;
+    frag_what = "motor->bam result fragment";
   } else if( FD_LIKELY( in_idx == ctx->pack_bam_leader_in_idx ) ) {
     frag_in     = &ctx->pack_leader_in;
     expected_sz = sizeof(fd_bam_leader_state_t);
@@ -829,7 +830,7 @@ fd_bam_test_next_deadline( fd_bam_tile_t * ctx ) {
    stem's default check (every reliable out has STEM_BURST credits)
    reports backpressure.  after_credit checks bam_verif credits per
    batch, so a short bam_verif must not stop the stem from polling the
-   feedback links (motor_bam, bank_bam, pack_bam_res; unreliable, so a
+   feedback links (motor_bam, pack_bam_res; unreliable, so a
    stalled BAM tile never backpressures their producers) that the
    verify pipeline transitively waits on.  The loop is released when
    nothing is queued, the head batch fits in bam_verif's credits, or a
@@ -1156,6 +1157,7 @@ privileged_init( fd_topo_t const *      topo,
   ctx->decoded_multi   = (fd_bam_decoded_multi_batch_t *)decoded_multi_mem;
   ctx->tcp_sock        = -1;
   ctx->bam_leader_state.slot = ULONG_MAX;
+  ctx->motor_bam_in_idx       = ULONG_MAX;
   ctx->pack_bam_leader_in_idx = ULONG_MAX;
   ctx->pack_bam_result_in_idx = ULONG_MAX;
   ctx->replay_in_idx = ULONG_MAX;
@@ -1277,20 +1279,12 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->keyswitch = fd_keyswitch_join( fd_topo_obj_laddr( topo, tile->id_keyswitch_obj_id ) );
   FD_TEST( ctx->keyswitch );
 
-  /* bank_bam links are followed by motor_bam, all contiguous and polled. */
-  ulong bank_in_idx = fd_topo_find_tile_in_link( topo, tile, "bank_bam", 0UL );
-  if( FD_UNLIKELY( bank_in_idx==ULONG_MAX ) ) FD_LOG_ERR(( "Missing bank_bam link" ));
-  for( ulong raw_in_idx=bank_in_idx; raw_in_idx<tile->in_cnt; raw_in_idx++ ) {
-    char const * name = topo->links[ tile->in_link_id[ raw_in_idx ] ].name;
-    if( FD_UNLIKELY( strcmp( name, "bank_bam" ) && strcmp( name, "motor_bam" ) ) ) break;
-    if( FD_UNLIKELY( ctx->bank_bam_in_cnt>=FD_BAM_BANK_IN_MAX ) ) FD_LOG_ERR(( "too many BAM result links" ));
-    ulong in_idx = bam_in_link( topo, tile, raw_in_idx, &ctx->bank_in[ ctx->bank_bam_in_cnt ] );
-    if( !ctx->bank_bam_in_cnt++ ) ctx->bank_bam_in_idx = in_idx;
-  }
-
+  ulong motor_in_idx  = fd_topo_find_tile_in_link( topo, tile, "motor_bam",    0UL );
   ulong leader_in_idx = fd_topo_find_tile_in_link( topo, tile, "pack_bam_ldr", 0UL );
   ulong result_in_idx = fd_topo_find_tile_in_link( topo, tile, "pack_bam_res", 0UL );
-  if( FD_UNLIKELY( leader_in_idx==ULONG_MAX || result_in_idx==ULONG_MAX ) ) FD_LOG_ERR(( "Missing pack_bam_ldr or pack_bam_res link" ));
+  if( FD_UNLIKELY( motor_in_idx==ULONG_MAX || leader_in_idx==ULONG_MAX || result_in_idx==ULONG_MAX ) )
+    FD_LOG_ERR(( "Missing motor_bam, pack_bam_ldr or pack_bam_res link" ));
+  ctx->motor_bam_in_idx       = bam_in_link( topo, tile, motor_in_idx,  &ctx->motor_result_in );
   ctx->pack_bam_leader_in_idx = bam_in_link( topo, tile, leader_in_idx, &ctx->pack_leader_in );
   ctx->pack_bam_result_in_idx = bam_in_link( topo, tile, result_in_idx, &ctx->pack_result_in );
 

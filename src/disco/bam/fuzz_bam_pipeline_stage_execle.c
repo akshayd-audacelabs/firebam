@@ -27,6 +27,7 @@ struct bam_fuzz_execle {
   fd_bank_t *        bank;
 
   bam_fuzz_outs_t    outs;
+  ulong              motor_bam_chunk;
 };
 
 static void
@@ -118,9 +119,9 @@ bam_fuzz_execle_new( fd_wksp_t *             wksp,
     for( ulong j=0UL; j<i; j++ ) ctx->txn_in[ i ].bundle.prev_txn_outs[ j ] = &ctx->txn_out[ j ];
   }
 
-  *ctx->out_poh  = bam_fuzz_execle_out( h, BAM_FUZZ_EXECLE_OUT_MOTOR,    wksp, MAX_MICROBLOCK_SZ              );
-  *ctx->out_bam  = bam_fuzz_execle_out( h, BAM_FUZZ_EXECLE_OUT_BANK_BAM, wksp, sizeof(fd_bam_bundle_result_t) );
+  *ctx->out_poh  = bam_fuzz_execle_out( h, BAM_FUZZ_EXECLE_OUT_MOTOR, wksp, MAX_MICROBLOCK_SZ );
   *ctx->out_pack = (fd_execle_out_t){ .idx = ULONG_MAX };
+  h->motor_bam_chunk = bam_fuzz_execle_out( h, BAM_FUZZ_EXECLE_OUT_MOTOR_BAM, wksp, sizeof(fd_bam_bundle_result_t) ).chunk0;
 
   bam_fuzz_execle_runtime_bind( h );
   fd_memcpy( out, h->outs.link, sizeof(h->outs.link) );
@@ -271,5 +272,15 @@ bam_fuzz_execle_frag( bam_fuzz_execle_t *    h,
   bam_fuzz_execle_seed_microblock( h, meta );
   during_frag( h->ctx, 0UL, seq, meta->sig, meta->chunk, meta->sz, meta->ctl );
   after_frag( h->ctx, 0UL, seq, meta->sig, meta->sz, meta->tsorig, meta->tspub, h->outs.stem );
+
+  bam_fuzz_link_t const * poh       = &h->outs.link[ BAM_FUZZ_EXECLE_OUT_MOTOR     ];
+  bam_fuzz_link_t const * motor_bam = &h->outs.link[ BAM_FUZZ_EXECLE_OUT_MOTOR_BAM ];
+  for( ulong poh_seq=res.out[ BAM_FUZZ_EXECLE_OUT_MOTOR ].lo; poh_seq<h->outs.seqs[ BAM_FUZZ_EXECLE_OUT_MOTOR ]; poh_seq++ ) {
+    fd_frag_meta_t const * m = poh->mcache + fd_mcache_line_idx( poh_seq, poh->depth );
+    ulong sz = m->sz;
+    fd_bam_bundle_result_t const * carried = fd_bam_microblock_strip_result( fd_chunk_to_laddr_const( poh->mem, m->chunk ), &sz );
+    if( carried ) fd_bam_publish_result( h->outs.stem, BAM_FUZZ_EXECLE_OUT_MOTOR_BAM, motor_bam->mem, &h->motor_bam_chunk,
+                                         motor_bam->chunk0, motor_bam->wmark, carried );
+  }
   return bam_fuzz_outs_end( &h->outs, res );
 }

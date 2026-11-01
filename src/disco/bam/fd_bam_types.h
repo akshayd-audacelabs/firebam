@@ -11,9 +11,9 @@
 /* FD_BAM_MAX_PENDING_RESULTS is the bundle result queue depth, so long disconnects
  * don't drop SchedulerMessage payloads. */
 #define FD_BAM_MAX_PENDING_RESULTS 2048U
-/* FD_BAM_RESULT_LINK_DEPTH is the depth of the pack_bam_res, bank_bam and
-   motor_bam links.  BAM consumes them unreliably so a stalled BAM tile never
-   backpressures pack, execution or motor; as in jito-solana, whose result
+/* FD_BAM_RESULT_LINK_DEPTH is the depth of the pack_bam_res and motor_bam
+   links.  BAM consumes them unreliably so a stalled BAM tile never
+   backpressures pack or motor; as in jito-solana, whose result
    try_send drops when its channel is full, an overrun drops results (counted
    in the link overrun metrics).  8x the BAM FIFO absorbs a stall of roughly
    a second at peak result rates for about 2 MiB per link. */

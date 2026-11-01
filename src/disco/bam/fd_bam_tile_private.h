@@ -82,11 +82,6 @@ struct fd_bam_in_ctx {
 
 typedef struct fd_bam_in_ctx fd_bam_in_ctx_t;
 
-/* One bank_bam input per execution tile, plus motor_bam.
-   Must cover FD_PACK_MAX_EXECLE_TILES + 1. */
-
-#define FD_BAM_BANK_IN_MAX (64UL)
-
 /* fd_bam_metrics_t contains private metric counters.  These get
    published to fd_metrics periodically.
    Counters are cumulative over the BAM tile lifetime and are not reset
@@ -211,12 +206,11 @@ struct fd_bam_tile {
   fd_keyswitch_t * keyswitch;                     /* Manages the identity keypair */
   fd_keyguard_client_t keyguard_client[1];        /* Keyguard client used to request signatures */
 
-  ulong            bank_bam_in_idx;               /* First polled result input index in stem callback space */
-  ulong            bank_bam_in_cnt;               /* Count of contiguous bank_bam and motor_bam durable result inputs */
+  ulong            motor_bam_in_idx;              /* Polled input index for motor_bam execution results */
   ulong            pack_bam_leader_in_idx;        /* Polled input index for pack_bam_ldr snapshot/control updates */
   ulong            pack_bam_result_in_idx;        /* Polled input index for pack_bam_res durable bundle feedback */
   ulong            replay_in_idx;                 /* Optional polled replay input index for local leader schedule hints */
-  fd_bam_in_ctx_t  bank_in[ FD_BAM_BANK_IN_MAX ]; /* Execution and motor result inputs */
+  fd_bam_in_ctx_t  motor_result_in;               /* Motor->BAM execution result ingress */
   fd_bam_in_ctx_t  pack_leader_in;                /* Pack->BAM latest-value-wins leader-state ingress */
   fd_bam_in_ctx_t  pack_result_in;                /* Pack->BAM durable result ingress */
   fd_bam_in_ctx_t  replay_in;                     /* Replay schedule and completed-slot progress ingress */
@@ -309,7 +303,7 @@ struct fd_bam_tile {
   ushort                feedback_queue_depth;             /* Queue depth of bam_results (0 <= cnt < FD_BAM_MAX_PENDING_RESULTS) */
   ushort                bam_results_head;                /* Index of next result to flush (wraps modulo FD_BAM_MAX_PENDING_RESULTS) */
   ushort                bam_results_tail;                /* Index of next slot to fill (wraps modulo FD_BAM_MAX_PENDING_RESULTS) */
-  fd_bam_bundle_result_t bam_results[ FD_BAM_MAX_PENDING_RESULTS ]; /* Durable FIFO result ring fed by pack_bam_res, bank_bam, and motor_bam; preserved across reconnect/reset until flushed */
+  fd_bam_bundle_result_t bam_results[ FD_BAM_MAX_PENDING_RESULTS ]; /* Durable FIFO result ring fed by pack_bam_res and motor_bam; preserved across reconnect/reset until flushed */
   fd_bam_leader_state_t  bam_leader_state;               /* Latest pack_bam_ldr snapshot awaiting publication; newer unsent snapshots supersede older ones */
   fd_bam_leader_slot_end_tracker_t leader_slot_end[ FD_BAM_LEADER_SLOT_END_TRACKER_CNT ]; /* Per-slot metric tracker used to record whether healthy BAM-owned slots saw fresh work before slot end. */
   ulong                 next_leader_slot;                /* Upcoming local leader slot from replay resets or schedule announcements, or ULONG_MAX if none is known */

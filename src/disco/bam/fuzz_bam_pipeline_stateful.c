@@ -68,8 +68,7 @@ typedef enum {
 
 #define BAM_FUZZ_VERIFY_CNT (3UL)
 
-#define BAM_FUZZ_BANK_IN_EXECLE_IDX (0UL)
-#define BAM_FUZZ_BANK_IN_BASE_IDX   (3UL)
+#define BAM_FUZZ_MOTOR_BAM_IN_IDX (3UL)
 static fd_wksp_t * g_bam_fuzz_wksp;
 static long        g_bam_fuzz_now = 1L;
 
@@ -414,11 +413,10 @@ bam_fuzz_ingest_pack_outputs( bam_fuzz_state_t *     f,
                                                       sizeof(fd_microblock_execle_trailer_t)+1UL, MAX_MICROBLOCK_SZ );
     bam_fuzz_res_t execle_res = bam_fuzz_execle_frag( f->execle, meta, seq );
     bam_fuzz_range_t motor = execle_res.out[ BAM_FUZZ_EXECLE_OUT_MOTOR ];
-    bam_fuzz_range_t bank  = execle_res.out[ BAM_FUZZ_EXECLE_OUT_BANK_BAM ];
+    bam_fuzz_range_t results = execle_res.out[ BAM_FUZZ_EXECLE_OUT_MOTOR_BAM ];
     f->execle_output_cnt += motor.hi-motor.lo;
-    for( ulong bank_seq=bank.lo; bank_seq<bank.hi; bank_seq++ ) {
-      bam_fuzz_ingest_result_link( f, state->bank_bam_in_idx + BAM_FUZZ_BANK_IN_EXECLE_IDX,
-                                   &f->execle_out[ BAM_FUZZ_EXECLE_OUT_BANK_BAM ], bank_seq );
+    for( ulong result_seq=results.lo; result_seq<results.hi; result_seq++ ) {
+      bam_fuzz_ingest_result_link( f, state->motor_bam_in_idx, &f->execle_out[ BAM_FUZZ_EXECLE_OUT_MOTOR_BAM ], result_seq );
     }
   }
 }
@@ -1160,12 +1158,11 @@ LLVMFuzzerTestOneInput( uchar const * data,
   f->pack   = bam_fuzz_pack_new  ( g_bam_fuzz_wksp, &f->resolv_out[0], f->pack_out, &f->pack_execle_busy_fseq );
   f->execle = bam_fuzz_execle_new( g_bam_fuzz_wksp, &f->pack_out[ BAM_FUZZ_PACK_OUT_EXECLE ], f->execle_out, f->pack_execle_busy_fseq );
 
-  bam_fuzz_link_t const * bank_bam   = &f->execle_out[ BAM_FUZZ_EXECLE_OUT_BANK_BAM ];
-  bam_fuzz_link_t const * bam_leader = &f->pack_out  [ BAM_FUZZ_PACK_OUT_BAM_LEADER  ];
-  bam_fuzz_link_t const * bam_result = &f->pack_out  [ BAM_FUZZ_PACK_OUT_BAM_RESULT  ];
-  state->bank_bam_in_idx = BAM_FUZZ_BANK_IN_BASE_IDX;
-  state->bank_bam_in_cnt = 1UL;
-  state->bank_in[ BAM_FUZZ_BANK_IN_EXECLE_IDX ] = (fd_bam_in_ctx_t){ .mem = bank_bam->mem,   .chunk0 = bank_bam->chunk0,   .wmark = bank_bam->wmark   };
+  bam_fuzz_link_t const * motor_bam  = &f->execle_out[ BAM_FUZZ_EXECLE_OUT_MOTOR_BAM ];
+  bam_fuzz_link_t const * bam_leader = &f->pack_out  [ BAM_FUZZ_PACK_OUT_BAM_LEADER   ];
+  bam_fuzz_link_t const * bam_result = &f->pack_out  [ BAM_FUZZ_PACK_OUT_BAM_RESULT   ];
+  state->motor_bam_in_idx = BAM_FUZZ_MOTOR_BAM_IN_IDX;
+  state->motor_result_in                        = (fd_bam_in_ctx_t){ .mem = motor_bam->mem,  .chunk0 = motor_bam->chunk0,  .wmark = motor_bam->wmark  };
   state->pack_bam_leader_in_idx = 1UL;
   state->pack_leader_in                         = (fd_bam_in_ctx_t){ .mem = bam_leader->mem, .chunk0 = bam_leader->chunk0, .wmark = bam_leader->wmark };
   state->pack_bam_result_in_idx = 2UL;

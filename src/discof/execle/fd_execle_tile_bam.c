@@ -1,5 +1,6 @@
-/* FireBAM part of the execle tile: BAM batch results for the BAM
-   tile.  Included once by fd_execle_tile.c after fd_execle_tile_t. */
+/* FireBAM part of the execle tile: BAM batch results, which ride the
+   batch's last microblock to motor (fd_bam_microblock.h).  Included
+   once by fd_execle_tile.c after fd_execle_tile_t. */
 
 #include "../../disco/bam/fd_bam_microblock.h"
 
@@ -54,20 +55,11 @@ bam_result_txn( fd_bam_bundle_result_t * bam_res,
   bam_fill_txn_result( bam_res, 0UL, txn_out );
 }
 
+/* bam_bundle_failed_result builds the result of a BAM revert batch
+   that failed at failed_idx (setup_bundle is 0 if its accounts could
+   not be prepared). */
 static inline void
-bam_publish_result( fd_execle_tile_t *             ctx,
-                    fd_stem_context_t *            stem,
-                    fd_bam_bundle_result_t const * bam_res ) {
-  fd_bam_publish_result( stem, ctx->out_bam->idx, ctx->out_bam->mem, &ctx->out_bam->chunk,
-                         ctx->out_bam->chunk0, ctx->out_bam->wmark, bam_res );
-}
-
-/* bam_bundle_failed_result builds and publishes the result of a BAM
-   revert batch that failed at failed_idx (setup_bundle is 0 if its
-   accounts could not be prepared). */
-static inline void
-bam_bundle_failed_result( fd_execle_tile_t *       ctx,
-                          fd_stem_context_t *      stem,
+bam_bundle_failed_result( fd_execle_tile_t const * ctx,
                           fd_bam_bundle_result_t * bam_res,
                           ulong                    txn_cnt,
                           ulong                    failed_idx,
@@ -81,5 +73,4 @@ bam_bundle_failed_result( fd_execle_tile_t *       ctx,
   fd_bam_result_set_txn_error( bam_res, failed_idx, fd_bam_txn_err_from_runtime_err( ctx->txn_out[ failed_idx ].err.txn_err ) );
   if( FD_LIKELY( setup_bundle ) )
     for( ulong i=0UL; i<=failed_idx; i++ ) bam_fill_txn_result( bam_res, i, &ctx->txn_out[ i ] );
-  bam_publish_result( ctx, stem, bam_res );
 }

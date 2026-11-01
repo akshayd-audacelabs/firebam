@@ -5,7 +5,7 @@ This doc covers the stateful BAM pipeline fuzzer in
 
 ## Files
 
-- `fuzz_bam_pipeline_stateful.c`: stateful fuzz target that drives scheduler protobuf ingress through production callbacks connected by synthetic `verify -> dedup -> resolv -> pack -> execle` links, feeds pack/execle failure results back to BAM, and checks outbound result/leader protobuf encoding.
+- `fuzz_bam_pipeline_stateful.c`: stateful fuzz target that drives scheduler protobuf ingress through production callbacks connected by synthetic `verify -> dedup -> resolv -> pack -> execle` links, feeds pack results and the results execle's microblocks carry back to BAM, and checks outbound result/leader protobuf encoding.
 - `fuzz_bam_pipeline_stage_*.c`: per-stage adapters used by the stateful target; these are not standalone fuzz targets.
 - `fuzz_bam_pipeline_stage.h`: the adapter API, shared transaction fixtures, and synthetic mcache/dcache link and stem helpers.
 
@@ -25,10 +25,11 @@ and restore `bam_verif` order. This target does not exercise concurrent stem
 operation, real link backpressure, ownership handoffs, or transport
 authentication/TLS.
 
-There is no motor adapter. The harness counts `execle_poh` outputs but
-does not turn their provisional committed outcomes into `motor_bam` feedback.
-Execution feedback consumed here comes from `bank_bam` not-committed outcomes;
-synthetic successful result entries exercise committed-result wire encoding.
+There is no motor adapter. The execle adapter publishes the result each
+`execle_poh` microblock carries on its `motor_bam` link, as Motor does for one
+execle tile; Motor's slot checks, including its `POH_TIMEOUT` answer for a
+microblock it drops, are not modeled. Synthetic successful result entries
+still exercise committed-result wire encoding.
 The shadow FIFO checks queue/encoding consistency, not an independent model
 of scheduling, execution correctness, or CU accounting.
 
