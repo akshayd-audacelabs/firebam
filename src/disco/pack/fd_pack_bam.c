@@ -187,7 +187,8 @@ fd_pack_peek_bundle_candidate( fd_pack_t const * pack,
 /* Exact predecessor permissions are required here: the normal fast bitsets
    omit accounts when their finite mapping is exhausted.  This bounded
    scratch index contains every predecessor account and resolves hash
-   collisions by comparing full keys.  Each chain has at most 5*64 entries. */
+   collisions by comparing full keys.  Each chain has at most
+   FD_PACK_BAM_LOOKAHEAD_TXN_MAX*64 entries. */
 typedef struct {
   fd_acct_addr_t const * key;
   ushort                next;
@@ -197,8 +198,9 @@ typedef struct {
 
 /* Called after a conflict on a valid hint that leaves the pending
    bundles unchanged.  Return the first ready successor independent of
-   all preceding groups.  The exact account index covers at most five
-   txns. */
+   all preceding groups.  The exact account index covers at most
+   FD_PACK_BAM_LOOKAHEAD_TXN_MAX txns. */
+FD_STATIC_ASSERT( FD_PACK_BAM_LOOKAHEAD_TXN_MAX*FD_TXN_ACCT_ADDR_MAX<USHORT_MAX, lookahead_acct_idx );
 static ulong
 fd_pack_bam_independent_candidate( fd_pack_t *          pack,
                                    int                  schedule_flags,
@@ -210,7 +212,7 @@ fd_pack_bam_independent_candidate( fd_pack_t *          pack,
   ulong generation = pack->bundle_hint_generation;
   treap_rev_iter_t iter = (treap_rev_iter_t)(head_hint & USHORT_MAX);
 
-  fd_pack_lookahead_acct_t accts[ FD_PACK_MAX_TXN_PER_BUNDLE*FD_TXN_ACCT_ADDR_MAX ];
+  fd_pack_lookahead_acct_t accts[ FD_PACK_BAM_LOOKAHEAD_TXN_MAX*FD_TXN_ACCT_ADDR_MAX ];
   ushort heads[512];
   fd_memset( heads, 0xff, sizeof(heads) );
   ulong seed = bitset_map_seed( pack->acct_to_bitset );
@@ -229,7 +231,8 @@ fd_pack_bam_independent_candidate( fd_pack_t *          pack,
       fd_pack_ord_txn_t const * cur = treap_rev_iter_ele_const( iter, pack->pool );
       if( RC_TO_REL_BUNDLE_IDX( cur->rewards, cur->compute_est )!=bundle_idx ) break;
       /* Never enter a partial group or transfer another batch's readiness. */
-      if( FD_UNLIKELY( scanned==FD_PACK_MAX_TXN_PER_BUNDLE ||
+      if( FD_UNLIKELY( scanned==FD_PACK_BAM_LOOKAHEAD_TXN_MAX ||
+                       txn_cnt==FD_PACK_MAX_TXN_PER_BUNDLE ||
                        cur->txn->source_tpu!=FD_TXN_M_TPU_SOURCE_BAM ||
                        cur->txn_e->bam.batch_idx!=txn_cnt ||
                        cur->txn_e->bam.seq_id!=txn0->bam.seq_id ||

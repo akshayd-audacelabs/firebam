@@ -1013,6 +1013,9 @@ test_bam_conflict_lookahead( void ) {
         insert_lookahead_batch( pack, 702UL, 1UL, "Y", "", 0, 1 );
         insert_lookahead_batch( pack, 703UL, 1UL, "Z", "", 0, 1 );
       } else {
+        /* The five-transaction head and dependent singles fill the scan. */
+        if( kind==8 ) for( ulong j=0UL; j<FD_PACK_BAM_LOOKAHEAD_TXN_MAX-5UL; j++ )
+          insert_lookahead_batch( pack, 710UL+j, 1UL, "X", "", 0, 1 );
         insert_lookahead_batch( pack, 705UL, kind==7 ? 2UL : 1UL, kind==5 ? "RY" : kind==13 ? "X" : "Y", "", 0, 1 );
         if( kind==7 ) {
           insert_lookahead_batch( pack, 707UL, 1UL, "Y", "", 0, 1 ); /* Depends on worker-ineligible batch. */
@@ -1080,6 +1083,49 @@ test_bam_conflict_lookahead( void ) {
               1UL, flags, hint, test_lookahead_ready, &ready, outcome.results ) );
   FD_TEST( !calls );
   fd_pack_delete( fd_pack_leave( pack ) );
+}
+
+/* A scan examines at most FD_PACK_BAM_LOOKAHEAD_TXN_MAX transactions,
+   the blocked head included, and never enters a batch it cannot finish.
+   Kinds: a single successor that is the last transaction examined, one
+   past it, a two-transaction successor ending at the bound, and one
+   straddling it. */
+static void
+test_bam_lookahead_depth( void ) {
+  for( ulong kind=0UL; kind<4UL; kind++ ) {
+    ulong succ_cnt  = kind>=2UL ? 2UL : 1UL;
+    ulong chain_cnt = FD_PACK_BAM_LOOKAHEAD_TXN_MAX-1UL-succ_cnt+(kind&1UL);
+    fd_pack_t * pack = init_all_with_meta( 2048UL, 2UL, 1UL, sizeof(ulong), 1 );
+    fd_txn_e_t * live = fd_pack_insert_txn_init( pack );
+    make_transaction1( live->txnp, 900UL, 1000U, 32U, 12.0, "X", "", NULL, NULL );
+    ulong deleted;
+    FD_TEST( fd_pack_insert_txn_fini( pack, live, 1000UL, &deleted )>=0 );
+    FD_TEST( fd_pack_schedule_next_microblock( pack, FD_PACK_TEST_MAX_COST_PER_BLOCK,
+                                               0UL, FD_PACK_SCHEDULE_TXN, outcome.results )==1UL );
+    insert_lookahead_batch( pack, 700UL, 1UL, "X", "", 0, 1 );
+    for( ulong j=0UL; j<chain_cnt; j++ ) insert_lookahead_batch( pack, 710UL+j, 1UL, "X", "", 0, 1 );
+    insert_lookahead_batch( pack, 800UL, succ_cnt, "Y", "", 0, 1 );
+
+    int flags = FD_PACK_SCHEDULE_BAM_ONLY | FD_PACK_SCHEDULE_BUNDLE | FD_PACK_SCHEDULE_BAM_READY;
+    ulong calls = 0UL;
+    test_lookahead_ready_t ready = { .barrier_id=ULONG_MAX, .multi_id=800UL, .multi_cnt=succ_cnt, .calls=&calls };
+    ulong miss0 = FD_MCNT_GET( PACK, BAM_LOOKAHEAD_MISS );
+    ulong hint;
+    FD_TEST( fd_pack_peek_bundle_candidate( pack, 1, &hint, NULL ) );
+    ulong scheduled = fd_pack_schedule_next_microblock_with_bundle_hint( pack, FD_PACK_TEST_MAX_COST_PER_BLOCK,
+                          1UL, flags, hint, test_lookahead_ready, &ready, outcome.results );
+    /* Every group entered in full is checked for readiness. */
+    FD_TEST( calls==FD_PACK_BAM_LOOKAHEAD_TXN_MAX+1UL-succ_cnt );
+    FD_TEST( FD_MCNT_GET( PACK, BAM_LOOKAHEAD_MISS )-miss0==(kind&1UL) );
+    if( kind&1UL ) {
+      FD_TEST( !scheduled );
+    } else {
+      FD_TEST( scheduled==succ_cnt && candidate_test_txn_id( outcome.results[0].txnp )==800UL );
+      FD_TEST( fd_pack_microblock_complete( pack, 1UL ) );
+    }
+    FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+    fd_pack_delete( fd_pack_leave( pack ) );
+  }
 }
 
 static void
@@ -1910,6 +1956,7 @@ main( int     argc,
   test_bam_secondary_fifo_head();
   test_bam_secondary_capacity_deferral();
   test_bam_conflict_lookahead();
+  test_bam_lookahead_depth();
   test_bam_lookahead_permissions();
   test_bam_lookahead_bucket_collision();
   test_bundle_ordinal_rebase();

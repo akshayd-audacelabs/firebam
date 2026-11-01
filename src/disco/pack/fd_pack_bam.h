@@ -72,6 +72,10 @@ int fd_pack_contains_initializer_bundle( fd_pack_t const *        pack,
 #define FD_PACK_SCHEDULE_BAM_SINGLE 16
 #define FD_PACK_SCHEDULE_BAM_READY  32
 
+/* The most transactions, the blocked head included, that one conflict
+   lookahead scan examines. */
+#define FD_PACK_BAM_LOOKAHEAD_TXN_MAX (16UL)
+
 /* The BAM_ONLY bit suppresses normal transactions, votes included, and
    filters bundles to BAM work.  BAM_SINGLE, like BUNDLE,
    enables bundle scheduling, but grants worker eligibility only for a
@@ -91,9 +95,10 @@ int fd_pack_contains_initializer_bundle( fd_pack_t const *        pack,
    Pass ULONG_MAX to opt out of the hint (and BAM readiness).
 
    When ready is non-NULL, a conflict on the common BAM head may trigger
-   lookahead over at most five transactions.  This applies only in BAM_ONLY
-   mode with initializer state Ready.  Every complete predecessor and the
-   candidate must pass ready(ready_ctx,...).  Skipped batches remain account
+   lookahead over at most FD_PACK_BAM_LOOKAHEAD_TXN_MAX transactions.
+   This applies only in BAM_ONLY mode with initializer state Ready.
+   Every complete predecessor and the candidate must pass
+   ready(ready_ctx,...).  Skipped batches remain account
    dependencies, including batches this worker cannot execute.  Initializers,
    deferred, incomplete and foreign batches remain barriers.  Capacity
    failures never authorize lookahead and deferred work is never revived.
