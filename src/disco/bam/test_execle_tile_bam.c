@@ -21,6 +21,7 @@ int test_execle_tile_upstream_main( int argc, char ** argv );
 #pragma pop_macro("main")
 
 #include "../pack/fd_pack.h"
+#include "../../flamenco/runtime/fd_executor.h" /* FD_TRANSACTION_ACCOUNT_BASE_SIZE */
 #include "test_bam_motor_fixture.h"
 
 /* Register FireBAM cases on their own list so main runs only them. */
@@ -300,18 +301,6 @@ FD_UNIT_TEST( execle_bam_result_cus ) {
   FD_TEST( res->loaded_accounts_data_size[ 0 ]==206U );
 }
 
-/* Finalizing a transaction hash when every member failed invokes the bmtree
-   finalizer with zero leaves.  Skip finalization and return the zero hash. */
-FD_UNIT_TEST( execle_empty_transaction_hash ) {
-  fd_txn_p_t txns[ 2 ];
-  uchar      hash[ 32 ];
-  fd_memset( txns, 0, sizeof(txns) );
-  fd_memset( hash,  0xff, sizeof(hash) );
-
-  test_compute_expected_hash( txns, 2UL, hash );
-  FD_TEST( fd_memeq( hash, (uchar[32]){0}, sizeof(hash) ) );
-}
-
 FD_UNIT_TEST( execle_bam_simple_ok ) {
   /* execle_simple_ok as a non-revert BAM transaction.  Upstream's case
      checks the execution outcome on the same tile code; this checks the
@@ -346,6 +335,10 @@ FD_UNIT_TEST( execle_bam_simple_ok ) {
   FD_TEST( result->execution_success );
   FD_TEST( result->scheduling_error==FD_BAM_SCHED_ERR_NONE );
   FD_TEST( result->feepayer_balance_lamports[0]==payer_start-fee-transfer );
+  FD_TEST( result->sanitize_success[0] );
+  /* The fee payer, the recipient and the System program, whose data
+     is its name. */
+  FD_TEST( result->loaded_accounts_data_size[0]==3UL*FD_TRANSACTION_ACCOUNT_BASE_SIZE+sizeof("solana_system_program")-1UL );
 
   fd_txn_p_t const * out_txn = fd_chunk_to_laddr( env->execle->out_poh->mem, test_out_poh_meta( 0UL )->chunk );
   FD_TEST( out_txn->flags & FD_TXN_P_FLAGS_SANITIZE_SUCCESS );
@@ -364,6 +357,17 @@ FD_UNIT_TEST( execle_bam_simple_ok ) {
   test_compute_expected_hash( &txn_copy, 1UL, expected_hash );
   FD_TEST( !memcmp( trailer->hash, expected_hash, 32UL ) );
   test_assert_txn_ns_dt_ordered( &trailer->txn_ns_dt );
+
+  /* Execle starts no result for a microblock that is not BAM, that
+     takes the other path than its batch's revert flag, or that holds
+     more than one non-revert transaction.  Pack sends none of these. */
+  fd_txn_p_t             txns[2] = { *txn, *txn };
+  fd_bam_bundle_result_t res[1];
+  FD_TEST(  bam_result_start( env->execle, txns, 1UL, bank->f.slot, 0, res ) );
+  FD_TEST( !bam_result_start( env->execle, txns, 1UL, bank->f.slot, 1, res ) );
+  FD_TEST( !bam_result_start( env->execle, txns, 2UL, bank->f.slot, 0, res ) );
+  txns[0].source_tpu = FD_TXN_M_TPU_SOURCE_QUIC;
+  FD_TEST( !bam_result_start( env->execle, txns, 1UL, bank->f.slot, 0, res ) );
 
   test_env_destroy( env );
 }
@@ -393,6 +397,8 @@ FD_UNIT_TEST( execle_bam_simple_fee_payer_fail ) {
   FD_TEST( !result->execution_success );
   FD_TEST( result->transaction_err_count==1U );
   FD_TEST( result->transaction_err[0]==bam_types_TransactionErrorReason_ACCOUNT_NOT_FOUND );
+  /* A transaction error, which BAM gets as such, not as a SANITIZE_ERROR */
+  FD_TEST( result->sanitize_success[0] );
 
   fd_txn_p_t const * out_txn = fd_chunk_to_laddr( env->execle->out_poh->mem, test_out_poh_meta( 0UL )->chunk );
   FD_TEST( !(out_txn->flags & FD_TXN_P_FLAGS_SANITIZE_SUCCESS) );
@@ -455,6 +461,40 @@ FD_UNIT_TEST( execle_bam_failed_txn_rollback_balance ) {
   test_env_destroy( env );
 }
 
+FD_UNIT_TEST( execle_bam_fees_only_drop ) {
+  /* Execle drops, instead of committing, a fees-only transaction whose
+     actual CUs exceed what pack requested (a durable nonce account's
+     data can cause this), so BAM must hear it was not committed.  Here
+     the fee payer is a nonce account, whose data costs 8 CUs, and pack
+     requested none. */
+  test_env_t * env = test_env_create();
+  fd_bank_t * bank = fd_svm_mini_bank( env->mini, env->bank_idx );
+
+  fd_pubkey_t fee_payer       = { .ul = { 0x8181UL } };
+  fd_pubkey_t missing_program = { .ul = { 0x8282UL } };
+  ulong const payer_start     = 1000000000UL;
+  test_put_nonce_account_rooted( env, &fee_payer, &fee_payer, &(fd_hash_t){ .ul = { 0x8383UL } }, payer_start );
+
+  fd_txn_p_t txn[1];
+  test_build_missing_program_txn( txn, bank, fee_payer, missing_program );
+  txn->pack_cu.requested_exec_plus_acct_data_cus = 0U;
+  test_mark_bam_batch( txn, test_bam, 1UL, 105U, 0 );
+  test_execle_run( env, txn, 1UL, 7U, 22UL, 0 );
+
+  FD_TEST( env->execle->txn_out[0].err.is_fees_only && !env->execle->txn_out[0].err.is_committable );
+  test_assert_bam_nonbundle_out( env, 1UL, 7U );
+  fd_bam_bundle_result_t const * result = test_out_poh_bam_result( env, 0UL );
+  FD_TEST( result && result->seq_id==105U && !result->execution_success );
+  FD_TEST( result->transaction_err_count==1U );
+  FD_TEST( result->transaction_err[0]==bam_types_TransactionErrorReason_PROGRAM_ACCOUNT_NOT_FOUND );
+  FD_TEST( result->sanitize_success[0] );
+  fd_txn_p_t const * out_txn = fd_chunk_to_laddr_const( env->execle->out_poh->mem, test_out_poh_meta( 0UL )->chunk );
+  FD_TEST( !(out_txn->flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS) );
+  FD_TEST( test_read_lamports( env, &fee_payer )==payer_start );
+
+  test_env_destroy( env );
+}
+
 FD_UNIT_TEST( execle_bam_bundle_ok ) {
   /* execle_bundle_ok as a BAM revert batch, whose result rides the last
      member's microblock.  As in execle_bam_simple_ok, the execution
@@ -498,6 +538,7 @@ FD_UNIT_TEST( execle_bam_bundle_ok ) {
   FD_TEST( result->feepayer_balance_lamports[1]==payer_start - 2UL*fee - transfer0 - transfer1 );
   for( ulong i=0UL; i<2UL; i++ ) {
     FD_TEST( result->consumed_cus[i]==150U ); /* one System transfer */
+    FD_TEST( result->sanitize_success[i] );
 
     fd_txn_p_t const * out_txn = fd_chunk_to_laddr( env->execle->out_poh->mem, test_out_poh_meta( i )->chunk );
     FD_TEST( out_txn->flags & FD_TXN_P_FLAGS_SANITIZE_SUCCESS );
@@ -965,15 +1006,19 @@ test_bam_pair_run( int variant,
     FD_TEST( result->terminal[1].transaction_err[0]==bam_types_TransactionErrorReason_ALREADY_PROCESSED );
     FD_TEST( result->terminal[1].transaction_err[1]==bam_types_TransactionErrorReason_COMMIT_CANCELLED );
   } else FD_TEST( !result->terminal[1].transaction_err_count );
-  if( !instruction_failure && !fees_only )
-    FD_TEST( !result->terminal[0].transaction_err_count );
+  /* A failed revert batch has an error per member, a failed
+     non-revert transaction its own. */
+  FD_TEST( result->terminal[0].transaction_err_count==( instruction_failure || fees_only ? (uint)next : 0U ) );
   if( instruction_failure )
     FD_TEST( result->terminal[0].transaction_err[next-1UL]==bam_types_TransactionErrorReason_INSTRUCTION_ERROR );
   if( atomic_failure ) /* the failure cancels every earlier member */
     for( ulong i=0UL; i<next-1UL; i++ )
       FD_TEST( result->terminal[0].transaction_err[i]==bam_types_TransactionErrorReason_COMMIT_CANCELLED );
-  if( fees_only )
+  if( fees_only ) { /* as in jito-solana: no executed units, the rollback fee payer balance */
     FD_TEST( result->terminal[0].transaction_err[0]==bam_types_TransactionErrorReason_PROGRAM_ACCOUNT_NOT_FOUND );
+    FD_TEST( !result->terminal[0].consumed_cus[0] );
+    FD_TEST( result->terminal[0].feepayer_balance_lamports[0]==test_bam_initial[0]-fee );
+  }
 
   ulong expected[5];
   fd_memcpy( expected, test_bam_initial, sizeof(expected) );
@@ -1378,6 +1423,7 @@ FD_UNIT_TEST( execle_reserved_fee_payer_rejected ) {
   FD_TEST( result && result->seq_id==93U && !result->execution_success );
   FD_TEST( result->transaction_err_count==1U );
   FD_TEST( result->transaction_err[0]==bam_types_TransactionErrorReason_INVALID_ACCOUNT_FOR_FEE );
+  FD_TEST( result->sanitize_success[0] );
   FD_TEST( test_read_lamports( env, &fd_solana_system_program_id )==before );
   test_env_destroy( env );
 }

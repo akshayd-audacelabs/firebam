@@ -210,6 +210,8 @@ test_bam_and_tpu_microblocks( fd_wksp_t * wksp ) {
                              in_chunk, sz, 0UL, 0UL, 0UL, stem ) );
   FD_TEST( seqs[ 0 ]==1UL && seqs[ 2 ]==2UL && ctx->expect_pack_idx==2U );
   FD_TEST( fd_memeq( test_published_result( ts, wksp, depth, 1UL ), &failed, sizeof(failed) ) );
+  /* It went to a new chunk: the BAM tile may not have read the first. */
+  FD_TEST( fd_memeq( test_published_result( ts, wksp, depth, 0UL ), &result, sizeof(result) ) );
 
   /* Ordinary TPU microblocks use the same parser without BAM feedback. */
   sz = test_microblock( fragment, ctx->slot, result.seq_id+2U, 1UL, NULL );
