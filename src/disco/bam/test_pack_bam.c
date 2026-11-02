@@ -957,6 +957,27 @@ insert_lookahead_batch( fd_pack_t * pack,
                                 FD_PACK_IB_TYPE_NONE, &id, NULL ) );
 }
 
+/* Inserts BAM single id writing writes, paid by transaction payer_id's
+   fee payer (account 0), as a searcher reusing one payer. */
+static void
+insert_lookahead_payer_batch( fd_pack_t *  pack,
+                              ulong        id,
+                              ulong        payer_id,
+                              char const * writes ) {
+  fd_txn_p_t payer[1];
+  make_transaction1( payer, payer_id, 1000U, 32U, 5.0, "", "", NULL, NULL );
+  fd_txn_e_t * slots[1];
+  fd_txn_e_t * const * bundle = fd_pack_insert_bundle_init( pack, slots, 1UL );
+  make_transaction1( bundle[0]->txnp, id, 1000U, 32U, 5.0, writes, "", NULL, NULL );
+  fd_memcpy( bundle[0]->txnp->payload+TXN(bundle[0]->txnp)->acct_addr_off,
+             fd_txn_get_acct_addrs( TXN(payer), payer->payload ), sizeof(fd_acct_addr_t) );
+  bundle[0]->txnp->source_tpu = FD_TXN_M_TPU_SOURCE_BAM;
+  bundle[0]->bam = (fd_txn_bam_t){ .seq_id=(uint)id, .scheduler_gen=1U };
+  ulong deleted;
+  FD_TEST( fd_pack_insert_bundle_fini( pack, bundle, 1UL, 1000UL, FD_PACK_IB_TYPE_NONE, &id, &deleted )>=0 );
+  FD_TEST( !deleted );
+}
+
 typedef struct {
   ulong barrier_id;
   ulong multi_id;
@@ -1153,25 +1174,29 @@ test_bam_lookahead_permissions( void ) {
     int live_reads_q;
     int extra_successor;
     int be_barrier;
+    ulong successor_payer; /* the successor pays with this txn's fee payer, or 0 */
     ulong expected;
-  } const cases[9] = {
-    { "head_write_successor_read",  "AX", "",  "Y",  "X", 0, 0, 0, 0, 0, 0UL   },
-    { "head_read_successor_write",  "A",  "X", "XY", "",  0, 0, 0, 0, 0, 0UL   },
-    { "head_write_successor_write", "AX", "",  "X",  "",  0, 0, 0, 0, 0, 0UL   },
-    { "head_alt_write",            "A",  "",  "Y",  "X", 2, 0, 0, 0, 0, 0UL   },
-    { "successor_alt_write",       "A",  "X", "Y",  "",  0, 2, 0, 0, 0, 0UL   },
-    { "successor_alt_read",        "AX", "",  "Y",  "",  0, 1, 0, 0, 0, 0UL   },
-    { "shared_alt_read",           "A",  "X", "Y",  "",  0, 1, 0, 0, 0, 705UL },
-    { "inflight_read_barrier",     "A",  "",  "Q",  "",  0, 0, 1, 1, 0, 706UL },
-    { "block_engine_barrier",      "A",  "",  "Z",  "",  0, 0, 0, 0, 1, 0UL   },
+  } const cases[11] = {
+    { "head_write_successor_read",  "AX", "",  "Y",  "X", 0, 0, 0, 0, 0, 0UL,   0UL   },
+    { "head_read_successor_write",  "A",  "X", "XY", "",  0, 0, 0, 0, 0, 0UL,   0UL   },
+    { "head_write_successor_write", "AX", "",  "X",  "",  0, 0, 0, 0, 0, 0UL,   0UL   },
+    { "head_alt_write",            "A",  "",  "Y",  "X", 2, 0, 0, 0, 0, 0UL,   0UL   },
+    { "successor_alt_write",       "A",  "X", "Y",  "",  0, 2, 0, 0, 0, 0UL,   0UL   },
+    { "successor_alt_read",        "AX", "",  "Y",  "",  0, 1, 0, 0, 0, 0UL,   0UL   },
+    { "shared_alt_read",           "A",  "X", "Y",  "",  0, 1, 0, 0, 0, 0UL,   705UL },
+    { "inflight_read_barrier",     "A",  "",  "Q",  "",  0, 0, 1, 1, 0, 0UL,   706UL },
+    { "block_engine_barrier",      "A",  "",  "Z",  "",  0, 0, 0, 0, 1, 0UL,   0UL   },
+    { "head_fee_payer",            "A",  "",  "Y",  "",  0, 0, 0, 0, 0, 700UL, 0UL   },
+    { "inflight_fee_payer",        "A",  "",  "Y",  "",  0, 0, 0, 1, 0, 900UL, 706UL },
   };
-  for( ulong kind=0UL; kind<9UL; kind++ ) for( int worker=0; worker<2; worker++ ) {
+  for( ulong kind=0UL; kind<11UL; kind++ ) for( int worker=0; worker<2; worker++ ) {
     struct permission_case const * c = &cases[kind];
     fd_pack_t * pack = init_all_with_meta( 64UL, 2UL, 1UL, sizeof(ulong), 1 );
     insert_live_writer( pack, "A", c->live_reads_q ? "Q" : "" );
     insert_lookahead_batch( pack, 700UL, 1UL, c->head_writes, c->head_reads, c->head_alt, 1 );
     if( c->be_barrier ) insert_lookahead_batch( pack, 704UL, 1UL, "Y", "", 0, 0 );
-    insert_lookahead_batch( pack, 705UL, 1UL, c->successor_writes, c->successor_reads, c->successor_alt, 1 );
+    if( c->successor_payer ) insert_lookahead_payer_batch( pack, 705UL, c->successor_payer, c->successor_writes );
+    else                     insert_lookahead_batch( pack, 705UL, 1UL, c->successor_writes, c->successor_reads, c->successor_alt, 1 );
     if( c->extra_successor ) insert_lookahead_batch( pack, 706UL, 1UL, "Z", "", 0, 1 );
     int flags = FD_PACK_SCHEDULE_BAM_ONLY | (worker ? FD_PACK_SCHEDULE_BAM_SINGLE : FD_PACK_SCHEDULE_BUNDLE) |
                 FD_PACK_SCHEDULE_BAM_READY;
@@ -1389,7 +1414,9 @@ test_bundle_ordinal_rebase_initializer_replacement( void ) {
     fd_pack_t * pack = init_all_with_meta( 64UL, 2UL, 8UL, sizeof(ulong), 1 );
     insert_ordinal_test_bundle( pack, 3000UL, 3UL, 1, FD_PACK_IB_TYPE_BAM, "" );
     if( with_group ) insert_ordinal_test_bundle( pack, 3200UL, 2UL, 0, FD_PACK_IB_TYPE_NONE, "" );
-    churn_bundle_ordinals( pack, ORDINAL_LIMIT-(ulong)with_group, 1 );
+    /* Alone, the initializer is rebased by the last churn and must keep
+       ordinal zero to be replaced; with a group, the replacement rebases. */
+    churn_bundle_ordinals( pack, with_group ? ORDINAL_LIMIT-1UL : ORDINAL_LIMIT+1UL, 1 );
 
     fd_ed25519_sig_t ib_sigs[ 3 ];
     ulong id = 3100UL;
@@ -1515,11 +1542,12 @@ test_deferred_bundle_skip_count( void ) {
   }
 }
 
-/* Neither readiness from another mode nor readiness from a stale pool index
-   permits dispatch.  Pool reservations alone leave the view valid. */
+/* Neither readiness from another mode nor readiness from a stale or
+   out-of-pool index permits dispatch.  Pool reservations alone leave the
+   view valid. */
 static void
 test_bam_candidate_hint_lifetime( void ) {
-  for( int mutation=0; mutation<12; mutation++ ) {
+  for( int mutation=0; mutation<13; mutation++ ) {
     fd_pack_t * pack = init_all_with_meta( 64UL, 2UL, 8UL, 48UL, 1 );
     insert_bam_candidate_test( pack, 700UL, 1UL, 2000U, 0U, "X", "", 0 );
     ulong hint;
@@ -1553,6 +1581,8 @@ test_bam_candidate_hint_lifetime( void ) {
       case 9: FD_TEST( fd_pack_schedule_next_microblock( pack, 0UL, 0UL, 0, outcome.results )==0UL ); break;
       case 10: fd_pack_set_initializer_bundles_ready( pack ); break;
       case 11: { fd_pack_rebate_t rebate = {0}; fd_pack_rebate_cus( pack, &rebate ); break; }
+      /* One past the pool of pack_depth+1+2*FD_PACK_MAX_TXN_PER_BUNDLE */
+      case 12: hint = (hint & ~(ulong)USHORT_MAX) | (64UL+1UL+2UL*FD_PACK_MAX_TXN_PER_BUNDLE); break;
     }
     int flags = FD_PACK_SCHEDULE_BUNDLE | FD_PACK_SCHEDULE_BAM_ONLY | FD_PACK_SCHEDULE_BAM_READY;
     FD_TEST( fd_pack_schedule_next_microblock_with_bundle_hint( pack, FD_PACK_TEST_MAX_COST_PER_BLOCK,

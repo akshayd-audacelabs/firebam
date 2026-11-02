@@ -370,6 +370,7 @@ test_pack_tile_assert_result( fd_bam_bundle_result_t const * res,
   FD_TEST( res->bundle_txn_cnt == txn_cnt );
   FD_TEST( res->scheduling_error == scheduling_error );
   FD_TEST( res->transaction_err_count == transaction_err_count );
+  FD_TEST( !res->execution_success ); /* pack only answers work that never committed */
   return res;
 }
 
@@ -1038,6 +1039,16 @@ test_pack_tile_bam_ownership_generation_retirement_barrier( void ) {
   FD_TEST( pack_tile_track_bam_work( h->ctx, scheduled_old_sig, 0L, 11U, 7U, ULONG_MAX, 100UL, 1U ) );
   test_pack_tile_schedule_bam_lead( h, scheduled_old_sig );
   FD_TEST( h->ctx->bam_work_cnt==1UL );
+  /* A batch of the old generation is still assembling. */
+  fd_txn_e_t partial[1];
+  fd_memset( partial, 0, sizeof(partial) );
+  h->ctx->current_bundle->id                = 13UL;
+  h->ctx->current_bundle->txn_cnt           = 2UL;
+  h->ctx->current_bundle->txn_received      = 1UL;
+  h->ctx->current_bundle->_txn[ 0 ]         = partial;
+  h->ctx->current_bundle->bundle            = h->ctx->current_bundle->_txn;
+  h->ctx->current_bundle_bam->ownership_gen = 7U;
+  h->ctx->current_bundle_bam->is_bam        = 1;
 
   generation = (8UL<<1) | 1UL;
   /* Only before_credit runs while a reliable output is backpressured.
@@ -1059,6 +1070,10 @@ test_pack_tile_bam_ownership_generation_retirement_barrier( void ) {
   test_pack_tile_assert_deleted_sig( pending_old_sig );
   FD_TEST( FD_MCNT_GET( PACK, TXN_EVICTED )==evicted_before+1UL );
   FD_TEST( !test_pack_tile_result_cnt( h ) );
+  /* The partial batch is cancelled as silently. */
+  FD_TEST( test_bundle_cancel_call_cnt==1UL && test_bundle_cancel_last_txn_cnt==2UL );
+  FD_TEST( !h->ctx->current_bundle->bundle && !h->ctx->current_bundle->txn_received );
+  FD_TEST( !h->ctx->current_bundle_bam->is_bam );
   test_pack_tile_send_txn_executed( h, scheduled_old_sig );
   FD_TEST( !test_pack_tile_result_cnt( h ) );
 
@@ -1935,6 +1950,14 @@ test_pack_tile_bam_old_member_does_not_override_missed_target( void ) {
     if( FD_LIKELY( batch_idx==1U ) ) {
       FD_TEST( h->ctx->current_bundle->txn_received==(ulong)batch_idx+1UL );
       FD_TEST( !test_pack_tile_result_cnt( h ) );
+      /* Members of another batch, scheduler or ownership generation, or
+         out of order, never continue this batch: each is dropped. */
+      for( uint k=0U; k<4U; k++ ) {
+        test_pack_tile_send_bam_resolv_frag( h, seq_id+(uint)(k==0U), (ushort)( scheduler_gen+(k==1U) ), (ushort)(k==2U),
+                                             max_schedule_slot, k==3U ? 1U : 2U, 3U, 1, blockhash_height,
+                                             (uchar)( 170U+k ) );
+        FD_TEST( h->ctx->current_bundle->txn_received==2UL && !test_pack_tile_result_cnt( h ) );
+      }
     }
   }
 
@@ -3060,8 +3083,11 @@ test_pack_tile_bam_initializer_generation_callbacks( void ) {
     }
     fd_bundle_crank_tip_payment_config_t expected = *ctx->crank->prev_config;
     e->generation = (8UL<<1) | 1UL;
-    pack_tile_sync_bam_ownership_generation( ctx );
+    /* after_credit applies the handoff before it schedules, even when the
+       generation changed after this iteration's before_credit. */
+    test_pack_callbacks_step( e );
     FD_TEST( e->generation==(8UL<<1) && ctx->bam_ownership_gen==8U );
+    FD_TEST( test_pack_callbacks_dispatch_count( e )==(ulong)( scenario>=2 ) );
     FD_TEST( e->status==FD_BAM_STATUS_FSEQ_OVERRIDE_ACTIVE && ctx->bam_override_snapshot );
     FD_TEST( !ctx->bam_work_cnt );
     if( scenario<2 ) {
@@ -3625,6 +3651,42 @@ test_pack_tile_bam_activation_purges_block_engine_bundles( void ) {
   test_pack_callbacks_delete( e );
 }
 
+/* A normal-mode crank leaves BAM work unready.  A failed crank does not
+   invalidate the candidate view, so buffered BAM work behind a deferred
+   Block Engine head, whose metadata drove the crank, must still wait. */
+static void
+test_pack_tile_bam_failed_normal_crank_keeps_bam_unready( void ) {
+  test_pack_callbacks_t e[1];
+  fd_pack_ctx_t * ctx = test_pack_callbacks_new( e, FD_PACK_STRATEGY_BALANCED );
+  e->status = 0UL;
+  ctx->bam_override_snapshot = 0;
+  test_pack_callbacks_leader( e, 104UL );
+  test_pack_callbacks_insert_block_engine_bundle( e, 61UL, 1UL, 60U );
+  /* Too few bytes this slot for the 223-byte bundle defers it. */
+  fd_pack_limits_t limits[1];
+  fd_pack_get_block_limits( ctx->pack, NULL, limits );
+  ulong old_bytes = limits->max_data_bytes_per_block;
+  limits->max_data_bytes_per_block = 48UL+FD_TXN_MIN_SERIALIZED_SZ;
+  fd_pack_set_block_limits( ctx->pack, limits );
+  fd_txn_e_t output[ FD_PACK_MAX_TXN_PER_BUNDLE ];
+  for( ulong j=0UL; j<128UL; j++ )
+    FD_TEST( !fd_pack_schedule_next_microblock( ctx->pack, CUS_PER_MICROBLOCK, 0UL, FD_PACK_SCHEDULE_BUNDLE, output ) );
+  limits->max_data_bytes_per_block = old_bytes;
+  fd_pack_set_block_limits( ctx->pack, limits );
+  test_pack_callbacks_insert( e, 62U, 104UL, 1 );
+  ulong hint;
+  fd_txn_e_t const * candidate = fd_pack_peek_bundle_candidate( ctx->pack, 0, &hint, NULL );
+  FD_TEST( candidate && candidate->txnp->source_tpu==FD_TXN_M_TPU_SOURCE_BAM );
+  /* Invalid on-chain config: the crank fails before signing. */
+  ctx->crank->enabled = 1;
+  ctx->crank->gen->configured_epoch = ctx->crank->epoch;
+  test_pack_callbacks_step( e );
+  FD_TEST( ctx->crank->metrics[2]==1UL );
+  FD_TEST( !test_pack_callbacks_dispatch_count( e ) );
+  FD_TEST( fd_pack_avail_txn_cnt( ctx->pack )==2UL && ctx->bam_work_cnt==1UL );
+  test_pack_callbacks_delete( e );
+}
+
 /* As in jito-solana (fetch_stage_manager.rs drops TPU packets while it
    advertises BAM's TPU), a TPU transaction that arrives in BAM mode is
    dropped, so a mid-slot BAM deactivation has no backlog from BAM
@@ -3826,12 +3888,16 @@ test_pack_tile_unprivileged_init_maps_replay_feedback( void ) {
   topo->objs[ tile->tile_obj_id ].offset = (ulong)test_pack_init_alloc( scratch_align(), scratch_footprint( tile ) );
 
   privileged_init( topo, tile );
-  unprivileged_init( topo, tile );
   fd_pack_ctx_t * ctx = fd_topo_obj_laddr( topo, tile->tile_obj_id );
+  /* Init resets BAM state itself, without relying on zeroed scratch. */
+  ctx->bam_work_cnt                  = 1UL;
+  ctx->bam_current_slot_has_bam_work = 1U;
+  unprivileged_init( topo, tile );
   ulong in_idx = fd_topo_find_tile_in_link( topo, tile, "replay_out", 0UL );
   FD_TEST( in_idx==1UL );
   FD_TEST( ctx->in_kind[ 0 ]==IN_KIND_RESOLV && ctx->in_kind[ in_idx ]==IN_KIND_REPLAY );
   FD_TEST( !ctx->bam_work_max && !ctx->bam_status_fseq ); /* no BAM objects: BAM tracking stays off */
+  FD_TEST( !ctx->bam_work_cnt && !ctx->bam_current_slot_has_bam_work );
 
   /* A committable execution copies the signature out of that in's
      dcache and deletes it from pack (stubbed). */
@@ -3877,6 +3943,7 @@ main( int     argc,
   test_pack_tile_bam_disabled_zero_capacity();
   test_pack_tile_unprivileged_init_maps_replay_feedback();
   test_pack_tile_bam_activation_purges_block_engine_bundles();
+  test_pack_tile_bam_failed_normal_crank_keeps_bam_unready();
   test_pack_tile_bam_tpu_dropped_until_deactivation();
   test_pack_tile_bam_tpu_drop_between_bam_members();
 
