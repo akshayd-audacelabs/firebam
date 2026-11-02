@@ -634,8 +634,9 @@ test_bam_current_slot_work_status_bits( fd_wksp_t * wksp ) {
   ulong fseq[1] = { 0UL };
   state->bam_status_fseq = fseq;
 
-  /* A leader slot that ends healthy counts as fresh work only if BAM work
-     for it arrived before its end. */
+  /* A leader slot that ends healthy counts as fresh work only if a leader
+     state reporting BAM work for it was staged before housekeeping
+     counted its end. */
   state->bam_status_counted = FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTED_HEALTHY;
   fd_bam_stage_leader_state( state, &(fd_bam_leader_state_t){
     .slot               = 42UL,
@@ -676,7 +677,29 @@ test_bam_current_slot_work_status_bits( fd_wksp_t * wksp ) {
   FD_TEST( FD_MGAUGE_GET( BAM, LEADER_STATE_TICK ) == 7UL );
   FD_TEST( FD_MGAUGE_GET( BAM, LEADER_STATE_SLOT_END_TIME ) == (ulong)state->bam_leader_state.slot_end_ns );
 
+  /* A slot staged while unhealthy ends healthy if the client step counts
+     the connection healthy before its end; a later change does not undo
+     that. */
+  long const saved_clock = g_clock;
+  long const slot_end    = g_clock + 1000L;
+  state->bam_auth_inflight = 1U; /* Keep the protocol state machine idle. */
+  test_bam_keepalive_sync( state, g_clock );
+  state->bam_stream_live = 0U;
+  int charge_busy = 0;
+  fd_bam_client_step( state, &charge_busy );
+  FD_TEST( state->bam_status_counted==FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTING );
+  fd_bam_stage_leader_state( state, &(fd_bam_leader_state_t){ .slot = 44UL, .slot_end_ns = slot_end } );
+  state->bam_stream_live = 1U;
+  fd_bam_client_step( state, &charge_busy );
+  g_clock = slot_end + 1L;
+  state->bam_stream_live = 0U;
+  fd_bam_client_step( state, &charge_busy );
+  FD_TEST( state->bam_status_counted==FD_PLUGIN_MSG_BAM_UPDATE_STATUS_CONNECTING );
+  fd_bam_tile_housekeeping( state );
+  FD_TEST( state->metrics.healthy_leader_slot_result_cnt[ FD_METRICS_ENUM_BAM_HEALTHY_LEADER_SLOT_RESULT_V_NONE_IDX ]==2UL );
+
   test_bam_env_destroy( env );
+  g_clock = saved_clock;
 }
 
 /* Overruns of the result links (ins 1 and 3 here) count as dropped
@@ -1778,8 +1801,10 @@ test_bam_rejected_result( fd_bam_tile_t *              state,
    its real sequence.  Ingress is also what keeps votes out of the BAM
    pipeline, whose consumers trust verify.  It
    parses every packet, so a vote is rejected whatever its signature,
-   position, or scheduler metadata.  A stale slot is rejected before
-   either, and mixed or defaulted revert_on_error flags are rejected as
+   position, or scheduler metadata.  A stale slot is rejected before a
+   vote, but only once the batch decodes: a decode failure (mixed revert
+   flags, too many transactions, an oversize packet) is reported for any
+   slot.  Mixed or defaulted revert_on_error flags are rejected as
    INCONSISTENT_BUNDLE. */
 static void
 test_bam_ingress_rejects_batch_variants( fd_wksp_t * wksp ) {
@@ -2276,7 +2301,10 @@ test_bam_receive_backpressure_parks_without_waker_fire( fd_wksp_t * wksp ) {
 /* A refused dial completes with POLLERR and SO_ERROR set: the step closes
    the socket, counts a connect failure and arms the backoff.  The port is
    bound but not listening, so loopback answers the SYN with a RST, and no
-   other socket can take the port. */
+   other socket can take the port.  The kernel raises POLLERR whenever
+   SO_ERROR is set, so a pipe, whose SO_ERROR query fails (ENOTSOCK)
+   while it polls writable, shows that the step also fails a dial on the
+   query result alone.  The SO_ERROR value itself is not pinned. */
 static void
 test_bam_tcp_connect_completion_uses_so_error( fd_wksp_t * wksp ) {
   long const saved_clock = g_clock;
@@ -2304,6 +2332,15 @@ test_bam_tcp_connect_completion_uses_so_error( fd_wksp_t * wksp ) {
   FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_CONNECT_IDX ]==1UL );
   FD_TEST( state->backoff_until>g_clock );
 
+  int pipe_fd[2];
+  FD_TEST( 0==pipe2( pipe_fd, O_CLOEXEC ) );
+  state->tcp_sock = pipe_fd[1];
+  busy = 0;
+  fd_bam_client_step( state, &busy );
+  FD_TEST( busy && state->tcp_sock==-1 && !state->tcp_sock_connected );
+  FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_CONNECT_IDX ]==2UL );
+  FD_TEST( 0==close( pipe_fd[0] ) );
+
   FD_TEST( 0==close( bound_sock ) );
   test_bam_env_destroy( env );
   g_clock = saved_clock;
@@ -2312,6 +2349,7 @@ test_bam_tcp_connect_completion_uses_so_error( fd_wksp_t * wksp ) {
 static void
 test_bam_client_services_socket_and_flushes_tx1( fd_wksp_t * wksp,
                                                  int         waker ) {
+  long const saved_clock = g_clock;
   test_bam_env_t env[1];
   fd_bam_tile_t * state = test_bam_env_create( env, wksp );
   if( !waker ) test_bam_env_disable_waker( env );
@@ -2330,14 +2368,24 @@ test_bam_client_services_socket_and_flushes_tx1( fd_wksp_t * wksp,
   ulong tx_bytes_before = state->grpc_metrics->stream_chunks_tx_bytes;
   FD_TEST( fd_h2_tx_ping( fd_grpc_client_h2_conn( state->grpc_client ),
                           fd_grpc_client_rbuf_tx( state->grpc_client ) ) );
+  fd_keepalive_tx( state->keepalive, state->rng, g_clock ); /* as the keepalive sends it */
   fd_bam_client_step( state, &charge_busy );
   FD_TEST( state->grpc_metrics->stream_chunks_tx_bytes==tx_bytes_before+sizeof(fd_h2_ping_t) );
 
+  /* The peer's PING ACK counts and samples the keepalive RTT. */
+  fd_h2_ping_t const ping_ack = { .hdr = { .typlen = fd_h2_frame_typlen( FD_H2_FRAME_TYPE_PING, 8UL ), .flags = FD_H2_FLAG_ACK } };
+  FD_TEST( (long)sizeof(ping_ack)==write( env->server_sock, &ping_ack, sizeof(ping_ack) ) );
+  g_clock += 1234L;
+  fd_bam_client_step( state, &charge_busy );
+  FD_TEST( state->metrics.keepalive_acks_cnt==1UL && !state->keepalive->inflight );
+  FD_TEST( state->rtt->is_rtt_valid && state->rtt->latest_rtt==1234.f );
+
   /* Native gRPC I/O polls a readable socket on every scheduled step. */
+  ulong rx_bytes_before = state->grpc_metrics->stream_chunks_rx_bytes;
   uchar partial_h2 = 0U;
   FD_TEST( 1L==write( env->server_sock, &partial_h2, 1UL ) );
   fd_bam_client_step( state, &charge_busy );
-  FD_TEST( state->grpc_metrics->stream_chunks_rx_bytes>=1UL );
+  FD_TEST( state->grpc_metrics->stream_chunks_rx_bytes==rx_bytes_before+1UL );
 
   FD_TEST( 0==close( env->server_sock ) );
   env->server_sock = -1;
@@ -2348,6 +2396,48 @@ test_bam_client_services_socket_and_flushes_tx1( fd_wksp_t * wksp,
   FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_IO_IDX ]==1UL );
 
   test_bam_env_destroy( env );
+  g_clock = saved_clock;
+}
+
+/* A peer GOAWAY kills the HTTP/2 connection inside a step's socket I/O
+   (conn_dead).  That step counts one IO failure and resets the
+   transport, keeping queued results, and the client redials once the
+   backoff ends. */
+static void
+test_bam_peer_goaway_resets_and_redials( fd_wksp_t * wksp ) {
+  long const saved_clock = g_clock;
+  g_clock = (long)10e9;
+  test_bam_env_t env[1];
+  fd_bam_tile_t * state = test_bam_env_create( env, wksp );
+  test_bam_env_mock_conn( env );
+  test_bam_keepalive_sync( state, g_clock );
+  state->bam_auth_inflight = 1U; /* Keep the protocol state machine idle. */
+  fd_bam_bundle_result_t result = test_make_bundle_result( 995U, 42UL, 1U );
+  test_enqueue_bundle_result( state, &result );
+  struct sockaddr_in addr;
+  int listen_sock = test_bam_loopback_listener( &addr );
+  test_bam_set_server( state, fd_ushort_bswap( addr.sin_port ) );
+
+  fd_h2_goaway_t const goaway = {
+    .hdr        = { .typlen = fd_h2_frame_typlen( FD_H2_FRAME_TYPE_GOAWAY, 8UL ) },
+    .error_code = fd_uint_bswap( FD_H2_ERR_PROTOCOL )
+  };
+  FD_TEST( (long)sizeof(goaway)==write( env->server_sock, &goaway, sizeof(goaway) ) );
+  int busy = 0;
+  fd_bam_client_step( state, &busy );
+  FD_TEST( busy && state->tcp_sock==-1 && !state->defer_reset );
+  FD_TEST( state->metrics.failure_cnt[ FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_IO_IDX ]==1UL );
+  FD_TEST( state->feedback_queue_depth==1U );
+  FD_TEST( state->backoff_until>g_clock );
+
+  g_clock = state->backoff_until;
+  busy = 0;
+  fd_bam_client_step( state, &busy );
+  FD_TEST( busy && state->tcp_sock>=0 && !state->tcp_sock_connected );
+
+  FD_TEST( 0==close( listen_sock ) );
+  test_bam_env_destroy( env );
+  g_clock = saved_clock;
 }
 
 /* Performance layout has no waker, so a scheduler message that arrives
@@ -2549,39 +2639,52 @@ test_bam_live_env_create( test_bam_env_t * env,
 /* Returning early for an incomplete END_STREAM leaves the scheduler stream
    live and reconnect reuses stale resolution state.  A stream that fails
    (gRPC or HTTP status), ends, or times out is released with its pending
-   leader state, and the transport is reset.  Queued results stay for the
-   next stream; a failed request also discards the auth proof. */
+   leader state, and the transport is reset.  Queued results and the
+   retained leader state stay for the next stream, unless an
+   INVALID_ARGUMENT names that state's slot as outside the node's valid
+   range: then the state is cleared, not dropped as pending. */
 static void
 test_bam_grpc_end_handling( fd_wksp_t * wksp ) {
   ulong const failed  = FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_REQUEST_FAILED_IDX;
   ulong const timeout = FD_METRICS_ENUM_BAM_CLIENT_FAILURE_REASON_V_REQUEST_TIMEOUT_IDX;
-  struct { uint h2_status, grpc_status; ulong failure_idx, drop_idx; } const cases[] = {
-    { 200U, FD_GRPC_STATUS_UNAVAILABLE, failed,    FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_REQUEST_FAILED_IDX },
-    { 200U, FD_GRPC_STATUS_OK,          ULONG_MAX, FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_STREAM_ENDED_IDX   },
-    { 503U, FD_GRPC_STATUS_OK,          failed,    FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_REQUEST_FAILED_IDX },
-    {   0U, 0U, /* timeout */           timeout,   FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_STREAM_TIMEOUT_IDX },
+  uint  const invalid = FD_GRPC_STATUS_INVALID_ARGUMENT;
+  /* drop_idx ULONG_MAX: the rejection cleared the leader state */
+  struct { uint h2_status, grpc_status; ulong failure_idx, drop_idx; char const * msg; } const cases[] = {
+    { 200U, FD_GRPC_STATUS_UNAVAILABLE, failed,    FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_REQUEST_FAILED_IDX, "" },
+    { 200U, FD_GRPC_STATUS_OK,          ULONG_MAX, FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_STREAM_ENDED_IDX,   "" },
+    { 503U, FD_GRPC_STATUS_OK,          failed,    FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_REQUEST_FAILED_IDX, "" },
+    {   0U, 0U, /* timeout */           timeout,   FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_STREAM_TIMEOUT_IDX, "" },
+    { 200U, invalid,                    failed,    ULONG_MAX,                                                           "Leader state slot 42 is outside of valid range 43..=46" },
+    { 200U, invalid,                    failed,    FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_REQUEST_FAILED_IDX, "Leader state slot 41 is outside of valid range 43..=46" },
+    { 200U, invalid,                    failed,    FD_METRICS_ENUM_BAM_LEADER_PENDING_DROP_REASON_V_REQUEST_FAILED_IDX, "Leader state slot 42 is outside of valid range"         },
   };
   for( ulong i=0UL; i<sizeof(cases)/sizeof(cases[0]); i++ ) {
     test_bam_env_t env[1];
     fd_bam_tile_t * state = test_bam_live_env_create( env, wksp, (long)10e9 );
     fd_bam_bundle_result_t result = test_make_bundle_result( 991U+(uint)i, 42UL, 1U );
     test_enqueue_bundle_result( state, &result );
+    state->bam_auth_ready  = 0U; /* opening the stream used the auth proof */
     state->bam_stream_live = 0U;
     fd_bam_client_grpc_callbacks.rx_start( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream );
     FD_TEST( state->bam_stream_live == 1U );
-    state->bam_leader_pending = 1U;
+    state->bam_leader_pending    = 1U;
+    state->bam_leader_state.slot = 42UL;
 
     if( cases[ i ].h2_status ) {
       fd_grpc_resp_hdrs_t hdrs = { .h2_status = cases[ i ].h2_status, .grpc_status = cases[ i ].grpc_status };
+      hdrs.grpc_msg_len = (uint)strlen( cases[ i ].msg );
+      fd_memcpy( hdrs.grpc_msg, cases[ i ].msg, hdrs.grpc_msg_len );
       fd_bam_client_grpc_callbacks.rx_end( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream, &hdrs );
     } else {
       fd_bam_client_grpc_callbacks.rx_timeout( state, FD_BAM_CLIENT_REQ_BAM_InitSchedulerStream, FD_GRPC_DEADLINE_RX_END );
     }
+    _Bool const rejected = cases[ i ].drop_idx==ULONG_MAX;
     FD_TEST( state->bam_stream_live == 0U );
     FD_TEST( state->bam_stream == NULL );
     FD_TEST( state->bam_leader_pending == 0U );
+    FD_TEST( state->bam_leader_state.slot==( rejected ? ULONG_MAX : 42UL ) );
+    FD_TEST( state->metrics.leader_state_suppressed_cnt[ FD_METRICS_ENUM_BAM_LEADER_STATE_SUPPRESS_REASON_V_SCHEDULER_REJECTED_IDX ]==rejected );
     FD_TEST( state->defer_reset == 1U );
-    FD_TEST( state->bam_auth_ready==(cases[ i ].failure_idx!=failed) );
     FD_TEST( state->feedback_queue_depth==1U );
     FD_TEST( state->metrics.failure_cnt[ failed  ]==(cases[ i ].failure_idx==failed ) );
     FD_TEST( state->metrics.failure_cnt[ timeout ]==(cases[ i ].failure_idx==timeout) );
@@ -3384,6 +3487,14 @@ test_bam_scheduler_stream_replays_only_retained_leader_state( fd_wksp_t * wksp )
     FD_TEST( state->bam_leader_pending == 0U );
     if( i ) test_bam_expect_leader_state( state, cases[ i ].slot, cases[ i ].tick, cases[ i ].cu );
   }
+
+  /* A pending state whose grace ends before the step sends it is dropped
+     at send time (case 0 counted the first expiry at rx_start). */
+  state->bam_leader_state.slot_end_ns = g_clock - FD_BAM_LEADER_STATE_EXPIRY_GRACE_NS;
+  state->bam_leader_pending           = 1U;
+  FD_TEST( fd_bam_client_step_reconnect( state, g_clock ) == 0 );
+  FD_TEST( state->bam_leader_pending == 0U && state->bam_leader_state.slot == ULONG_MAX );
+  FD_TEST( state->metrics.leader_state_suppressed_cnt[ FD_METRICS_ENUM_BAM_LEADER_STATE_SUPPRESS_REASON_V_EXPIRED_IDX ] == 2UL );
 
   test_bam_env_destroy( env );
 }
@@ -4516,8 +4627,9 @@ test_bam_identity_switch_halts_signing_and_invalidates_leader_schedule_state( fd
   test_bam_env_destroy( env );
 }
 
-/* While no leader slot is known the client does not dial, and rechecks
-   the leader schedule after a wallclock interval or once backoff ends. */
+/* While no leader slot is known the client does not dial.  A leader
+   schedule recheck falls due after a wallclock interval, and its dial
+   still waits out the backoff.  Queued results lift the gate. */
 static void
 test_bam_unknown_leader_slot_gates_dial( fd_wksp_t * wksp ) {
   test_bam_env_t env[1];
@@ -4591,8 +4703,9 @@ test_bam_unknown_leader_slot_gates_dial( fd_wksp_t * wksp ) {
 }
 
 /* Leader state from pack waits for a scheduler stream, and a slot change
-   on a live one goes out at once.  A frag of the wrong size changes
-   nothing. */
+   on a live one goes out at once.  A frag of the wrong size or below the
+   in's chunk0 changes nothing (replay_input_contract checks a chunk
+   above the wmark). */
 static void
 test_bam_pack_leader_slot_change_flushes_immediately( fd_wksp_t * wksp ) {
   test_bam_env_t env[1];
@@ -4623,6 +4736,11 @@ test_bam_pack_leader_slot_change_flushes_immediately( fd_wksp_t * wksp ) {
   FD_TEST( state->bam_leader_pending == 1U );
   FD_TEST( state->bam_leader_state.slot == 76UL );
   FD_TEST( state->feedback_queue_depth == 0U );
+
+  state->pack_leader_in.chunk0 = state->pack_leader_in.wmark = 1UL;
+  fd_bam_test_receive_ingress_frag( state, state->pack_bam_leader_in_idx, 0UL, 0UL, sizeof(fd_bam_leader_state_t) );
+  FD_TEST( state->bam_leader_state.slot == 76UL );
+  state->pack_leader_in.chunk0 = state->pack_leader_in.wmark = 0UL;
 
   test_bam_prepare_scheduler_stream( state );
   ingress.leader = (fd_bam_leader_state_t){ .slot = 77UL, .tick = 9U, .slot_cu_budget_remaining = 456U };
@@ -4696,6 +4814,7 @@ test_bam_result_channel_contract( fd_wksp_t * wksp ) {
     FD_TEST( state->feedback_queue_depth==depth+1U && state->bam_results_tail==depth+1U );
     FD_TEST( state->bam_results[ depth ].slot==ingress[ i ].result.slot );
 
+    ingress[ i ].result.slot++; /* a new result, so dedup cannot drop these */
     fd_bam_test_receive_ingress_frag( state, in_idx[ i ], 0UL, 0UL, sizeof(fd_bam_leader_state_t) );
     fd_bam_test_receive_ingress_frag( state, 7UL,         0UL, 0UL, sizeof(fd_bam_bundle_result_t) );
     FD_TEST( state->feedback_queue_depth==depth+1U && state->bam_results_tail==depth+1U );
@@ -5258,6 +5377,33 @@ test_bam_gossip_tile_applies_contact_update( fd_wksp_t * wksp ) {
   }
   FD_TEST( fd_fseq_query( ctx.bam_contact.signed_fseq )==3UL );
   FD_TEST( !ctx.bam_contact.ack_pending );
+
+  /* On the bam_gossip in, a frag of the wrong size is ignored and a valid
+     one awaits signing.  A newer update supersedes it even when refused
+     because its TPU or forward base port would overflow the QUIC port.
+     Without a stem the frags push nothing. */
+  union {
+    fd_bam_contact_update_t update;
+    uchar                   bytes[ FD_CHUNK_SZ ];
+  } frag = { .update = {
+    .tpu               = test_bam_ip4_port( "9.9.9.9", 5100U ),
+    .tpu_fwd           = test_bam_ip4_port( "9.9.9.8", 5200U ),
+    .version_client_id = FD_GOSSIP_CONTACT_INFO_CLIENT_FIRE_BAM,
+  } };
+  ctx.in[ 1 ] = (fd_gossip_in_ctx_t){ .kind = IN_KIND_BAM_GOSSIP, .mem = (fd_wksp_t *)frag.bytes, .mtu = FD_CHUNK_SZ };
+  returnable_frag( &ctx, 1UL, 9UL, 0UL, 0UL, sizeof(fd_bam_contact_update_t)-1UL, 0UL, 0UL, 0UL, NULL );
+  FD_TEST( !ctx.bam_contact.ack_pending );
+  test_bam_check_ci_sock( ci, FD_GOSSIP_CONTACT_INFO_SOCKET_TPU, bam_tpu, 5000U );
+  returnable_frag( &ctx, 1UL, 9UL, 0UL, 0UL, sizeof(fd_bam_contact_update_t), 0UL, 0UL, 0UL, NULL );
+  FD_TEST( ctx.bam_contact.ack_pending && ctx.bam_contact.ack_target==10UL );
+  for( ulong i=0UL; i<2UL; i++ ) {
+    frag.update.tpu.port     = fd_ushort_bswap( (ushort)( i ? 5100U : USHRT_MAX-5U ) );
+    frag.update.tpu_fwd.port = fd_ushort_bswap( (ushort)( i ? USHRT_MAX-5U : 5200U ) );
+    returnable_frag( &ctx, 1UL, 10UL+i, 0UL, 0UL, sizeof(fd_bam_contact_update_t), 0UL, 0UL, 0UL, NULL );
+    FD_TEST( !ctx.bam_contact.ack_pending );
+    test_bam_check_ci_sock( ci, FD_GOSSIP_CONTACT_INFO_SOCKET_TPU,          frag.update.tpu.addr,     5100U );
+    test_bam_check_ci_sock( ci, FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS, frag.update.tpu_fwd.addr, 5200U );
+  }
 
   free( gossip_mem );
   test_bam_env_destroy( env );
@@ -6478,6 +6624,7 @@ main( int     argc,
   test_bam_receive_backpressure_parks_without_waker_fire( wksp );
   test_bam_tcp_connect_completion_uses_so_error( wksp );
   for( int waker=1; waker>=0; waker-- ) test_bam_client_services_socket_and_flushes_tx1( wksp, waker );
+  test_bam_peer_goaway_resets_and_redials( wksp );
   test_bam_grpc_end_handling( wksp );
   test_bam_polls_socket_without_waker( wksp );
   test_bam_connect_without_waker_skips_epoll( wksp );
