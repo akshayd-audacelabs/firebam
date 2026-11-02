@@ -25,6 +25,10 @@ bam_result_start( fd_execle_tile_t const * ctx,
   return 1;
 }
 
+/* bam_fill_txn_result records transaction idx's outcome.  Members of a
+   revert batch share account records, so call it right after the member
+   executes: a later member may change the fee payer, and BAM (like
+   jito-solana) wants each transaction's own post-balance. */
 static inline void
 bam_fill_txn_result( fd_bam_bundle_result_t * res,
                      ulong                    idx,
@@ -56,14 +60,13 @@ bam_result_txn( fd_bam_bundle_result_t * bam_res,
 }
 
 /* bam_bundle_failed_result builds the result of a BAM revert batch
-   that failed at failed_idx (setup_bundle is 0 if its accounts could
-   not be prepared). */
+   that failed at failed_idx, either in execution or because its
+   accounts could not be prepared. */
 static inline void
 bam_bundle_failed_result( fd_execle_tile_t const * ctx,
                           fd_bam_bundle_result_t * bam_res,
                           ulong                    txn_cnt,
-                          ulong                    failed_idx,
-                          int                      setup_bundle ) {
+                          ulong                    failed_idx ) {
   bam_res->execution_success = 0U;
   for( ulong i=0UL; i<txn_cnt; i++ ) {
     if( FD_LIKELY( i!=failed_idx || ctx->txn_out[ failed_idx ].err.txn_err!=FD_RUNTIME_TXN_ERR_SANITIZE_FAILURE ) )
@@ -71,6 +74,4 @@ bam_bundle_failed_result( fd_execle_tile_t const * ctx,
     fd_bam_result_add_txn_error( bam_res, i, bam_types_TransactionErrorReason_COMMIT_CANCELLED );
   }
   fd_bam_result_set_txn_error( bam_res, failed_idx, fd_bam_txn_err_from_runtime_err( ctx->txn_out[ failed_idx ].err.txn_err ) );
-  if( FD_LIKELY( setup_bundle ) )
-    for( ulong i=0UL; i<=failed_idx; i++ ) bam_fill_txn_result( bam_res, i, &ctx->txn_out[ i ] );
 }

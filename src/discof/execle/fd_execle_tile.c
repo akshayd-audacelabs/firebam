@@ -579,6 +579,7 @@ handle_bundle( fd_execle_tile_t *  ctx,
     if( failed_idx!=ULONG_MAX ) continue;
 
     fd_runtime_prepare_and_execute_txn( ctx->runtime, bank, txn_in, txn_out );
+    if( FD_UNLIKELY( is_bam_revert ) ) bam_fill_txn_result( bam_res, i, txn_out );
 
     txn->flags = (txn->flags & 0x00FFFFFFU) | ((uint)(-txn_out->err.txn_err)<<24);
     if( FD_UNLIKELY( !txn_out->err.is_committable || txn_out->err.txn_err!=FD_RUNTIME_EXECUTE_SUCCESS ) ) failed_idx = i;
@@ -596,7 +597,6 @@ handle_bundle( fd_execle_tile_t *  ctx,
       fd_txn_out_t * txn_out   = &ctx->txn_out[ i ];
       uchar *        signature = (uchar *)txn_in->txn->payload + TXN( txn_in->txn )->signature_off;
 
-      if( FD_UNLIKELY( is_bam_revert ) ) bam_fill_txn_result( bam_res, i, txn_out );
       fd_runtime_commit_txn( ctx->runtime, bank, txn_in, txn_out );
 
       txn_end_ticks[ i ] = fd_tickcount();
@@ -643,7 +643,7 @@ handle_bundle( fd_execle_tile_t *  ctx,
     /* A failed bundle is dropped in its entirety: every transaction is
        marked non-committable and none of them land in the block. We
        intentionally do NOT emit runtime_txn events here */
-    if( FD_UNLIKELY( is_bam_revert ) ) bam_bundle_failed_result( ctx, bam_res, txn_cnt, failed_idx, setup_bundle );
+    if( FD_UNLIKELY( is_bam_revert ) ) bam_bundle_failed_result( ctx, bam_res, txn_cnt, failed_idx );
     for( ulong i=0UL; i<txn_cnt; i++ ) {
 
       ctx->txn_out[ i ].err.is_committable = 0;

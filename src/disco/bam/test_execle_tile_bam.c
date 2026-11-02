@@ -492,6 +492,9 @@ FD_UNIT_TEST( execle_bam_bundle_ok ) {
   FD_TEST( result->seq_id==103U );
   FD_TEST( result->execution_success );
   FD_TEST( !result->transaction_err_count );
+  /* Each member reports its own post-balance (as in jito-solana), not
+     the shared fee payer's balance after the whole batch. */
+  FD_TEST( result->feepayer_balance_lamports[0]==payer_start - fee - transfer0 );
   FD_TEST( result->feepayer_balance_lamports[1]==payer_start - 2UL*fee - transfer0 - transfer1 );
   for( ulong i=0UL; i<2UL; i++ ) {
     FD_TEST( result->consumed_cus[i]==150U ); /* one System transfer */
