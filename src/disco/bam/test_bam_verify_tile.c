@@ -109,6 +109,8 @@ test_env_init( test_env_t * env ) {
    two terminal outcomes.  Verify must emit only a preprocessing marker. */
 static void
 test_bam_atomic_verify_failure_result_owner( void ) {
+  static uchar       in_dcache[ FD_TPU_PARSED_MTU ] __attribute__((aligned(FD_CHUNK_ALIGN)));
+  static uchar const zeros[ FD_TXN_MAX_SZ ];
   test_env_t env[1];
 
   /* The members of a batch can land on different verify tiles, so
@@ -116,13 +118,18 @@ test_bam_atomic_verify_failure_result_owner( void ) {
      of the seq_id, and a non-revert single are checked and published,
      and dedup fails the members after a failed one.  None parses, so
      each is published once as a marker with its parsed txn zeroed.
-     Each frag arrives at the out_chunk the previous publish advanced
-     to. */
+     during_frag copies each frag from bam_verif to the out_chunk the
+     previous publish advanced to.  The first is as large as a parsed
+     frag can be, past FD_TPU_RAW_MTU, and leaves nonzero bytes where
+     each parsed txn must be zeroed. */
   test_env_init( env );
+  env->ctx->in_kind[ IN_IDX_BAM ] = IN_KIND_BAM;
+  env->ctx->in[ IN_IDX_BAM ].mem  = (fd_wksp_t *)in_dcache; /* chunk0 and wmark 0: one parsed frag */
+  fd_memset( in_dcache, 0xa5, sizeof(in_dcache) );
   for( ulong i=0UL; i<4UL; i++ ) {
     uchar batch_idx = (uchar)( i==1UL );
     _Bool revert    = i<3UL;
-    fd_txn_m_t * txnm = (fd_txn_m_t *)fd_chunk_to_laddr( env->ctx->out_mem, env->ctx->out_chunk );
+    fd_txn_m_t * txnm = (fd_txn_m_t *)in_dcache;
     *txnm = (fd_txn_m_t) {
       .payload_sz = 0U,
       .source_tpu = FD_TXN_M_TPU_SOURCE_BAM,
@@ -137,12 +144,18 @@ test_bam_atomic_verify_failure_result_owner( void ) {
       },
     };
 
-    after_frag( env->ctx, IN_IDX_BAM, 10UL+i, 0UL, sizeof(fd_txn_m_t), 0UL, 0UL, env->stem );
+    ulong sz = i ? sizeof(fd_txn_m_t) : FD_TPU_PARSED_MTU;
+    during_frag( env->ctx, IN_IDX_BAM, 10UL+i, 0UL, 0UL, sz, 0UL );
+    txnm = (fd_txn_m_t *)fd_chunk_to_laddr( env->ctx->out_mem, env->ctx->out_chunk );
+    FD_TEST( fd_memeq( txnm, in_dcache, sz ) );
+    after_frag( env->ctx, IN_IDX_BAM, 10UL+i, 0UL, sz, 0UL, 0UL, env->stem );
 
     FD_TEST( env->seqs[ 0 ]==i+1UL );
     FD_TEST( env->mcache[ i ].sig==11UL+i );
     FD_TEST( txnm->bam.preprocess_failed && txnm->bam.batch_idx==batch_idx );
     FD_TEST( txnm->bam.seq_id==88U && txnm->txn_t_sz==fd_txn_footprint( 0UL, 0UL ) );
+    FD_TEST( fd_memeq( fd_txn_m_txn_t( txnm ), zeros, fd_txn_footprint( 0UL, 0UL ) ) );
+    FD_TEST( env->ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_RESULT_V_PARSE_FAILED_IDX ]==i+1UL );
     FD_TEST( !env->ctx->bundle_failed && !env->ctx->bundle_id );
     FD_TEST( !env->ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_RESULT_V_BUNDLE_PEER_FAILED_IDX ] );
   }

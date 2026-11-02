@@ -178,6 +178,7 @@ main( int     argc,
   /* Retransmitted shreds go only ahead of our rotation */
   FD_TEST( test_fan_out( 995UL, 0 )==4UL );  /* 996 starts our rotation */
   FD_TEST( ctx->bam_leader_soon_slot==995UL && ctx->bam_leader_soon );
+  FD_TEST( !test_fan_out( 996UL, 0 ) );      /* 997..999 only continue it */
   FD_TEST( !test_fan_out( 999UL, 0 ) );      /* 1000..1003 are another validator's */
   FD_TEST( !test_fan_out( 1100UL, 0 ) );
 
@@ -203,6 +204,7 @@ main( int     argc,
   during_housekeeping( ctx );
   FD_TEST( keyswitch->state==FD_KEYSWITCH_STATE_COMPLETED && fd_memeq( ctx->identity_key->uc, other.uc, 32UL ) );
   FD_TEST( !test_fan_out( 995UL, 0 ) );
+  FD_TEST( test_fan_out( 996UL, 0 )==4UL );  /* 1000, four slots ahead, starts our rotation */
   FD_TEST( test_fan_out( 1100UL, 1 )==4UL ); /* 'C' leads epoch 1 */
 
   free( mcache_mem );

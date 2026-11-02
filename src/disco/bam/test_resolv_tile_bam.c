@@ -193,6 +193,7 @@ test_no_bank_deser_marker( uchar batch_idx ) {
   FD_TEST( txnm->bam.preprocess_failed );
   FD_TEST( txnm->bam.seq_id    ==123U );
   FD_TEST( txnm->bam.batch_idx ==batch_idx );
+  FD_TEST( h->ctx->metrics.txn_dropped[ FD_METRICS_ENUM_RESOLV_TXN_DROP_REASON_V_NO_BANK_IDX ]==1UL );
 
   /* A non-BAM txn keeps upstream's path: with no bank to resolve its
      lookup tables it is counted and dropped. */
@@ -202,6 +203,24 @@ test_no_bank_deser_marker( uchar batch_idx ) {
   test_insert_blockhash( h, txnm, 100UL );
   after_frag( h->ctx, 0UL, 0UL, 0UL, fd_txn_m_realized_footprint( txnm, 1, 0 ), 0UL, 0UL, h->stem );
   FD_TEST( h->seqs[ 0 ]==1UL );
+  FD_TEST( h->ctx->metrics.txn_dropped[ FD_METRICS_ENUM_RESOLV_TXN_DROP_REASON_V_NO_BANK_IDX ]==no_bank_cnt+1UL );
+
+  /* With a bank, a BAM member is failed only if its lookup tables do
+     not resolve, and NO_BANK is not counted.  Resolution fails while
+     the bank's SlotHashes is missing (size 0).  A SlotHashes with no
+     entries parses, and the harness txn names no table to read, so
+     resolution succeeds. */
+  static fd_bank_t bank[1];
+  h->ctx->bank = bank;
+  for( ulong ok=0UL; ok<2UL; ok++ ) {
+    h->ctx->slot_hashes_sz = ok*sizeof(ulong);
+    txnm = test_prepare_bam_txn( h, (uchar)(13UL+ok), 1, 0U, 2U, 1 );
+    after_frag( h->ctx, 0UL, 0UL, 0UL, fd_txn_m_realized_footprint( txnm, 1, 0 ), 0UL, 0UL, h->stem );
+    FD_TEST( h->seqs[ 0 ]==2UL+ok );
+    FD_TEST( !!txnm->bam.preprocess_failed==!ok && !!h->ctx->bundle_failed==!ok );
+    FD_TEST( h->ctx->metrics.lut[ ok ? FD_METRICS_ENUM_LUT_RESOLVE_RESULT_V_SUCCESS_IDX
+                                     : FD_METRICS_ENUM_LUT_RESOLVE_RESULT_V_ACCOUNT_NOT_FOUND_IDX ]==1UL );
+  }
   FD_TEST( h->ctx->metrics.txn_dropped[ FD_METRICS_ENUM_RESOLV_TXN_DROP_REASON_V_NO_BANK_IDX ]==no_bank_cnt+1UL );
 
   test_harness_delete( h );

@@ -387,6 +387,8 @@ test_topology( int          bundle_enabled,
     ulong verify_link = fd_topo_find_link( topo, "bam_verif", 0UL );
     ulong sign_link   = fd_topo_find_link( topo, "bam_sign",  0UL );
     FD_TEST( verify_link!=ULONG_MAX && sign_link!=ULONG_MAX );
+    /* The sign tile FD_TESTs these mtus at boot (fd_sign_tile.c) */
+    FD_TEST( topo->links[ sign_link ].mtu==256UL && topo->links[ bam->in_link_id[ sign_in ] ].mtu==64UL );
     /* bam_verif has its own depth, not the TPU receive depth */
     FD_TEST( config->tiles.verify.receive_buffer_size!=FD_BAM_VERIFY_OUT_DEPTH );
     FD_TEST( topo->links[ verify_link ].depth==FD_BAM_VERIFY_OUT_DEPTH );
