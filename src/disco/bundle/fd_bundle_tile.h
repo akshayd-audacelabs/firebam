@@ -27,6 +27,22 @@ struct fd_bundle_block_engine_update {
 };
 typedef struct fd_bundle_block_engine_update fd_bundle_block_engine_update_t;
 
+/* fd_bundle_uuid_t is published on the optional bundle_precnf link (to
+   the pre-confirmation tile) for each bundle, right before the bundle's
+   transactions are published to verify.  bundle_seq equals
+   fd_txn_m_t.block_engine.bundle_id of those transactions.  uuid is the
+   block engine's BundleUuid.uuid. */
+
+#define FD_BUNDLE_UUID_MAX (128UL)
+
+struct fd_bundle_uuid {
+  ulong bundle_seq;
+  ulong txn_cnt;
+  ulong uuid_sz;
+  uchar uuid[ FD_BUNDLE_UUID_MAX ];
+};
+typedef struct fd_bundle_uuid fd_bundle_uuid_t;
+
 FD_PROTOTYPES_BEGIN
 
 extern fd_topo_run_tile_t fd_tile_bundle;

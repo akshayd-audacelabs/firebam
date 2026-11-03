@@ -340,6 +340,25 @@ test_vote_history_authorize( void ) {
   FD_TEST( !fd_keyguard_payload_authorize( &authority, body, 133UL, FD_KEYGUARD_ROLE_VOTOR, FD_KEYGUARD_SIGN_TYPE_ED25519 ) );
 }
 
+static void
+test_precnf_auth_authorize( void ) {
+  fd_keyguard_authority_t authority = {0};
+  uchar challenge[ 9 ] = { 'a','b','c','d','e','f','g','h','i' };
+
+  FD_TEST( FD_KEYGUARD_ROLE_PRECNF==12 && FD_KEYGUARD_ROLE_CNT==13 );
+  /* A Jito AuthService challenge signed as "<pubkey>-<challenge>". */
+  FD_TEST( fd_keyguard_payload_authorize( &authority, challenge, sizeof(challenge), FD_KEYGUARD_ROLE_PRECNF, FD_KEYGUARD_SIGN_TYPE_PUBKEY_CONCAT_ED25519 ) );
+  /* Wrong sign type, wrong length, and other payload kinds are refused. */
+  FD_TEST( !fd_keyguard_payload_authorize( &authority, challenge, sizeof(challenge),     FD_KEYGUARD_ROLE_PRECNF, FD_KEYGUARD_SIGN_TYPE_ED25519 ) );
+  FD_TEST( !fd_keyguard_payload_authorize( &authority, challenge, sizeof(challenge)-1UL, FD_KEYGUARD_ROLE_PRECNF, FD_KEYGUARD_SIGN_TYPE_PUBKEY_CONCAT_ED25519 ) );
+  uchar bam_payload[25];
+  memcpy( bam_payload, "X_OFF_CHAIN_JITO_BAM_V1\0", 24UL );
+  bam_payload[24] = 'x';
+  FD_TEST( !fd_keyguard_payload_authorize( &authority, bam_payload, sizeof(bam_payload), FD_KEYGUARD_ROLE_PRECNF, FD_KEYGUARD_SIGN_TYPE_ED25519 ) );
+  uchar skip[11] = { 3 /* Alpenglow skip vote */ };
+  FD_TEST( !fd_keyguard_payload_authorize( &authority, skip, sizeof(skip), FD_KEYGUARD_ROLE_PRECNF, FD_KEYGUARD_SIGN_TYPE_BLS ) );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -351,6 +370,7 @@ main( int     argc,
   test_tower_authorize();
   test_tower_match();
   test_vote_history_authorize();
+  test_precnf_auth_authorize();
   FD_LOG_NOTICE(( "pass" ));
   return 0;
 }

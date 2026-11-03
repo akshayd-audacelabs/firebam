@@ -2,6 +2,7 @@
 #define HEADER_fd_src_disco_bundle_fd_bundle_tile_private_h
 
 #include "fd_bundle_auth.h"
+#include "fd_bundle_tile.h"
 #include "fd_keepalive.h"
 #include "../fd_clock_tile.h"
 #include "../stem/fd_stem.h"
@@ -31,6 +32,8 @@ struct fd_bundle_pending_txn {
   ulong  bundle_txn_cnt;
   uchar  commission;
   uchar  commission_pubkey[ 32 ];
+  uchar  uuid_sz;               /* bundles only */
+  uchar  uuid[ FD_BUNDLE_UUID_MAX ];
 };
 
 typedef struct fd_bundle_pending_txn fd_bundle_pending_txn_t;
@@ -163,6 +166,8 @@ struct fd_bundle_tile {
   /* Bundle state */
   ulong bundle_seq;
   ulong bundle_txn_cnt;
+  ulong bundle_uuid_sz;
+  uchar bundle_uuid[ FD_BUNDLE_UUID_MAX ];
 
   /* Error backoff */
   fd_rng_t rng[1];
@@ -174,6 +179,7 @@ struct fd_bundle_tile {
   fd_stem_context_t *       stem;
   fd_bundle_out_ctx_t       verify_out;
   fd_bundle_out_ctx_t       plugin_out;
+  fd_bundle_out_ctx_t       precnf_out;  /* bundle UUIDs, optional */
   fd_bundle_pending_txn_t * pending_txns;
 
   /* App metrics */

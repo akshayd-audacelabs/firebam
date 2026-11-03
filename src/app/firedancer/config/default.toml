@@ -1922,6 +1922,23 @@ telemetry = true
         # `telemetry` to false to disable event reporting.
         url = "https://events-in.firedancer.io"
 
+    # The preconf tile forwards a copy of every verified, deduplicated
+    # non-vote transaction this validator receives as leader to an
+    # external pre-confirmation relayer.  It reads the transaction
+    # stream as an unreliable consumer, so it can never slow down block
+    # production: if it falls behind, copies are dropped instead.
+    #
+    # Enabling this sends pending transactions, including the sender's
+    # IP address, to a third party before they land in a block.
+    [tiles.preconf]
+        # Whether the preconf tile runs.  Requires block production to
+        # be enabled.
+        enabled = false
+
+        # The URL of the pre-confirmation relayer, for example
+        # "https://relayer.example.com:443".  Required when enabled.
+        url = ""
+
     # The gui tile receives data from the validator and serves an HTTP
     # endpoint to clients to view it.
     [tiles.gui]

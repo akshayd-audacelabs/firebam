@@ -220,6 +220,9 @@ fd_config_extract_pod( uchar *       pod,
 
   CFG_POP      ( cstr,   tiles.event.url                                  );
 
+  CFG_POP      ( bool,   tiles.preconf.enabled                            );
+  CFG_POP      ( cstr,   tiles.preconf.url                                );
+
   CFG_POP      ( bool,   tiles.gui.enabled                                );
   CFG_POP      ( cstr,   tiles.gui.gui_listen_address                     );
   CFG_POP      ( ushort, tiles.gui.gui_listen_port                        );

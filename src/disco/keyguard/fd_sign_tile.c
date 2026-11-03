@@ -459,6 +459,11 @@ unprivileged_init_sensitive( fd_topo_t const *      topo,
       FD_TEST( !strcmp( out_link->name, "sign_bam" ) );
       FD_TEST( in_link->mtu==256UL );
       FD_TEST( out_link->mtu==64UL );
+    } else if( !strcmp(in_link->name, "precnf_sign" ) ) {
+      ctx->in[ i ].role = FD_KEYGUARD_ROLE_PRECNF;
+      FD_TEST( !strcmp( out_link->name, "sign_precnf" ) );
+      FD_TEST( in_link->mtu==9UL );
+      FD_TEST( out_link->mtu==64UL );
     } else if( !strcmp(in_link->name, "event_sign" ) ) {
       ctx->in[ i ].role = FD_KEYGUARD_ROLE_EVENT;
       FD_TEST( !strcmp( out_link->name, "sign_event" ) );

@@ -549,6 +549,8 @@ fd_bundle_tile_publish_bundle_txn(
   entry->bundle_txn_cnt   = bundle_txn_cnt;
   entry->commission     = (uchar)ctx->builder_commission;
   fd_memcpy( entry->commission_pubkey, ctx->builder_pubkey, 32UL );
+  entry->uuid_sz        = (uchar)ctx->bundle_uuid_sz;
+  fd_memcpy( entry->uuid, ctx->bundle_uuid, ctx->bundle_uuid_sz );
   ctx->metrics.txn_received_cnt++;
 }
 
@@ -576,6 +578,7 @@ fd_bundle_tile_publish_txn(
   entry->bundle_txn_cnt   = 1UL;
   entry->commission     = 0U;
   fd_memset( entry->commission_pubkey, 0, 32UL );
+  entry->uuid_sz        = 0U;
   ctx->metrics.txn_received_cnt++;
 }
 
@@ -688,6 +691,11 @@ fd_bundle_client_visit_pb_bundle_uuid(
     ctx->metrics.backpressure_drop_cnt += ctx->bundle_txn_cnt;
     return true;
   }
+
+  /* The uuid (field 2) is decoded after the packets (field 1), so keep
+     it from the first pass for the transactions buffered below. */
+  ctx->bundle_uuid_sz = bundle.uuid.size;
+  fd_memcpy( ctx->bundle_uuid, bundle.uuid.bytes, bundle.uuid.size );
 
   ctx->bundle_seq++;
   bundle = (bundle_BundleUuid)bundle_BundleUuid_init_default;

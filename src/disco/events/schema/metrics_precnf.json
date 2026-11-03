@@ -1,0 +1,169 @@
+{
+    "name": "metrics_precnf",
+    "id": 475281583,
+    "description": "Metrics of one precnf tile instance, one row per sweep",
+    "local": true,
+    "fields": {
+        "sample_id":                     { "type": "UInt64",                                                         "description": "Identifier shared by every row of one sweep" },
+        "sample_reason":                 { "type": "ref:MetricsSampleReason",                                        "description": "Why the sweep was taken" },
+        "sample_slot":                   { "type": "UInt64",                                                         "description": "Slot that triggered the sweep, 0 for periodic sweeps" },
+        "sample_snapct_state":           { "type": "ref:MetricsSnapctLoadState",                                     "description": "Snapshot load state entered, for snapct_state sweeps; unknown otherwise" },
+        "sample_caught_up":              { "type": "Bool",                                                           "description": "Whether replay had caught up to the cluster tip when the sweep was taken (replay IsCaughtUp); set once per run, never cleared" },
+        "sample_tile_cnt":               { "type": "UInt64",                                                         "description": "Tile instances in the sweep, to detect partial sweeps" },
+        "kind_id":                       { "type": "UInt64",                                                         "description": "Index of this tile instance among tiles of its kind" },
+        "pid":                           { "type": "UInt64",                     "compression": "T64, ZSTD",         "description": "Process ID of the tile" },
+        "tid":                           { "type": "UInt64",                     "compression": "T64, ZSTD",         "description": "Thread ID of the tile. Same as Pid in production, but might differ in development" },
+        "last_cpu_index":                { "type": "UInt64",                     "compression": "T64, ZSTD",         "description": "CPU the tile last ran on" },
+        "context_switch_involuntary":    { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "counter: cumulative since tile start, query deltas. Involuntary context switches" },
+        "context_switch_voluntary":      { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "counter: cumulative since tile start, query deltas. Voluntary context switches" },
+        "page_fault_major":              { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "counter: cumulative since tile start, query deltas. Major page faults" },
+        "page_fault_minor":              { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "counter: cumulative since tile start, query deltas. Minor page faults" },
+        "state": {
+            "type": "LowCardinality(String)",
+            "description": "Tile lifecycle state: 0=booting, 1=running, 2=shutdown",
+            "variants": {
+                "booting":  { "description": "Booting" },
+                "running":  { "description": "Running" },
+                "shutdown": { "description": "Shutdown" }
+            }
+        },
+        "heartbeat_time":                { "type": "DateTime64(9)",              "compression": "Delta, ZSTD",       "description": "Last wall-clock time the tile heartbeated" },
+        "is_backpressured":              { "type": "Bool",                                                           "description": "Whether the tile is currently backpressured" },
+        "backpressure":                  { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "counter: cumulative since tile start, query deltas. Times the tile waited for one or more consumers to catch up to resume publishing" },
+        "regime_duration_nanos": {
+            "type": "Tuple",
+            "description": "Tile wall time, by regime; regimes are exhaustive and groups Busy, Idle, Backpressure and Housekeeping partition it",
+            "aliases": {
+                "all":          ["caught_up_housekeeping", "processing_housekeeping", "backpressure_housekeeping", "caught_up_prefrag", "processing_prefrag", "backpressure_prefrag", "caught_up_postfrag", "processing_postfrag", "caught_up_sleeping", "backpressure_sleeping"],
+                "housekeeping": ["caught_up_housekeeping", "processing_housekeeping", "backpressure_housekeeping"],
+                "busy":         ["caught_up_prefrag", "processing_prefrag", "processing_postfrag"],
+                "idle":         ["caught_up_postfrag", "caught_up_sleeping"],
+                "backpressure": ["backpressure_prefrag", "backpressure_sleeping"],
+                "sleeping":     ["caught_up_sleeping", "backpressure_sleeping"]
+            },
+            "fields": {
+                "caught_up_housekeeping":    { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Caught up + Housekeeping" },
+                "processing_housekeeping":   { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Processing + Housekeeping" },
+                "backpressure_housekeeping": { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Backpressure + Housekeeping" },
+                "caught_up_prefrag":         { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Caught up + Prefrag" },
+                "processing_prefrag":        { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Processing + Prefrag" },
+                "backpressure_prefrag":      { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Backpressure + Prefrag" },
+                "caught_up_postfrag":        { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Caught up + Postfrag" },
+                "processing_postfrag":       { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Processing + Postfrag" },
+                "caught_up_sleeping":        { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Caught up + Sleeping" },
+                "backpressure_sleeping":     { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Backpressure + Sleeping" }
+            }
+        },
+        "thread_duration_nanos": {
+            "type": "Tuple",
+            "description": "Thread wall time since start, by scheduler state; Idle is the remainder, so parts sum to about the lifetime.  User, System and Interrupt have 10 ms resolution; Interrupt is 0 unless it is the only live tile pinned to its CPU",
+            "aliases": {
+                "all":       ["wait", "idle", "user", "system", "interrupt"],
+                "running":   ["user", "system"],
+                "preempted": ["wait", "interrupt"]
+            },
+            "fields": {
+                "wait":      { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Wait (task was runnable but not scheduled)" },
+                "idle":      { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Idle (task was not runnable)" },
+                "user":      { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "User (task was scheduled and executing in user mode)" },
+                "system":    { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "System (task was scheduled and executing in kernel mode)" },
+                "interrupt": { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Interrupt (CPU time stolen by hardirq/softirq handlers or a hypervisor; fixed tiles only)" }
+            }
+        },
+        "park_attempted": {
+            "type": "Tuple",
+            "description": "Times the tile tried to park while idle (efficient mode), by result",
+            "aliases": {
+                "all": ["ring", "deadline", "pending"]
+            },
+            "fields": {
+                "ring":     { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Woken by a doorbell ring" },
+                "deadline": { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Deadline or park cap lapsed" },
+                "pending":  { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Pre-park recheck found work, did not park" }
+            }
+        },
+        "device_irq":                    { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "counter: cumulative since tile start, query deltas. Device IRQs on the tile's dedicated CPU, 0 unless it is the only live tile pinned there" },
+        "tlb_shootdown":                 { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "counter: cumulative since tile start, query deltas. TLB shootdowns on the tile's dedicated CPU, 0 unless it is the only live tile pinned there" },
+        "timer_irq":                     { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "counter: cumulative since tile start, query deltas. Local timer interrupts (LOC) on the tile's dedicated CPU, 0 unless it is the only live tile pinned there" },
+        "txn_classified": {
+            "type": "Tuple",
+            "description": "Non-vote transactions seen on dedup_resolv, by source class",
+            "aliases": {
+                "all": ["tpu_quic", "tpu_udp", "block_engine_packet", "jito_bundle", "bam", "other"]
+            },
+            "fields": {
+                "tpu_quic":            { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Transaction received on the TPU over QUIC" },
+                "tpu_udp":             { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Transaction received on the TPU over UDP" },
+                "block_engine_packet": { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Single transaction from the Block Engine" },
+                "jito_bundle":         { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Member of a Jito bundle" },
+                "bam":                 { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Verified transaction from a BAM batch" },
+                "other":               { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Non-vote transaction from another source" }
+            }
+        },
+        "vote_skipped":                  { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Simple vote transactions skipped" },
+        "bam_preprocess_failed_skipped": { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "BAM transactions skipped because they failed verify or dedup" },
+        "batch_queued":                  { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Batch messages encoded and queued for sending" },
+        "packet_queued":                 { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Transactions encoded into queued batches" },
+        "bytes_queued":                  { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Encoded bytes queued for sending" },
+        "queue_dropped":                 { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Queued messages evicted because the send queue was full" },
+        "queue_count":                   { "type": "UInt64",                     "compression": "T64, ZSTD",         "description": "Messages currently in the send queue" },
+        "queue_bytes":                   { "type": "UInt64",                     "compression": "T64, ZSTD",         "description": "Bytes currently used in the send queue" },
+        "txn_no_stream_dropped":         { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Forwardable transactions dropped because the relay stream was not open" },
+        "bundle_uuid_received":          { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Bundle UUIDs received from the bundle tile" },
+        "bundle_queued":                 { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Complete Jito bundles encoded into queued bundle messages" },
+        "bundle_batch_queued":           { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Bundle messages encoded and queued for sending" },
+        "bundle_packet_queued":          { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Transactions of queued Jito bundles" },
+        "bundle_dropped": {
+            "type": "Tuple",
+            "description": "Jito bundles not forwarded, by reason",
+            "aliases": {
+                "all": ["partial", "uuid_missing", "invalid"]
+            },
+            "fields": {
+                "partial":      { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Not all of the bundle's transactions arrived (one failed verify or dedup, or was overrun)" },
+                "uuid_missing": { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "The bundle's UUID never arrived from the bundle tile" },
+                "invalid":      { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Transaction count, UUID or transaction size out of range" }
+            }
+        },
+        "conn_state": {
+            "type": "LowCardinality(String)",
+            "description": "Relayer connection state: 0=disconnected, 1=connecting, 2=authenticating, 3=streaming",
+            "variants": {
+                "disconnected":   { "description": "Disconnected" },
+                "connecting":     { "description": "Connecting" },
+                "authenticating": { "description": "Authenticating" },
+                "streaming":      { "description": "Streaming" }
+            }
+        },
+        "conn_attempted":                { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Connection attempts to the relayer" },
+        "stream_opened":                 { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Relay streams opened" },
+        "disconnected": {
+            "type": "Tuple",
+            "description": "Connections to the relayer that ended, by reason",
+            "aliases": {
+                "all": ["identity_changed", "dns_failed", "connect_failed", "timeout", "transport", "peer_closed", "auth_failed", "no_heartbeat", "credit_stall"]
+            },
+            "fields": {
+                "identity_changed": { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Validator identity changed" },
+                "dns_failed":       { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Could not resolve the relayer host" },
+                "connect_failed":   { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "TCP connect failed" },
+                "timeout":          { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Connect, auth or stream open timed out" },
+                "transport":        { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Socket, TLS or HTTP/2 error" },
+                "peer_closed":      { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Relayer closed the stream or connection" },
+                "auth_failed":      { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Authentication failed" },
+                "no_heartbeat":     { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "No message from the relayer within the watchdog timeout" },
+                "credit_stall":     { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Relayer stopped granting HTTP/2 flow-control credit" }
+            }
+        },
+        "heartbeat_sent":                { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Heartbeat messages sent to the relayer" },
+        "msg_sent":                      { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Queued messages sent to the relayer" },
+        "msg_oversize_dropped":          { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Queued messages dropped because they exceed the gRPC buffer" },
+        "stale_msg_cleared":             { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Queued messages discarded when the relay stream (re)opened" },
+        "response_received":             { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Messages received from the relayer (heartbeats)" },
+        "bytes_written":                 { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "gRPC message bytes written to the relayer" },
+        "bytes_read":                    { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "gRPC message bytes read from the relayer" },
+        "auth_succeeded":                { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Successful challenge/response authentications" },
+        "auth_refreshed":                { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Successful access token refreshes" },
+        "auth_failed":                   { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Failed or rejected authentication requests" }
+    }
+}

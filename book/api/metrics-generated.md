@@ -1991,6 +1991,59 @@
 
 </div>
 
+## Precnf Tile
+
+<div class="metrics">
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| <span class="metrics-name">precnf_&#8203;txn_&#8203;classified</span><br/>{precnf_&#8203;txn_&#8203;class="<span class="metrics-enum">tpu_&#8203;quic</span>"} | counter | Non-vote transactions seen on dedup_resolv, by source class (Transaction received on the TPU over QUIC) |
+| <span class="metrics-name">precnf_&#8203;txn_&#8203;classified</span><br/>{precnf_&#8203;txn_&#8203;class="<span class="metrics-enum">tpu_&#8203;udp</span>"} | counter | Non-vote transactions seen on dedup_resolv, by source class (Transaction received on the TPU over UDP) |
+| <span class="metrics-name">precnf_&#8203;txn_&#8203;classified</span><br/>{precnf_&#8203;txn_&#8203;class="<span class="metrics-enum">block_&#8203;engine_&#8203;packet</span>"} | counter | Non-vote transactions seen on dedup_resolv, by source class (Single transaction from the Block Engine) |
+| <span class="metrics-name">precnf_&#8203;txn_&#8203;classified</span><br/>{precnf_&#8203;txn_&#8203;class="<span class="metrics-enum">jito_&#8203;bundle</span>"} | counter | Non-vote transactions seen on dedup_resolv, by source class (Member of a Jito bundle) |
+| <span class="metrics-name">precnf_&#8203;txn_&#8203;classified</span><br/>{precnf_&#8203;txn_&#8203;class="<span class="metrics-enum">bam</span>"} | counter | Non-vote transactions seen on dedup_resolv, by source class (Verified transaction from a BAM batch) |
+| <span class="metrics-name">precnf_&#8203;txn_&#8203;classified</span><br/>{precnf_&#8203;txn_&#8203;class="<span class="metrics-enum">other</span>"} | counter | Non-vote transactions seen on dedup_resolv, by source class (Non-vote transaction from another source) |
+| <span class="metrics-name">precnf_&#8203;vote_&#8203;skipped</span> | counter | Simple vote transactions skipped |
+| <span class="metrics-name">precnf_&#8203;bam_&#8203;preprocess_&#8203;failed_&#8203;skipped</span> | counter | BAM transactions skipped because they failed verify or dedup |
+| <span class="metrics-name">precnf_&#8203;batch_&#8203;queued</span> | counter | Batch messages encoded and queued for sending |
+| <span class="metrics-name">precnf_&#8203;packet_&#8203;queued</span> | counter | Transactions encoded into queued batches |
+| <span class="metrics-name">precnf_&#8203;bytes_&#8203;queued</span> | counter | Encoded bytes queued for sending |
+| <span class="metrics-name">precnf_&#8203;queue_&#8203;dropped</span> | counter | Queued messages evicted because the send queue was full |
+| <span class="metrics-name">precnf_&#8203;queue_&#8203;count</span> | gauge | Messages currently in the send queue |
+| <span class="metrics-name">precnf_&#8203;queue_&#8203;bytes</span> | gauge | Bytes currently used in the send queue |
+| <span class="metrics-name">precnf_&#8203;txn_&#8203;no_&#8203;stream_&#8203;dropped</span> | counter | Forwardable transactions dropped because the relay stream was not open |
+| <span class="metrics-name">precnf_&#8203;bundle_&#8203;uuid_&#8203;received</span> | counter | Bundle UUIDs received from the bundle tile |
+| <span class="metrics-name">precnf_&#8203;bundle_&#8203;queued</span> | counter | Complete Jito bundles encoded into queued bundle messages |
+| <span class="metrics-name">precnf_&#8203;bundle_&#8203;batch_&#8203;queued</span> | counter | Bundle messages encoded and queued for sending |
+| <span class="metrics-name">precnf_&#8203;bundle_&#8203;packet_&#8203;queued</span> | counter | Transactions of queued Jito bundles |
+| <span class="metrics-name">precnf_&#8203;bundle_&#8203;dropped</span><br/>{precnf_&#8203;bundle_&#8203;drop_&#8203;reason="<span class="metrics-enum">partial</span>"} | counter | Jito bundles not forwarded, by reason (Not all of the bundle's transactions arrived (one failed verify or dedup, or was overrun)) |
+| <span class="metrics-name">precnf_&#8203;bundle_&#8203;dropped</span><br/>{precnf_&#8203;bundle_&#8203;drop_&#8203;reason="<span class="metrics-enum">uuid_&#8203;missing</span>"} | counter | Jito bundles not forwarded, by reason (The bundle's UUID never arrived from the bundle tile) |
+| <span class="metrics-name">precnf_&#8203;bundle_&#8203;dropped</span><br/>{precnf_&#8203;bundle_&#8203;drop_&#8203;reason="<span class="metrics-enum">invalid</span>"} | counter | Jito bundles not forwarded, by reason (Transaction count, UUID or transaction size out of range) |
+| <span class="metrics-name">precnf_&#8203;conn_&#8203;state</span> | gauge | Relayer connection state: 0=disconnected, 1=connecting, 2=authenticating, 3=streaming |
+| <span class="metrics-name">precnf_&#8203;conn_&#8203;attempted</span> | counter | Connection attempts to the relayer |
+| <span class="metrics-name">precnf_&#8203;stream_&#8203;opened</span> | counter | Relay streams opened |
+| <span class="metrics-name">precnf_&#8203;disconnected</span><br/>{precnf_&#8203;disconnect_&#8203;reason="<span class="metrics-enum">identity_&#8203;changed</span>"} | counter | Connections to the relayer that ended, by reason (Validator identity changed) |
+| <span class="metrics-name">precnf_&#8203;disconnected</span><br/>{precnf_&#8203;disconnect_&#8203;reason="<span class="metrics-enum">dns_&#8203;failed</span>"} | counter | Connections to the relayer that ended, by reason (Could not resolve the relayer host) |
+| <span class="metrics-name">precnf_&#8203;disconnected</span><br/>{precnf_&#8203;disconnect_&#8203;reason="<span class="metrics-enum">connect_&#8203;failed</span>"} | counter | Connections to the relayer that ended, by reason (TCP connect failed) |
+| <span class="metrics-name">precnf_&#8203;disconnected</span><br/>{precnf_&#8203;disconnect_&#8203;reason="<span class="metrics-enum">timeout</span>"} | counter | Connections to the relayer that ended, by reason (Connect, auth or stream open timed out) |
+| <span class="metrics-name">precnf_&#8203;disconnected</span><br/>{precnf_&#8203;disconnect_&#8203;reason="<span class="metrics-enum">transport</span>"} | counter | Connections to the relayer that ended, by reason (Socket, TLS or HTTP/2 error) |
+| <span class="metrics-name">precnf_&#8203;disconnected</span><br/>{precnf_&#8203;disconnect_&#8203;reason="<span class="metrics-enum">peer_&#8203;closed</span>"} | counter | Connections to the relayer that ended, by reason (Relayer closed the stream or connection) |
+| <span class="metrics-name">precnf_&#8203;disconnected</span><br/>{precnf_&#8203;disconnect_&#8203;reason="<span class="metrics-enum">auth_&#8203;failed</span>"} | counter | Connections to the relayer that ended, by reason (Authentication failed) |
+| <span class="metrics-name">precnf_&#8203;disconnected</span><br/>{precnf_&#8203;disconnect_&#8203;reason="<span class="metrics-enum">no_&#8203;heartbeat</span>"} | counter | Connections to the relayer that ended, by reason (No message from the relayer within the watchdog timeout) |
+| <span class="metrics-name">precnf_&#8203;disconnected</span><br/>{precnf_&#8203;disconnect_&#8203;reason="<span class="metrics-enum">credit_&#8203;stall</span>"} | counter | Connections to the relayer that ended, by reason (Relayer stopped granting HTTP/2 flow-control credit) |
+| <span class="metrics-name">precnf_&#8203;heartbeat_&#8203;sent</span> | counter | Heartbeat messages sent to the relayer |
+| <span class="metrics-name">precnf_&#8203;msg_&#8203;sent</span> | counter | Queued messages sent to the relayer |
+| <span class="metrics-name">precnf_&#8203;msg_&#8203;oversize_&#8203;dropped</span> | counter | Queued messages dropped because they exceed the gRPC buffer |
+| <span class="metrics-name">precnf_&#8203;stale_&#8203;msg_&#8203;cleared</span> | counter | Queued messages discarded when the relay stream (re)opened |
+| <span class="metrics-name">precnf_&#8203;response_&#8203;received</span> | counter | Messages received from the relayer (heartbeats) |
+| <span class="metrics-name">precnf_&#8203;bytes_&#8203;written</span> | counter | gRPC message bytes written to the relayer |
+| <span class="metrics-name">precnf_&#8203;bytes_&#8203;read</span> | counter | gRPC message bytes read from the relayer |
+| <span class="metrics-name">precnf_&#8203;auth_&#8203;succeeded</span> | counter | Successful challenge/response authentications |
+| <span class="metrics-name">precnf_&#8203;auth_&#8203;refreshed</span> | counter | Successful access token refreshes |
+| <span class="metrics-name">precnf_&#8203;auth_&#8203;failed</span> | counter | Failed or rejected authentication requests |
+
+</div>
+
 ## Snapmk Tile
 
 <div class="metrics">

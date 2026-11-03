@@ -443,6 +443,16 @@ fd_keyguard_payload_authorize( fd_keyguard_authority_t const * authority,
     /* no further restrictions on bundle */
     return 1;
 
+  case FD_KEYGUARD_ROLE_PRECNF:
+    /* The pre-confirms relayer uses Jito's AuthService challenge, which
+       has the same shape as the bundle auth payload (a 9 byte challenge
+       signed as "<base58 pubkey>-<challenge>"). */
+    if( FD_UNLIKELY( payload_mask != FD_KEYGUARD_PAYLOAD_BUNDLE ) ) {
+      FD_LOG_WARNING(( "unauthorized payload type for precnf (mask=%#lx)", payload_mask ));
+      return 0;
+    }
+    return 1;
+
   case FD_KEYGUARD_ROLE_EVENT:
     if( FD_UNLIKELY( payload_mask != FD_KEYGUARD_PAYLOAD_EVENT ) ) {
       FD_LOG_WARNING(( "unauthorized payload type for event (mask=%#lx)", payload_mask ));

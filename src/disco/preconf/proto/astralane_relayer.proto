@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+// Wire schema for the Astralane pre-confirmation relayer, as used by
+// jito-solana (jito-protos/astralane-protos/astralane_relayer.proto).
+//
+// ExpiringPacketBatch and StartExpiringPacketStreamResponse are defined
+// in mev-protos' block_engine.proto, which the trimmed copy in
+// src/disco/bundle/proto does not include.  They are copied here with
+// identical field numbers and types; protobuf package names do not
+// appear on the wire, so the encoding is the same.
+
+import "packet.proto";
+import "shared.proto";
+import "bundle.proto";
+
+package astralane_relayer;
+
+// block_engine.ExpiringPacketBatch
+message ExpiringPacketBatch {
+  shared.Header header = 1;
+  packet.PacketBatch batch = 2;
+  uint32 expiry_ms = 3;
+}
+
+// block_engine.StartExpiringPacketStreamResponse
+message StartExpiringPacketStreamResponse {
+  shared.Heartbeat heartbeat = 1;
+}
+
+// A batch of bundles relayed atomically; each bundle keeps its uuid so the
+// block engine can dedupe and track it end-to-end.
+message ExpiringBundleBatch {
+  shared.Header header = 1;
+  repeated bundle.BundleUuid bundles = 2;
+  uint32 expiry_ms = 3;
+}
+
+// Packets, bundles, and heartbeats are sent over the same stream.
+message RelayUpdate {
+  oneof msg {
+    ExpiringPacketBatch batches = 1;
+    shared.Heartbeat heartbeat = 2;
+    ExpiringBundleBatch bundles = 3;
+  }
+}
+
+service AstralaneRelayer {
+  rpc StartRelayStream (stream RelayUpdate)
+      returns (stream StartExpiringPacketStreamResponse) {}
+}

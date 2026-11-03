@@ -36,7 +36,8 @@ static char const * const stub_tile_names[] = {
   "net", "netlnk", "sock", "quic", "verify", "dedup", "resolv", "pack", "execle", "shred", "sign", "metric",
   "event", "diag", "gui", "rpc", "bundle", "bam", "gossvf", "gossip", "rserve", "replay", "execrp",
   "motor", "rotor", "votor", "accdb", "snapct", "snapld", "snapdc", "snapin", "snapwr",
-  "genesi", "ipecho", "admin", "solcap", "snapmk", "snapzp", "snaprd", "snapsv", "waker", "mwaitx"
+  "genesi", "ipecho", "admin", "solcap", "snapmk", "snapzp", "snaprd", "snapsv", "waker", "mwaitx",
+  "precnf"
 };
 #define STUB_TILE_CNT (sizeof(stub_tile_names)/sizeof(stub_tile_names[0]))
 static fd_topo_run_tile_t stub_tiles[ STUB_TILE_CNT ];
@@ -58,7 +59,7 @@ fd_topo_run_tile_t *      TILES     [ STUB_TILE_CNT+1UL ];
 static int
 set_identity_tile_halts( char const * name ) {
   static char const * const halt[] = { "replay", "rotor", "gossip", "votor", "bundle", "rserve", "bam" };
-  static char const * const once[] = { "shred", "sign", "gossvf", "pack", "rpc", "event", "gui" };
+  static char const * const once[] = { "shred", "sign", "gossvf", "pack", "rpc", "event", "gui", "precnf" };
   for( ulong i=0UL; i<sizeof(halt)/sizeof(halt[0]); i++ ) if( !strcmp( name, halt[i] ) ) return 1;
   for( ulong i=0UL; i<sizeof(once)/sizeof(once[0]); i++ ) if( !strcmp( name, once[i] ) ) return 0;
   FD_LOG_ERR(( "unmodeled identity keyswitch user %s", name ));
@@ -224,6 +225,7 @@ static config_t *
 topology_config( int          bundle_enabled,
                  int          bam_enabled,
                  int          leader_enabled,
+                 int          preconf_enabled,
                  char const * layout_mode ) {
   static config_t config[1];
   fd_memset( config, 0, sizeof(config_t) );
@@ -243,6 +245,8 @@ topology_config( int          bundle_enabled,
   config->tiles.bundle.enabled = bundle_enabled;
   config->bam.tiles.enabled = bam_enabled;
   config->firedancer.layout.enable_block_production = leader_enabled;
+  config->tiles.preconf.enabled = preconf_enabled && leader_enabled;
+  fd_cstr_ncpy( config->tiles.preconf.url, "http://127.0.0.1:50055", sizeof(config->tiles.preconf.url) );
 
   fd_cstr_ncpy( config->net.interface, "lo", sizeof(config->net.interface) );
   fd_cstr_ncpy( config->layout.affinity, "f128", sizeof(config->layout.affinity) );
@@ -261,6 +265,39 @@ topology_config( int          bundle_enabled,
   return config;
 }
 
+/* The preconf tile taps dedup_resolv (and bundle UUIDs in Jito mode)
+   without ever backpressuring them, and follows set-identity. */
+static void
+test_precnf( fd_topo_t const * topo,
+             int               preconf_enabled,
+             int               bundle_enabled ) {
+  ulong precnf_id = fd_topo_find_tile( topo, "precnf", 0UL );
+  FD_TEST( (precnf_id!=ULONG_MAX)==preconf_enabled );
+  FD_TEST( (fd_topo_find_link( topo, "bundle_precnf", 0UL )!=ULONG_MAX)==(preconf_enabled && bundle_enabled) );
+  if( !preconf_enabled ) return;
+
+  fd_topo_tile_t const * precnf = &topo->tiles[ precnf_id ];
+  FD_TEST( precnf->id_keyswitch_obj_id!=ULONG_MAX );
+  FD_TEST( precnf->is_waker_client && precnf->waker_client_idx!=ULONG_MAX );
+  FD_TEST( !strcmp( precnf->precnf.url, "http://127.0.0.1:50055" ) );
+
+  ulong dedup_in = fd_topo_find_tile_in_link( topo, precnf, "dedup_resolv", 0UL );
+  FD_TEST( dedup_in!=ULONG_MAX && precnf->in_link_poll[ dedup_in ] && !precnf->in_link_reliable[ dedup_in ] );
+  ulong sign_in = fd_topo_find_tile_in_link( topo, precnf, "sign_precnf", 0UL );
+  FD_TEST( sign_in!=ULONG_MAX && !precnf->in_link_poll[ sign_in ] );
+  FD_TEST( fd_topo_find_tile_out_link( topo, precnf, "precnf_sign", 0UL )!=ULONG_MAX );
+  fd_topo_tile_t const * sign = &topo->tiles[ fd_topo_find_tile( topo, "sign", 0UL ) ];
+  FD_TEST( fd_topo_find_tile_in_link ( topo, sign, "precnf_sign", 0UL )!=ULONG_MAX );
+  FD_TEST( fd_topo_find_tile_out_link( topo, sign, "sign_precnf", 0UL )!=ULONG_MAX );
+
+  if( bundle_enabled ) {
+    fd_topo_tile_t const * bundle = &topo->tiles[ fd_topo_find_tile( topo, "bundle", 0UL ) ];
+    FD_TEST( fd_topo_find_tile_out_link( topo, bundle, "bundle_precnf", 0UL )!=ULONG_MAX );
+    ulong uuid_in = fd_topo_find_tile_in_link( topo, precnf, "bundle_precnf", 0UL );
+    FD_TEST( uuid_in!=ULONG_MAX && precnf->in_link_poll[ uuid_in ] && !precnf->in_link_reliable[ uuid_in ] );
+  }
+}
+
 /* Exercise every BAM/bundle mode: missing shared crank/sign wiring breaks
    BAM-only config and identity updates, while an unwanted source tile leaves
    a disabled ingress path active. */
@@ -268,8 +305,9 @@ static void
 test_topology( int          bundle_enabled,
                int          bam_enabled,
                int          leader_enabled,
+               int          preconf_enabled,
                char const * layout_mode ) {
-  config_t * config = topology_config( bundle_enabled, bam_enabled, leader_enabled, layout_mode );
+  config_t * config = topology_config( bundle_enabled, bam_enabled, leader_enabled, preconf_enabled, layout_mode );
 
   int crank_enabled = bundle_enabled || bam_enabled;
   fd_topo_t const * topo = &config->topo;
@@ -411,6 +449,8 @@ test_topology( int          bundle_enabled,
   FD_TEST( fd_pod_queryf_ulong( topo->props, 0UL, "obj.%lu.cache_min_reserved", accdb->id )==
            fd_accdb_cache_min_reserved( crank_enabled ) );
 
+  test_precnf( topo, preconf_enabled, bundle_enabled );
+
   test_set_identity( &config->topo );
 }
 
@@ -427,7 +467,7 @@ test_bam_smt_sibling( ulong phys ) {
   FD_TEST( !fd_topo_bam_smt_pair( "bam", "bam" ) && !fd_topo_bam_smt_pair( "bundle", "bundle" ) );
   FD_TEST( !fd_topo_bam_smt_pair( "bam", "dedup" ) && !fd_topo_bam_smt_pair( "net", "bundle" ) );
 
-  fd_topo_t * topo = &topology_config( 1, 1, 1, "performance" )->topo;
+  fd_topo_t * topo = &topology_config( 1, 1, 1, 0, "performance" )->topo;
   static fd_topo_cpus_t cpus[1];
   fd_memset( cpus, 0, sizeof(cpus) );
   cpus->numa_node_cnt = 1UL;
@@ -458,12 +498,12 @@ main( int     argc,
     TILES[ i ] = &stub_tiles[ i ];
   }
 
-  test_topology( 0, 0, 1, "performance" );
-  test_topology( 1, 0, 1, "performance" );
-  test_topology( 0, 1, 1, "performance" );
-  test_topology( 1, 1, 1, "performance" );
-  test_topology( 0, 1, 1, "efficient"   );
-  test_topology( 1, 1, 0, "performance" );
+  test_topology( 0, 0, 1, 0, "performance" );
+  test_topology( 1, 0, 1, 0, "performance" );
+  test_topology( 0, 1, 1, 0, "performance" );
+  test_topology( 1, 1, 1, 1, "performance" );
+  test_topology( 0, 1, 1, 1, "efficient"   );
+  test_topology( 1, 1, 0, 0, "performance" );
 
   test_bam_smt_sibling( 24UL );
   test_bam_smt_sibling( 32UL );

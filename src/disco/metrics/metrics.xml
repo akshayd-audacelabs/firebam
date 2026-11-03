@@ -1979,6 +1979,73 @@ deliberate exception with lint-allow="<rule id>")
     <int value="3" name="Connected" label="Connected" />
 </enum>
 
+<enum name="PrecnfTxnClass">
+    <int value="0" name="TpuQuic" label="Transaction received on the TPU over QUIC" />
+    <int value="1" name="TpuUdp" label="Transaction received on the TPU over UDP" />
+    <int value="2" name="BlockEnginePacket" label="Single transaction from the Block Engine" />
+    <int value="3" name="JitoBundle" label="Member of a Jito bundle" />
+    <int value="4" name="Bam" label="Verified transaction from a BAM batch" />
+    <int value="5" name="Other" label="Non-vote transaction from another source" />
+</enum>
+
+<enum name="PrecnfDisconnectReason">
+    <int value="0" name="IdentityChanged" label="Validator identity changed" />
+    <int value="1" name="DnsFailed" label="Could not resolve the relayer host" />
+    <int value="2" name="ConnectFailed" label="TCP connect failed" />
+    <int value="3" name="Timeout" label="Connect, auth or stream open timed out" />
+    <int value="4" name="Transport" label="Socket, TLS or HTTP/2 error" />
+    <int value="5" name="PeerClosed" label="Relayer closed the stream or connection" />
+    <int value="6" name="AuthFailed" label="Authentication failed" />
+    <int value="7" name="NoHeartbeat" label="No message from the relayer within the watchdog timeout" />
+    <int value="8" name="CreditStall" label="Relayer stopped granting HTTP/2 flow-control credit" />
+</enum>
+
+<enum name="PrecnfBundleDropReason">
+    <int value="0" name="Partial" label="Not all of the bundle's transactions arrived (one failed verify or dedup, or was overrun)" />
+    <int value="1" name="UuidMissing" label="The bundle's UUID never arrived from the bundle tile" />
+    <int value="2" name="Invalid" label="Transaction count, UUID or transaction size out of range" />
+</enum>
+
+<enum name="PrecnfConnState">
+    <int value="0" name="Disconnected" label="Disconnected" />
+    <int value="1" name="Connecting" label="Connecting" />
+    <int value="2" name="Authenticating" label="Authenticating" />
+    <int value="3" name="Streaming" label="Streaming" />
+</enum>
+
+<tile name="precnf">
+    <counter name="TxnClassified" enum="PrecnfTxnClass" summary="Non-vote transactions seen on dedup_resolv, by source class" />
+    <counter name="VoteSkipped" summary="Simple vote transactions skipped" />
+    <counter name="BamPreprocessFailedSkipped" summary="BAM transactions skipped because they failed verify or dedup" />
+    <counter name="BatchQueued" summary="Batch messages encoded and queued for sending" />
+    <counter name="PacketQueued" summary="Transactions encoded into queued batches" />
+    <counter name="BytesQueued" summary="Encoded bytes queued for sending" />
+    <counter name="QueueDropped" summary="Queued messages evicted because the send queue was full" />
+    <gauge name="QueueCount" summary="Messages currently in the send queue" />
+    <gauge name="QueueBytes" summary="Bytes currently used in the send queue" />
+    <counter name="TxnNoStreamDropped" summary="Forwardable transactions dropped because the relay stream was not open" />
+    <counter name="BundleUuidReceived" summary="Bundle UUIDs received from the bundle tile" />
+    <counter name="BundleQueued" summary="Complete Jito bundles encoded into queued bundle messages" />
+    <counter name="BundleBatchQueued" summary="Bundle messages encoded and queued for sending" />
+    <counter name="BundlePacketQueued" summary="Transactions of queued Jito bundles" />
+    <counter name="BundleDropped" enum="PrecnfBundleDropReason" summary="Jito bundles not forwarded, by reason" />
+
+    <gauge name="ConnState" states="PrecnfConnState" summary="Relayer connection state" />
+    <counter name="ConnAttempted" summary="Connection attempts to the relayer" />
+    <counter name="StreamOpened" summary="Relay streams opened" />
+    <counter name="Disconnected" enum="PrecnfDisconnectReason" summary="Connections to the relayer that ended, by reason" />
+    <counter name="HeartbeatSent" summary="Heartbeat messages sent to the relayer" />
+    <counter name="MsgSent" summary="Queued messages sent to the relayer" />
+    <counter name="MsgOversizeDropped" summary="Queued messages dropped because they exceed the gRPC buffer" />
+    <counter name="StaleMsgCleared" summary="Queued messages discarded when the relay stream (re)opened" />
+    <counter name="ResponseReceived" summary="Messages received from the relayer (heartbeats)" />
+    <counter name="BytesWritten" summary="gRPC message bytes written to the relayer" />
+    <counter name="BytesRead" summary="gRPC message bytes read from the relayer" />
+    <counter name="AuthSucceeded" summary="Successful challenge/response authentications" />
+    <counter name="AuthRefreshed" summary="Successful access token refreshes" />
+    <counter name="AuthFailed" summary="Failed or rejected authentication requests" />
+</tile>
+
 <tile name="event">
     <gauge name="ConnState" states="EventConnState" summary="Telemetry server connection state" />
     <gauge name="QueueUsed" summary="Events in the queue, sent-but-unacknowledged plus unsent" />

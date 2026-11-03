@@ -1183,6 +1183,14 @@ FD_UNIT_TEST( packet_publish_after_credit_atomic ) {
   FD_TEST( pending_txn_cnt( state->pending_txns )==5UL );
   FD_TEST( published_txn_cnt( env )==0UL );
 
+  /* Every buffered transaction carries its bundle's uuid (published on
+     bundle_precnf when the bundle is drained). */
+  for( ulong i=0UL; i<5UL; i++ ) {
+    fd_bundle_pending_txn_t const * e = pending_txn_peek_index_const( state->pending_txns, i );
+    uchar const * exp = i<3UL ? bundles[0].uuid : bundles[1].uuid;
+    FD_TEST( e->uuid_sz==3U && fd_memeq( e->uuid, exp, 3UL ) );
+  }
+
   FD_TEST( publish_after_credit( state )==3UL );
   FD_TEST( pending_txn_cnt( state->pending_txns )==2UL );
   FD_TEST( pending_txn_peek_head( state->pending_txns )->bundle_seq==2UL );

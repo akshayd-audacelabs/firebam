@@ -37,7 +37,8 @@ FD_STATIC_ASSERT( FD_KEYGUARD_AUTH_VOTERS_MAX<=16UL, auth_voters_max_fits_sign_r
 #define FD_KEYGUARD_ROLE_VOTOR        (9)  /* Alpenglow votor tile (QUIC TLS, vote history file) */
 #define FD_KEYGUARD_ROLE_TOWER        (10) /* Tower tile (tower file) */
 #define FD_KEYGUARD_ROLE_BAM          (11) /* BAM auth */
-#define FD_KEYGUARD_ROLE_CNT          (12) /* number of known roles */
+#define FD_KEYGUARD_ROLE_PRECNF       (12) /* Pre-confirms relayer auth (precnf tile) */
+#define FD_KEYGUARD_ROLE_CNT          (13) /* number of known roles */
 
 /* Payload types ******************************************************/
 

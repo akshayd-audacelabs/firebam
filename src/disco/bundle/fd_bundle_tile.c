@@ -307,6 +307,19 @@ after_credit( fd_bundle_tile_t *  ctx,
     ulong drain_sig = head->sig;
     ulong drain_cnt = 0UL;
 
+    if( FD_UNLIKELY( drain_sig==1UL && ctx->precnf_out.mem ) ) {
+      /* Tell the pre-confirmation tile the bundle's uuid.  Nobody waits
+         for this link (no credits are needed). */
+      fd_bundle_uuid_t * msg = fd_chunk_to_laddr( ctx->precnf_out.mem, ctx->precnf_out.chunk );
+      msg->bundle_seq = head->bundle_seq;
+      msg->txn_cnt    = head->bundle_txn_cnt;
+      msg->uuid_sz    = head->uuid_sz;
+      fd_memcpy( msg->uuid, head->uuid, head->uuid_sz );
+      ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now( ctx ) );
+      fd_stem_publish( stem, ctx->precnf_out.idx, head->bundle_seq, ctx->precnf_out.chunk, sizeof(fd_bundle_uuid_t), 0UL, 0UL, tspub );
+      ctx->precnf_out.chunk = fd_dcache_compact_next( ctx->precnf_out.chunk, sizeof(fd_bundle_uuid_t), ctx->precnf_out.chunk0, ctx->precnf_out.wmark );
+    }
+
     do {
       fd_bundle_pending_txn_t const * txn = pending_txn_peek_head( ctx->pending_txns );
 
@@ -605,6 +618,11 @@ unprivileged_init( fd_topo_t const *      topo,
   ulong verify_out_idx = fd_topo_find_tile_out_link( topo, tile, "bundle_verif", tile->kind_id );
   if( FD_UNLIKELY( verify_out_idx==ULONG_MAX ) ) FD_LOG_ERR(( "Missing bundle_verif link" ));
   ctx->verify_out = bundle_out_link( topo, &topo->links[ tile->out_link_id[ verify_out_idx ] ], verify_out_idx );
+
+  ulong precnf_out_idx = fd_topo_find_tile_out_link( topo, tile, "bundle_precnf", tile->kind_id );
+  if( precnf_out_idx!=ULONG_MAX ) {
+    ctx->precnf_out = bundle_out_link( topo, &topo->links[ tile->out_link_id[ precnf_out_idx ] ], precnf_out_idx );
+  }
 
   ulong plugin_out_idx = fd_topo_find_tile_out_link( topo, tile, "bundle_status", tile->kind_id );
   if( plugin_out_idx!=ULONG_MAX ) {

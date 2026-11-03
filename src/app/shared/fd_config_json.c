@@ -12,7 +12,7 @@
    or knowingly skipped) before the constant is bumped.  String keys of
    the user's own file are separately forced through the classification
    lists below. */
-FD_STATIC_ASSERT( sizeof(fd_config_t)==24467152UL, update_fd_config_to_json_for_the_layout_change );
+FD_STATIC_ASSERT( sizeof(fd_config_t)==24467432UL, update_fd_config_to_json_for_the_layout_change );
 
 #define REDACTED "[redacted]"
 
@@ -132,6 +132,7 @@ static char const * const jw_redacted_keys[] = {
   "tiles.bundle.url",
   "tiles.bam.url",
   "tiles.event.url",
+  "tiles.preconf.url",
   "tiles.shred.additional_shred_destinations_retransmit",
   "tiles.shred.additional_shred_destinations_leader",
   "tiles.metric.prometheus_listen_address",
@@ -607,6 +608,10 @@ fd_config_to_json( fd_config_t const * config,
     jw_obj_close( &w );
     jw_obj_open( &w, "event" );
       jw_url( &w, "url", config->tiles.event.url );
+    jw_obj_close( &w );
+    jw_obj_open( &w, "preconf" );
+      jw_bool( &w, "enabled", config->tiles.preconf.enabled );
+      jw_url ( &w, "url",     config->tiles.preconf.url );
     jw_obj_close( &w );
     jw_obj_open( &w, "gui" );
       jw_bool ( &w, "enabled",                   config->tiles.gui.enabled );

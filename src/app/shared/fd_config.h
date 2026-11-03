@@ -434,6 +434,11 @@ struct fd_config {
     } event;
 
     struct {
+      int  enabled;
+      char url[ FD_URL_MAX ];
+    } preconf;
+
+    struct {
       int    enabled;
       char   gui_listen_address[ 16 ];
       ushort gui_listen_port;

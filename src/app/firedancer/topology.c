@@ -825,6 +825,33 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_tile_out( topo, "sign",   0UL,              "sign_event", 0UL                                         );
   }
 
+  if( FD_UNLIKELY( config->tiles.preconf.enabled ) ) {
+    /* The preconf tile copies verified, deduplicated transactions to an
+       external relayer.  dedup_resolv only exists when block production
+       is enabled. */
+    if( FD_UNLIKELY( !leader_enabled ) )
+      FD_LOG_ERR(( "[tiles.preconf.enabled] requires [layout.enable_block_production]" ));
+    if( FD_UNLIKELY( !strcmp( config->tiles.preconf.url, "" ) ) )
+      FD_LOG_ERR(( "[tiles.preconf.enabled] is true but [tiles.preconf.url] is empty" ));
+
+    fd_topob_wksp( topo, "precnf"      );
+    fd_topob_wksp( topo, "precnf_sign" );
+    fd_topob_wksp( topo, "sign_precnf" );
+    fd_topob_link( topo, "precnf_sign", "precnf_sign", 128UL, 9UL,  1UL );
+    fd_topob_link( topo, "sign_precnf", "sign_precnf", 128UL, 64UL, 1UL );
+    /*                                  tile_name, tile_wksp, metrics_wksp, cpu_idx,                       uses_id_keyswitch, uses_av_keyswitch, is_waker_client */
+    fd_topob_tile( topo, "precnf", "precnf", "metric_in", tile_to_cpu[ topo->tile_cnt ], 1,                 0,                 1 );
+
+    /* UNRELIABLE: dedup never waits for this tile.  If it falls behind,
+       the frags it missed are dropped (counted as link overruns). */
+    fd_topob_tile_in(  topo, "precnf", 0UL, "metric_in", "dedup_resolv", 0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
+
+    fd_topob_tile_in(  topo, "sign",   0UL, "metric_in", "precnf_sign",  0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
+    fd_topob_tile_out( topo, "precnf", 0UL,              "precnf_sign",  0UL                                         );
+    fd_topob_tile_in(  topo, "precnf", 0UL, "metric_in", "sign_precnf",  0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
+    fd_topob_tile_out( topo, "sign",   0UL,              "sign_precnf",  0UL                                         );
+  }
+
   if( FD_UNLIKELY( config->tiles.bundle.enabled ) ) {
     fd_topob_wksp( topo, "bundle_verif" );
     fd_topob_wksp( topo, "bundle_sign"  );
@@ -843,6 +870,15 @@ fd_topo_initialize( config_t * config ) {
 
     /**/                 fd_topob_tile_out( topo, "bundle", 0UL, "bundle_verif", 0UL );
     FOR(verify_tile_cnt) fd_topob_tile_in(  topo, "verify", i,             "metric_in", "bundle_verif",   0UL,        FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
+
+    if( FD_UNLIKELY( config->tiles.preconf.enabled ) ) {
+      /* Bundle UUIDs for the preconf tile, which forwards Jito bundles
+         with their UUID.  UNRELIABLE: the bundle tile never waits. */
+      fd_topob_wksp( topo, "bundle_precnf" );
+      fd_topob_link( topo, "bundle_precnf", "bundle_precnf", 1024UL, sizeof(fd_bundle_uuid_t), 1UL );
+      fd_topob_tile_out( topo, "bundle", 0UL, "bundle_precnf", 0UL );
+      fd_topob_tile_in(  topo, "precnf", 0UL, "metric_in", "bundle_precnf", 0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
+    }
 
     /**/                 fd_topob_tile_in(  topo, "sign",   0UL,           "metric_in", "bundle_sign",    0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
     /**/                 fd_topob_tile_out( topo, "bundle", 0UL,                        "bundle_sign",    0UL                                                );
@@ -1401,6 +1437,11 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->event.boot_timestamp_nanos = config->boot_timestamp_nanos;
     fd_memcpy( tile->event.launch_cpus, config->launch_cpus, sizeof(tile->event.launch_cpus) );
     FD_TEST( fd_cstr_printf_check( tile->event.launch_cgroup, sizeof(tile->event.launch_cgroup), NULL, "%s", config->launch_cgroup ) );
+
+  } else if( FD_UNLIKELY( !strcmp( tile->name, "precnf" ) ) ) {
+
+    fd_cstr_ncpy( tile->precnf.identity_key_path, config->paths.identity_key, sizeof(tile->precnf.identity_key_path) );
+    fd_cstr_ncpy( tile->precnf.url,               config->tiles.preconf.url,   sizeof(tile->precnf.url)               );
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "net"   ) ||
                           !strcmp( tile->name, "sock"  ) ||

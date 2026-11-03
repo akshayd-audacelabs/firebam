@@ -349,6 +349,11 @@ struct fd_topo_tile {
       ulong  tx_rate_mbps;
     } event;
 
+    struct {
+      char   url[ FD_URL_MAX ];
+      char   identity_key_path[ PATH_MAX ];
+    } precnf;
+
     fd_topo_tile_bam_t bam;
 
     struct {
